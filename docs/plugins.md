@@ -1,0 +1,106 @@
+# Plugins
+
+Agent of Empires keeps its core small (sessions, tmux, worktrees) and grows a
+plugin system so optional capabilities can be enabled or disabled at runtime
+instead of bloating the core. The core ships first-party plugins bundled with
+the binary and can install external community plugins from GitHub or a local
+directory. Plugins can contribute settings and UI, and workers run through the
+capability-gated plugin host.
+
+To build your own, start with [Writing Plugins](development/writing-plugins.md)
+and the [Plugin API Reference](plugin-api.md). The official starter scaffolds a
+working plugin in Python, Node, or Rust:
+
+```sh
+cookiecutter gh:agent-of-empires/plugin-template
+```
+
+## Managing plugins
+
+Three equivalent surfaces:
+
+- **CLI**: `aoe plugin list`, `aoe plugin info <id>`, `aoe plugin enable <id>`,
+  `aoe plugin disable <id>`, `aoe plugin install <source>`,
+  `aoe plugin update <id>`, `aoe plugin uninstall <id>`.
+- **TUI**: open the command palette and run "Manage plugins", or open Settings
+  and select the Plugins tab (the same manager, hosted inline). Space toggles
+  enable/disable.
+- **Web dashboard**: Settings, then the Plugins tab. The same list and toggles.
+  Enabling or disabling a plugin requires an elevated (passphrase) session when
+  login is enabled and is blocked in read-only mode; localhost browsers skip
+  the passphrase step, matching the CLI's same-host trust model.
+
+A plugin's enable-state is stored under `[plugins."<id>"]` in `config.toml` and
+survives every config save.
+
+## Bundled plugins
+
+| Plugin | What it does | Disabled behavior |
+|---|---|---|
+| `aoe.web` | The web dashboard management marker. Present whenever the dashboard is compiled in (`--features serve`), so every released binary ships it, enabled by default. | When disabled, `aoe serve` is an unrecognized subcommand (hidden from `aoe --help`); re-enable with `aoe plugin enable aoe.web`. `--stop` / `--status` / `--restart` still reach a running daemon. |
+
+`aoe.web` is the only bundled plugin today, and it rides along with the web
+dashboard. So a release binary (or any `cargo build --features serve`) shows it
+in `aoe plugin list`, while a TUI-only build (`cargo build`, no `serve`) has an
+empty registry and `aoe plugin list` reports no plugins. That is expected, not a
+bug.
+
+The bundled set is deliberately minimal while the system is proven out. More
+first-party plugins land as each piece is verified.
+
+## Installing external plugins
+
+External plugins are community code that you install at your own risk. Install,
+update, and uninstall from the CLI (`aoe plugin`) or from the web dashboard's
+Plugins settings (Marketplace searches the `aoe-plugin` GitHub topic; each
+mutating action confirms the plugin's capabilities first). See Trust and
+capabilities below.
+
+```sh
+aoe plugin install gh:owner/repo          # latest release (the audited default)
+aoe plugin install gh:owner/repo@v1.2.3   # an explicit tag, branch, or commit
+aoe plugin install ./path/to/plugin       # a local directory
+aoe plugin update <id>
+aoe plugin uninstall <id>
+```
+
+With no `@ref`, install resolves the repo's latest stable GitHub release (the
+audited default path) and installs that tag. An explicit `@ref` installs
+unverified, un-audited code and asks you to confirm first (`--yes` skips the
+prompt). If the repo has published no release, install warns and falls back to
+the default branch behind the same confirmation. The recorded source stays
+ref-less, so `aoe plugin update` keeps tracking the latest release; an `@ref`
+install keeps following that ref.
+
+A plugin lands under `<app_dir>/plugins/<id>/`. A GitHub source is cloned and
+pinned to the exact commit; if the plugin ships a compiled worker as a release
+binary, the asset for your platform is downloaded into the plugin directory. To
+install from a GitHub Enterprise host, set `AOE_GITHUB_CLONE_BASE` to its base
+URL.
+
+### Trust and capabilities
+
+Bundled plugins are `builtin` and fully trusted. Installed plugins are
+`community` and untrusted: their manifest declares the capabilities they need
+(network access, filesystem access, spawning processes, and so on), and install
+prompts you once to grant that exact set. Run non-interactively with `--yes` to
+grant without prompting. A capability this version of aoe does not recognize is
+rejected rather than granted; upgrade aoe.
+
+A grant is pinned to the installed manifest. If an update expands what the
+plugin can do (new capabilities, changed build steps or UI slots, a runtime or
+trust change), it must be approved before the new version becomes active. You
+can approve in a terminal with `aoe plugin update <id>`, or in-app: the web
+dashboard's plugin settings and the TUI plugin manager show an Update action
+that opens an approval popup describing exactly what changed. Declining keeps
+the current version active and stops the prompt from reappearing until the next
+version. The approval is pinned to the exact fetched content, so an update that
+changed since you reviewed it is refused rather than applied. `aoe plugin
+install` and `aoe plugin update` report the resolved trust level (`featured`,
+`community`, or `local`) in their success output, and `aoe plugin list` and
+`aoe plugin info <id>` show each plugin's trust level and whether it is granted.
+An external plugin cannot use the reserved `aoe.*` /
+`agent-of-empires.*` id namespace.
+
+Resolved versions live in `<app_dir>/plugins.lock` (the exact commit, manifest
+hash, and release asset per plugin), so an install is reproducible.

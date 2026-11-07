@@ -1,0 +1,2446 @@
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { Puzzle } from "lucide-react";
+import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
+import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
+import { diffSelectionStale } from "./lib/diffSelection";
+import { useSessions } from "./hooks/useSessions";
+import { useDashboardPresence } from "./hooks/useDashboardPresence";
+import { clearAcpCache } from "./hooks/useAcpSession";
+import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
+import { AcpPrefsProvider } from "./lib/acpPrefs";
+import { safeGetItem, safeRemoveItem } from "./lib/safeStorage";
+import { isAutomatedSession } from "./lib/onboarding";
+import { useWorkspaces } from "./hooks/useWorkspaces";
+import { useLastSessionRestore } from "./hooks/useLastSessionRestore";
+import { useRepoGroups } from "./hooks/useRepoGroups";
+import { useSessionGroups } from "./hooks/useSessionGroups";
+import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
+import { useOrgGroups } from "./hooks/useOrgGroups";
+import { PluginUiProvider, usePluginUiEntries } from "./lib/pluginUiContext";
+import { buildSortValueMap, pluginSortSpecs } from "./lib/pluginUi";
+import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
+import { nextAttentionSessionId, sessionNeedsAttention, workspaceIsTrashed } from "./lib/sidebarSort";
+import { useSidebarSortMode } from "./hooks/useSidebarSortMode";
+import { useSidebarAxis } from "./hooks/useSidebarAxis";
+import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups";
+import { useProjects } from "./hooks/useProjects";
+import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
+import { useResolvedTheme } from "./hooks/useResolvedTheme";
+import { useWebSettings } from "./hooks/useWebSettings";
+import { useDiffFiles } from "./hooks/useDiffFiles";
+import { useDiffComments } from "./hooks/useDiffComments";
+import { clearStoredComments, sweepOrphanComments } from "./components/diff/comments/storage";
+import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
+import { useCommandActions, buildConversationActions, type SessionStateAction } from "./hooks/useCommandActions";
+import { usePluginCommands } from "./hooks/usePluginCommands";
+import { useSettingsCommands } from "./hooks/useSettingsCommands";
+import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
+import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
+import { useMobileViewportLock } from "./hooks/useMobileViewportLock";
+import { useIsWideViewport } from "./hooks/useIsWideViewport";
+import type { RightPanelView } from "./lib/rightPanelView";
+import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab, isDockCollapsed } from "./lib/paneLayout";
+import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
+import { PluginPaneBody } from "./components/plugin/PluginSlots";
+import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
+import {
+  deleteWorkspaceSessions,
+  type Notifier,
+  restoreSessions,
+  trashedWorkspaceRestoreIds,
+  trashSessions,
+  workspaceCleanupDefaults,
+} from "./lib/trashActions";
+import {
+  loginStatus,
+  logout,
+  stopSession,
+  startSession,
+  acpEnable,
+  acpDisable,
+  fetchAbout,
+  fetchSettings,
+  fetchTelemetryStatus,
+  setTelemetryConsent,
+  reportTelemetrySeen,
+  isDebugBuild,
+  markWebTourSeen,
+  updateWorkspaceOrdering,
+  createProject,
+  setProjectPinned,
+  deleteProject,
+  setSessionUnread,
+  killTerminal,
+  setSessionPin,
+  setSessionArchive,
+  setSessionSnooze,
+  trashSession,
+  restoreSession,
+  fetchPlugins,
+} from "./lib/api";
+import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
+import { getClientCapabilities } from "./lib/clientCapabilities";
+import { normalizeProjectPathKey } from "./lib/registeredProjects";
+import { IdleDecayWindowContext, parseIdleDecayWindowMs, useIdleDecayWindowMs } from "./lib/idleDecay";
+import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
+import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
+import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionColors";
+import { toastBus, reportError } from "./lib/toastBus";
+import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
+import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
+import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
+import { clearMobileKeyboardProxyInput, deliverMobileKeyboardProxyInput } from "./lib/mobileKeyboardProxy";
+import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
+import { WorkspaceSidebar, SnoozeModal } from "./components/WorkspaceSidebar";
+import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
+import { StopSessionDialog } from "./components/StopSessionDialog";
+import { SwitchViewDialog } from "./components/SwitchViewDialog";
+import { TopBar } from "./components/TopBar";
+import { AppShellSkeleton, MainPaneSkeleton } from "./components/AppShellSkeleton";
+import { ContentSplit } from "./components/ContentSplit";
+import { TerminalSessionStack } from "./components/TerminalSessionStack";
+// Lazy-load the acp surface so non-acp users never download
+// the @assistant-ui/react, shiki, and in-house StringDiff/DiffLine
+// dependency tree. Cuts ~hundreds of KB off the cold-start bundle
+// for the (currently default) tmux-only flow. The Suspense fallback
+// below covers the brief load while the chunk arrives.
+const StructuredView = lazy(() =>
+  import("./components/acp/StructuredView").then((m) => ({
+    default: m.StructuredView,
+  })),
+);
+const FleetOperations = lazy(() =>
+  import("./components/FleetOperations").then((m) => ({
+    default: m.FleetOperations,
+  })),
+);
+import { type PaneDisplay } from "./components/Dock";
+import { DockGroups, type DockGroupView } from "./components/DockGroups";
+import { BottomDock } from "./components/BottomDock";
+import { PaneDndController } from "./components/PaneDndController";
+import { visibleToFullIndex, type DropTarget } from "./components/paneDnd";
+import { BackgroundAgentsPanel } from "./components/acp/BackgroundAgentsPanel";
+import { DiffPane } from "./components/DiffPane";
+import { FilesPane } from "./components/FilesPane";
+import { FileContentViewer } from "./components/diff/FileContentViewer";
+import { PairedShellPane } from "./components/PairedTerminal";
+import { BUILTIN_PANES, isTerminalTabId, terminalIndexOf, terminalTabId, type DockLocation } from "./lib/panes";
+import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
+import { MobileMainPane } from "./components/MobileMainPane";
+import { ChromeCollapseHandle, CollapsibleRegion } from "./components/CollapsibleChrome";
+import { DiffFileViewer } from "./components/diff/DiffFileViewer";
+import { SettingsView } from "./components/SettingsView";
+import { ProjectFormModal } from "./components/ProjectFormModal";
+import { HelpOverlay } from "./components/HelpOverlay";
+import { useTour } from "./hooks/useTour";
+import { useWelcomePhase } from "./hooks/useWelcomePhase";
+import { ThemeIntro } from "./components/onboarding/ThemeIntro";
+import type { TourScope } from "./lib/tourSteps";
+import { SessionWizard } from "./components/session-wizard/SessionWizard";
+import type { WizardPrefill } from "./components/session-wizard/SessionWizard";
+import type { ProjectInfo, RepoGroup, SessionResponse } from "./lib/types";
+import { Dashboard } from "./components/Dashboard";
+import { LoginPage } from "./components/LoginPage";
+import { TokenEntryPage } from "./components/TokenEntryPage";
+import { LOGIN_REQUIRED_EVENT, TOKEN_EXPIRED_EVENT, resetTokenExpired } from "./lib/fetchInterceptor";
+import { AboutModal } from "./components/AboutModal";
+import { TelemetryConsentModal } from "./components/TelemetryConsentModal";
+import { TipsModal } from "./components/TipsModal";
+import { useTips, shouldAutoPopTips } from "./hooks/useTips";
+import { CommandPalette } from "./components/command-palette/CommandPalette";
+import { useConversationSearch } from "./hooks/useConversationSearch";
+import { DisconnectBanner } from "./components/DisconnectBanner";
+import { ElevationPrompt } from "./components/ElevationPrompt";
+import { UpdateBanner } from "./components/UpdateBanner";
+import { DashboardUpdateBanner } from "./components/DashboardUpdateBanner";
+
+// Pre-#1832 per-browser tour-seen flag. Read once on load to migrate users who
+// already dismissed the tour to the backend; no longer written.
+const LEGACY_TOUR_SEEN_KEY = "aoe-tour-seen";
+
+export default function App() {
+  useMobileViewportLock();
+  // Apply the user-selected theme as CSS custom properties on the root
+  // element. Runs once on mount + on settings-driven theme changes.
+  // The pre-React /theme-bootstrap.js (referenced from index.html)
+  // paints the cached theme before hydration; this hook keeps it in
+  // sync with the server's view.
+  useResolvedTheme();
+  const [loginRequired, setLoginRequired] = useState<boolean | null>(null);
+  const [loginAuthenticated, setLoginAuthenticated] = useState(true);
+  const [tokenExpired, setTokenExpired] = useState(false);
+  const [idleDecayWindowMs, setIdleDecayWindowMs] = useState(IDLE_DECAY_WINDOW_MS);
+  const [unreadIndicatorEnabled, setUnreadIndicatorEnabled] = useState(true);
+  const [sessionRowTagMode, setSessionRowTagMode] = useState<SessionRowTagMode>("branch");
+  const [sessionColorsEnabled, setSessionColorsEnabled] = useState(true);
+
+  const applyAppSettings = useCallback((settings: Record<string, unknown> | null | undefined) => {
+    setIdleDecayWindowMs(parseIdleDecayWindowMs(settings));
+    setUnreadIndicatorEnabled(parseUnreadIndicatorEnabled(settings));
+    setSessionRowTagMode(parseSessionRowTagMode(settings));
+    setSessionColorsEnabled(parseSessionColorsEnabled(settings));
+  }, []);
+
+  const refreshAppSettings = useCallback(async () => {
+    applyAppSettings(await fetchSettings());
+  }, [applyAppSettings]);
+
+  useEffect(() => {
+    const onTokenExpired = () => setTokenExpired(true);
+    window.addEventListener(TOKEN_EXPIRED_EVENT, onTokenExpired);
+    return () => window.removeEventListener(TOKEN_EXPIRED_EVENT, onTokenExpired);
+  }, []);
+
+  // Clearing tokenExpired here matters: the render order below shows
+  // TokenEntryPage above LoginPage, so without the reset a token that's
+  // actually fine would keep getting shown the wrong screen.
+  useEffect(() => {
+    const onLoginRequired = () => {
+      setTokenExpired(false);
+      setLoginRequired(true);
+      setLoginAuthenticated(false);
+    };
+    window.addEventListener(LOGIN_REQUIRED_EVENT, onLoginRequired);
+    return () => window.removeEventListener(LOGIN_REQUIRED_EVENT, onLoginRequired);
+  }, []);
+
+  useEffect(() => {
+    loginStatus().then(({ required, authenticated }) => {
+      setLoginRequired(required);
+      setLoginAuthenticated(authenticated);
+    });
+  }, []);
+
+  useEffect(() => {
+    fetchSettings().then(applyAppSettings);
+  }, [applyAppSettings]);
+
+  const handleTokenSuccess = () => {
+    setTokenExpired(false);
+    // Re-check login status now that token auth works
+    loginStatus().then(({ required, authenticated }) => {
+      setLoginRequired(required);
+      setLoginAuthenticated(authenticated);
+    });
+  };
+
+  const handleLoginSuccess = () => {
+    setLoginAuthenticated(true);
+    // Reset dedup flags so a future session expiry can re-fire the event.
+    resetTokenExpired();
+  };
+
+  const handleLogout = async () => {
+    await logout();
+    setLoginAuthenticated(false);
+  };
+
+  // Only hydrate once the user is past every auth gate, so the request runs as
+  // the authenticated user (and never against the login/token screens).
+  // Token auth is the first factor; show token entry before anything else
+  if (tokenExpired) {
+    return <TokenEntryPage onSuccess={handleTokenSuccess} />;
+  }
+
+  if (loginRequired && !loginAuthenticated) {
+    return <LoginPage onSuccess={handleLoginSuccess} />;
+  }
+
+  if (loginRequired === null) {
+    // Paint the app-shell chrome immediately instead of a blank surface while
+    // loginStatus() resolves, so a PWA cold launch fills in progressively.
+    return <AppShellSkeleton />;
+  }
+
+  return (
+    <IdleDecayWindowContext.Provider value={idleDecayWindowMs}>
+      <UnreadIndicatorContext.Provider value={unreadIndicatorEnabled}>
+        <SessionRowTagContext.Provider value={sessionRowTagMode}>
+          <SessionColorsContext.Provider value={sessionColorsEnabled}>
+            {/* PluginUiProvider must sit above AppContent: AppContent itself reads
+                the plugin UI snapshot (usePluginPanes), so the provider can't live
+                inside its own return. */}
+            <PluginUiProvider>
+              <AppContent
+                loginRequired={loginRequired}
+                onLogout={handleLogout}
+                onSettingsRefresh={refreshAppSettings}
+              />
+            </PluginUiProvider>
+            <ElevationPrompt />
+          </SessionColorsContext.Provider>
+        </SessionRowTagContext.Provider>
+      </UnreadIndicatorContext.Provider>
+    </IdleDecayWindowContext.Provider>
+  );
+}
+
+/** Walk from the event target up to the document root looking for any
+ *  text-input surface, so global hotkeys don't fire when the user is
+ *  typing in an `<input>`, `<textarea>`, or contenteditable element
+ *  (or any contenteditable ancestor of a deeper rich-text widget). */
+function isInsideEditable(target: EventTarget | null): boolean {
+  let el: HTMLElement | null = target instanceof HTMLElement ? target : null;
+  while (el) {
+    const tag = el.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || el.isContentEditable) {
+      return true;
+    }
+    el = el.parentElement;
+  }
+  return false;
+}
+
+function AppContent({
+  loginRequired,
+  onLogout,
+  onSettingsRefresh,
+}: {
+  loginRequired: boolean;
+  onLogout: () => void;
+  onSettingsRefresh: () => Promise<void> | void;
+}) {
+  useDashboardPresence();
+  // Wire the localStorage write chokepoint and pull the server-side UI-state
+  // blob into localStorage. AppContent only mounts past auth, so this runs as
+  // the authenticated user. Background (does NOT gate render): blocking first
+  // paint on this fetch raced immediate interactions and could flash a blank
+  // screen if the endpoint were slow. A brand-new browser paints local defaults
+  // for the first session; hydration writes the synced values for the next
+  // mount/reload. Same-device loads (populated cache) are unaffected.
+  useEffect(() => {
+    initWebUiSync();
+    void hydrateWebUiStateFromServer();
+  }, []);
+
+  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const idleDecayWindowMs = useIdleDecayWindowMs();
+  const { settings: webSettings } = useWebSettings();
+  const sessionMatch = useMatch("/session/:sessionId");
+  const settingsRootMatch = useMatch("/settings");
+  const settingsTabMatch = useMatch("/settings/:tab");
+  const profilesMatch = useMatch("/profiles");
+  const activeSessionId = sessionMatch?.params.sessionId ?? null;
+  const showSettings = settingsRootMatch !== null || settingsTabMatch !== null;
+  const settingsTab = settingsTabMatch?.params.tab ?? null;
+
+  const {
+    sessions,
+    workspaceOrdering,
+    setWorkspaceOrdering,
+    markLocalOrderingUpdate,
+    error,
+    loaded: sessionsLoaded,
+    injectSession,
+    setSessionStatus,
+    applySession,
+  } = useSessions();
+  const workspaces = useWorkspaces(sessions);
+  // Trash is a whole-workspace concern, so it is derived here from the
+  // authoritative unsliced workspace list rather than reconstructed from the
+  // sidebar's per-`group_path` slice views. A workspace is in Trash only when
+  // every one of its sessions is trashed, and Restore/Delete then cover all of
+  // them. See #2533.
+  const trashedWorkspaces = useMemo(() => workspaces.filter(workspaceIsTrashed), [workspaces]);
+
+  // Remember the active session and restore it on a PWA relaunch (#2103).
+  useLastSessionRestore({ activeSessionId, sessions, sessionsLoaded });
+
+  // One-shot orphan-draft sweep once useSessions has settled its first
+  // fetch (success or null). Catches acp:draft:<id> keys left behind
+  // by deletions that happened in another tab or on another device since
+  // the last load (#1358). The local-tab delete path calls clearDraft
+  // directly so it does not need to wait for this. Gating on
+  // `sessionsLoaded` rather than `sessions.length > 0` covers the
+  // legitimate empty-server case: a brand-new user with zero sessions
+  // must still get prior orphan drafts swept. Bounded by localStorage
+  // entry count; cheap.
+  const sweptDraftsRef = useRef(false);
+  useEffect(() => {
+    if (sweptDraftsRef.current) return;
+    if (!sessionsLoaded) return;
+    sweptDraftsRef.current = true;
+    sweepOrphanDrafts(new Set(sessions.map((s) => s.id)));
+  }, [sessionsLoaded, sessions]);
+
+  // Same once-on-mount sweep for diff-comments keys (#1842). Clears keys for
+  // deleted sessions and retroactively removes empty keys written before the
+  // empty-removal fix. Mirrors the draft sweep above.
+  const sweptCommentsRef = useRef(false);
+  useEffect(() => {
+    if (sweptCommentsRef.current) return;
+    if (!sessionsLoaded) return;
+    sweptCommentsRef.current = true;
+    sweepOrphanComments(new Set(sessions.map((s) => s.id)));
+  }, [sessionsLoaded, sessions]);
+
+  const [sidebarSortMode, setSidebarSortMode] = useSidebarSortMode();
+  const [sidebarAxis, setSidebarAxis] = useSidebarAxis();
+
+  // Active plugin sort (#2401): an ephemeral selection of a live `sort-key`
+  // entry. Not persisted (plugin entries die with the daemon). The ref is only
+  // ever read by resolving it against the live snapshot, so a stale ref (entry
+  // gone after a daemon restart) is inert and the sidebar falls back to the
+  // built-in sort; if the entry reappears on a later poll the selection
+  // resumes. Selecting a built-in mode clears it via `selectSidebarSortMode`.
+  const pluginUiEntries = usePluginUiEntries();
+  const [pluginSortRef, setPluginSortRef] = useState<{ pluginId: string; entryId: string } | null>(null);
+  const activePluginSort = useMemo(() => {
+    if (!pluginSortRef) return null;
+    return (
+      pluginSortSpecs(pluginUiEntries).find(
+        (s) => s.pluginId === pluginSortRef.pluginId && s.entryId === pluginSortRef.entryId,
+      ) ?? null
+    );
+  }, [pluginUiEntries, pluginSortRef]);
+  const pluginSort = useMemo<PluginSortContext | undefined>(
+    () =>
+      activePluginSort
+        ? {
+            direction: activePluginSort.direction,
+            values: buildSortValueMap(pluginUiEntries, activePluginSort.pluginId, activePluginSort.column),
+          }
+        : undefined,
+    [activePluginSort, pluginUiEntries],
+  );
+  const selectSidebarSortMode = useCallback(
+    (mode: SidebarSortMode) => {
+      setPluginSortRef(null);
+      setSidebarSortMode(mode);
+    },
+    [setSidebarSortMode],
+  );
+
+  const { projects, refresh: refreshProjects } = useProjects();
+  const {
+    groups: repoGroups,
+    savedProjects,
+    toggleRepoCollapsed,
+    updateRepoAppearance,
+    reorderRepoGroups,
+  } = useRepoGroups(workspaces, workspaceOrdering, sidebarSortMode, projects, pluginSort);
+  const { groups: sessionGroups, toggleGroupCollapsed } = useSessionGroups(workspaces, sidebarSortMode, pluginSort);
+  // The nested `repo+group` axis reuses the already-built repo groups for
+  // its top level (so repo collapse, appearance, and ordering are shared
+  // with the repo axis) and splits each repo by `group_path` underneath.
+  // See #1720.
+  const { groups: nestedGroups, toggleSubgroupCollapsed } = useNestedSidebarGroups(
+    repoGroups,
+    sidebarSortMode,
+    pluginSort,
+  );
+  // The org axis (#3283) partitions the same repo groups by remote owner;
+  // it needs no sort/plugin-sort input of its own since it reuses each
+  // repo's already-ordered workspace list verbatim, just like the nested
+  // axis's repo header.
+  const {
+    groups: orgGroups,
+    toggleOrgCollapsed,
+    toggleRepoCollapsed: toggleOrgRepoCollapsed,
+  } = useOrgGroups(repoGroups);
+
+  // The sidebar render path consumes one honest model (SidebarGroup): the
+  // repo axis maps in via an adapter, the user-group axis is already in
+  // that shape. Collapse routing follows the active axis so the two
+  // axes keep independent collapse state. See #1234.
+  const sidebarGroups = useMemo(
+    () => (sidebarAxis === "group" ? sessionGroups : repoGroups.map(repoGroupToSidebarGroup)),
+    [sidebarAxis, sessionGroups, repoGroups],
+  );
+  const toggleSidebarGroup = sidebarAxis === "group" ? toggleGroupCollapsed : toggleRepoCollapsed;
+
+  // Drag-end handler for the sidebar. Optimistically applies the new
+  // order locally so the row snaps into place, then persists to the
+  // server. `markLocalOrderingUpdate` opens a short window during
+  // which polled responses do not clobber our just-applied state, so a
+  // poll firing mid-PUT can't revert the drag.
+  const handleReorderWorkspaces = useCallback(
+    (newOrder: string[]) => {
+      setWorkspaceOrdering(newOrder);
+      markLocalOrderingUpdate();
+      void updateWorkspaceOrdering(newOrder);
+    },
+    [setWorkspaceOrdering, markLocalOrderingUpdate],
+  );
+
+  // Selected diff-file identity. `repoName` is undefined for single-repo
+  // sessions and the workspace member name for multi-repo workspaces.
+  // Kept as one state so the path + repo always update together; with
+  // two parallel states we'd briefly fetch the wrong repo when only
+  // one side changed (workspace path collisions across repos make this
+  // a real bug, not theoretical). See #1047.
+  const [selectedFile, setSelectedFile] = useState<{
+    path: string;
+    repoName?: string;
+    /** 1-based source line to scroll into view, when the file was opened from a
+     *  transcript `path:line` link. Undefined for plain file-list clicks. */
+    line?: number;
+    /** Opened from a transcript file-ref rather than the diff list. Such a
+     *  file may have no diff against the base (full-file fallback, #1810), so
+     *  it must not be auto-cleared for being absent from the diff list. */
+    cited?: boolean;
+    /** An absolute path OUTSIDE the session's repo roots that the agent
+     *  touched this session (a cited `/tmp/plan.md`, `~/.claude/x.md`). Read
+     *  via the provenance-confined `/file` endpoint and rendered by
+     *  FileContentViewer instead of the git-diff viewer. See #3088. */
+    external?: boolean;
+  } | null>(null);
+  const selectedFilePath = selectedFile?.path ?? null;
+  const selectedFileExternal = selectedFile?.external ?? false;
+  const selectedRepoName = selectedFile?.repoName;
+  const selectedFileLine = selectedFile?.line;
+  // Dock panes render as tabbed groups (#2437): each dock holds an ordered set
+  // of tabs (diff, one-or-more terminals, plugin panes) with one active body.
+  // The tab membership + active tab + terminal count are persisted per session;
+  // dock sizes stay global (Dock/BottomDock own those localStorage keys).
+  const {
+    layout: paneLayout,
+    openTab,
+    addTerminal,
+    closeTab,
+    activateTab,
+    moveTab,
+    placeTab,
+    toggleKind,
+    togglePlugin,
+    syncPlugins,
+    setDockCollapsed,
+  } = usePaneLayout(activeSessionId);
+  const pluginPanes = usePluginPanes(activeSessionId);
+  const pluginPaneById = useMemo(() => {
+    const m = new Map<string, PluginPane>();
+    for (const p of pluginPanes) m.set(p.id, p);
+    return m;
+  }, [pluginPanes]);
+
+  // Auto-add newly available plugin panes as tabs in their default dock; the
+  // layout suppresses any the user explicitly closed. When the user disabled
+  // plugin auto-open (#3035) pass an empty list rather than skipping the
+  // effect: syncPlugins still materializes the session's seeded layout on
+  // mount (pinning the diff/terminal defaults), it just adds no plugin panes.
+  // Manual activity-bar opens and already-open panes are unaffected.
+  useEffect(() => {
+    syncPlugins(
+      webSettings.autoOpenPluginPanes ? pluginPanes.map((p) => ({ id: p.id, defaultDock: p.defaultDock })) : [],
+    );
+  }, [pluginPanes, syncPlugins, webSettings.autoOpenPluginPanes]);
+
+  // One-shot lookup from plugin id to its manifest identity (icon name +
+  // icon_asset URL), so a pane gets a real identity glyph, up to the plugin's
+  // actual logo, even when it doesn't set its own per-pane icon. Fetched once
+  // on mount rather than polled: the installed-plugin list itself has no live
+  // sync anywhere else in the app today (Settings > Plugins only reloads on
+  // mount and after its own mutations), so this matches existing staleness
+  // tolerance rather than introducing a new one.
+  const [pluginIdentityById, setPluginIdentityById] = useState<
+    Record<string, { icon?: string; iconAssetUrl?: string }>
+  >({});
+  useEffect(() => {
+    void fetchPlugins().then((res) => {
+      if (!res) return;
+      setPluginIdentityById(
+        Object.fromEntries(
+          res.plugins.map((p) => [p.id, { icon: p.icon ?? undefined, iconAssetUrl: p.icon_asset_url ?? undefined }]),
+        ),
+      );
+    });
+  }, []);
+
+  const paneDescriptor = useCallback(
+    (id: string): PaneDisplay => {
+      const plugin = pluginPaneById.get(id);
+      if (plugin) {
+        const identity = pluginIdentityById[plugin.entry.plugin_id];
+        const icon = resolvePaneIcon(plugin.icon, identity?.icon) ?? Puzzle;
+        // A plugin's real logo outranks any lucide glyph, including a
+        // per-pane runtime icon a worker chose before icon_asset existed.
+        return { title: plugin.title, icon, iconAssetUrl: identity?.iconAssetUrl };
+      }
+      if (isTerminalTabId(id)) {
+        const idx = terminalIndexOf(id);
+        const term = BUILTIN_PANES.find((p) => p.id === "terminal")!;
+        return { title: idx === 0 ? term.title : `${term.title} ${idx + 1}`, icon: term.icon };
+      }
+      const d = BUILTIN_PANES.find((p) => p.id === id)!;
+      return { title: d.title, icon: d.icon };
+    },
+    [pluginPaneById, pluginIdentityById],
+  );
+
+  // A persisted tab is visible only if its backing pane currently exists: diff
+  // and terminals always do; a plugin tab does only while its plugin is loaded.
+  const tabAvailable = useCallback(
+    (id: string) => !id.startsWith("plugin:") || pluginPaneById.has(id),
+    [pluginPaneById],
+  );
+  // A dock's groups reduced to what's actually shown: each surviving group keeps
+  // its persisted index (so a drop addresses the right group) and a valid active
+  // tab. Groups with no visible tab (only unloaded plugins) are not rendered.
+  const renderGroups = useCallback(
+    (dock: DockLocation): DockGroupView[] =>
+      dockGroups(paneLayout, dock)
+        .map((g, group) => {
+          const tabs = g.tabs.filter(tabAvailable);
+          const active = g.active && tabs.includes(g.active) ? g.active : (tabs[0] ?? null);
+          return { group, tabs, active };
+        })
+        .filter((g) => g.tabs.length > 0),
+    [paneLayout, tabAvailable],
+  );
+
+  const availableRightGroups = useMemo(() => renderGroups("right"), [renderGroups]);
+  const rightDockExplicitlyCollapsed = isDockCollapsed(paneLayout, "right");
+  const rightDockCollapsed = rightDockExplicitlyCollapsed || availableRightGroups.length === 0;
+  const rightGroups = useMemo(
+    () => (rightDockExplicitlyCollapsed ? [] : availableRightGroups),
+    [rightDockExplicitlyCollapsed, availableRightGroups],
+  );
+  const bottomGroups = useMemo(() => renderGroups("bottom"), [renderGroups]);
+  const groupsByDock = useMemo(
+    () => ({
+      right: rightGroups.map((g) => ({ group: g.group, tabs: g.tabs })),
+      bottom: bottomGroups.map((g) => ({ group: g.group, tabs: g.tabs })),
+    }),
+    [rightGroups, bottomGroups],
+  );
+  const terminalOpen = (["right", "bottom"] as DockLocation[]).some(
+    (d) => !isDockCollapsed(paneLayout, d) && dockTabs(paneLayout, d).some(isTerminalTabId),
+  );
+
+  // Activity-bar entries are pane KINDS (diff, terminal, each plugin), not
+  // individual tabs; the strip's +/x manage terminal instances.
+  const isPaneOpen = (kind: string): boolean => {
+    if (kind === "terminal") return terminalOpen;
+    const dock = dockOf(paneLayout, kind);
+    return dock !== null && !isDockCollapsed(paneLayout, dock);
+  };
+  const togglePaneAny = useCallback(
+    (kind: string) => {
+      const defaultDock: DockLocation =
+        pluginPaneById.get(kind)?.defaultDock ?? BUILTIN_PANES.find((p) => p.id === kind)?.defaultDock ?? "right";
+      if (isPluginPaneId(kind)) togglePlugin(kind, defaultDock);
+      else toggleKind(kind as "diff" | "terminal" | "agents" | "files", defaultDock);
+    },
+    [toggleKind, togglePlugin, pluginPaneById],
+  );
+  // Open (or focus) the Sub agents pane. Used by an inline async
+  // sub-agent card to jump to its panel entry.
+  const openAgentsPane = useCallback(() => {
+    const dock = dockOf(paneLayout, "agents");
+    if (dock) activateTab(dock, "agents");
+    else toggleKind("agents", "right");
+  }, [paneLayout, activateTab, toggleKind]);
+  const closePaneAny = useCallback(
+    (id: string) => {
+      // Closing an extra terminal tab kills its tmux shell so it does not leak;
+      // terminal 0 (shared with the native TUI) only hides. Diff/plugin tabs
+      // have no backend shell to reap.
+      if (isTerminalTabId(id)) {
+        const idx = terminalIndexOf(id);
+        if (idx >= 1) {
+          // Remove the tab only once the shell is actually killed; if the
+          // DELETE fails, keep the tab so the user can retry instead of
+          // silently leaking the shell with no way to close it.
+          if (activeSessionId) {
+            void killTerminal(activeSessionId, idx).then((ok) => {
+              if (ok) closeTab(id);
+            });
+          }
+          return;
+        }
+      }
+      closeTab(id);
+    },
+    [closeTab, activeSessionId],
+  );
+  const movePaneAny = useCallback((id: string, dock: DockLocation) => moveTab(id, dock), [moveTab]);
+  // The dnd controller works in visible-tab space; map a drop index back to the
+  // target group's full persisted tab list, since a hidden (unloaded) plugin tab
+  // still holds a slot the visible index does not count. A split target carries
+  // no index (the new group starts with just the dragged tab).
+  const placeVisibleTab = useCallback(
+    (id: string, target: DropTarget) => {
+      if (target.newGroup) {
+        placeTab(id, { dock: target.dock, group: target.group, newGroup: true });
+        return;
+      }
+      const fullBase = (dockGroups(paneLayout, target.dock)[target.group]?.tabs ?? []).filter((tab) => tab !== id);
+      const index = visibleToFullIndex(fullBase, target.index ?? fullBase.length, tabAvailable);
+      placeTab(id, { dock: target.dock, group: target.group, index });
+    },
+    [paneLayout, placeTab, tabAvailable],
+  );
+  // Layout topology is width-driven so it stays aligned with the `md:`
+  // Tailwind classes the rest of the layout uses. At md and up the
+  // side-by-side ContentSplit renders; below md a single full-viewport
+  // pane shows one of agent / diff / paired, chosen via the picker (#1452).
+  const isMdUp = useIsWideViewport();
+  const singlePane = !isMdUp;
+  const [rightPanelView, setRightPanelView] = useState<RightPanelView>("agent");
+  const [pickerOpen, setPickerOpen] = useState(false);
+  // Reading mode for the phone conversation view: the top bar folds away so the
+  // transcript gets its 48px back (the composer has its own, independent
+  // handle inside StructuredView). Kept here rather than in the structured view
+  // because the top bar is the App shell's own child. State is App-level, so it
+  // survives switching sessions; the collapse only *applies* on the mobile
+  // conversation view, so leaving it on and navigating to settings or the
+  // dashboard shows the bar again.
+  const [headerCollapsed, setHeaderCollapsed] = useState(false);
+  // The paired shell mounts lazily on first activation, then stays mounted
+  // (kept alive but hidden) so its PTY, scrollback, and focus survive view
+  // switches. Mounting it eagerly would spawn a shell for every mobile
+  // session the user never opens the shell on.
+  const [pairedMounted, setPairedMounted] = useState(false);
+  const [showSessionWizard, setShowSessionWizard] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
+  const [showFleet, setShowFleet] = useState(false);
+  const tipsAutoPoppedRef = useRef(false);
+  // Pending `requestAnimationFrame` id for the tips auto-pop, cancelled only on
+  // unmount so a dep-change re-render cannot orphan a committed open.
+  const tipsAutoPopFrameRef = useRef<number | null>(null);
+  // Whether the tour was already seen when this page loaded (set in the settings
+  // fetch below). Auto-pop keys off this, not the live tourSeen, so finishing
+  // the tour this session does not then pop tips on top of the first-run flow.
+  const tourSeenAtLoadRef = useRef<boolean | null>(null);
+  // All tips orchestration (open state, mark-seen, the show toggle, the auto-pop
+  // decision) lives in the hook / lib so it stays out of this component and is
+  // unit-tested directly.
+  const tips = useTips();
+  const [showPalette, setShowPalette] = useState(false);
+  // Palette content-search query (#2515); declared here so the keyboard
+  // handlers below can clear it on close/toggle. Consumed lower down by
+  // useConversationSearch.
+  const [paletteQuery, setPaletteQuery] = useState("");
+  // Session id awaiting a snooze duration from the palette's "Snooze…" action;
+  // drives the shared SnoozeModal. Null when no snooze is in flight.
+  const [snoozeTargetId, setSnoozeTargetId] = useState<string | null>(null);
+  const [showAbout, setShowAbout] = useState(false);
+  const [telemetryConsentNeeded, setTelemetryConsentNeeded] = useState(false);
+  // Whether the telemetry status fetch has settled. `telemetryConsentNeeded`
+  // starts false, so before this is true "no consent needed" and "not resolved
+  // yet" look the same; the tips auto-pop waits on this so it can't slip in
+  // before a pending consent modal.
+  const [telemetryConsentKnown, setTelemetryConsentKnown] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 768);
+  const keyboardProxyRef = useRef<HTMLTextAreaElement>(null);
+  const [keyboardProxy, setKeyboardProxy] = useState<HTMLTextAreaElement | null>(null);
+  const setKeyboardProxyRef = useCallback((element: HTMLTextAreaElement | null) => {
+    keyboardProxyRef.current = element;
+    setKeyboardProxy(element);
+  }, []);
+
+  const [serverAbout, setServerAbout] = useState<ServerAbout | null>(null);
+  // CityHall client mode collapses the dashboard to a locked-down end-user
+  // client; the capability flags gate the terminal/diff panes, project
+  // management, the wizard, and settings from one place. See #7.
+  const caps = useMemo(() => getClientCapabilities(serverAbout), [serverAbout]);
+
+  const activeWorkspace = useMemo(() => {
+    if (!activeSessionId) return undefined;
+    return workspaces.find((w) => w.sessions.some((s) => s.id === activeSessionId));
+  }, [workspaces, activeSessionId]);
+  const activeSession = activeWorkspace?.sessions.find((s) => s.id === activeSessionId);
+  const allPaneIds: string[] = [
+    // CityHall client mode hides the code-inspection panes (diff, files) and
+    // the terminal (plus plugin panes below) so only the composer + structured
+    // view remain. See #7.
+    ...(caps.canUseDiff ? ["diff", "files"] : []),
+    ...(caps.canUseTerminal ? ["terminal"] : []),
+    // The background-agents panel only applies to structured-view (ACP)
+    // sessions; a plain terminal session never launches sub-agents.
+    ...(activeSession?.view === "structured" ? ["agents"] : []),
+    ...(caps.cityhall ? [] : pluginPanes.map((p) => p.id)),
+  ];
+
+  // Fetch the diff when the panel is actually showing: on desktop when the
+  // split is expanded, on mobile when the diff view is the active pane.
+  const diffPanelActive = isMdUp ? dockOf(paneLayout, "diff") !== null : rightPanelView === "diff";
+  const {
+    files: diffFiles,
+    perRepoBases,
+    warning,
+    loading: diffFilesLoading,
+    revision,
+    refresh: refreshDiffFiles,
+  } = useDiffFiles(activeSessionId, diffPanelActive);
+
+  // Diff-viewer comments (#928). Acp-only and session-scoped. The
+  // banner lives in the diff pane while the inline UI lives inside
+  // DiffFileViewer, so the store is lifted here and threaded to both.
+  const diffComments = useDiffComments(activeSessionId);
+  const commentsEnabled = activeSession?.view === "structured";
+  // Sending does not require a live worker: the diff-comments handler runs the
+  // same auto-wake as a plain composer prompt (touch_and_wake_if_sunk +
+  // trigger_resume_background, #1748), so an archived / snoozed / idle-dormant
+  // session respawns its worker on send instead of sinking the prompt. A
+  // trashed session is the one exception: the reconciler never resumes it, so
+  // there is nothing to drain into.
+  const commentSendEnabled = commentsEnabled && !activeSession?.trashed_at;
+  // Every disabled state names its cause and what the user can do about it: a
+  // tooltip that only says "unavailable" leaves them staring at a dead button.
+  const commentSendDisabledReason = !commentsEnabled
+    ? "Diff comments can only be sent from the agent view. Switch this session to the agent view first."
+    : "This session is in the trash. Restore it to send comments to the agent.";
+  const commentsIsMultiRepo = (activeSession?.workspace_repos.length ?? 0) > 0;
+  const [sendDialogOpen, setSendDialogOpen] = useState(false);
+
+  useEffect(() => {
+    if (!commentSendEnabled) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (!((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "s")) {
+        return;
+      }
+      if (isInsideEditable(e.target)) return;
+      if (diffComments.count === 0) return;
+      e.preventDefault();
+      setSendDialogOpen(true);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [commentSendEnabled, diffComments.count]);
+
+  // Clear-on-view: opening a session (or having it open when its turn
+  // finishes) reads it, clearing the unread marker. Mirrors the TUI, where
+  // engaging with a session (open / live-send / dwell) clears it. The sidebar
+  // separately hides the chip for the active row, so there's no flash in the
+  // ~poll window before this lands.
+  const unreadIndicatorEnabled = useUnreadIndicatorEnabled();
+  useEffect(() => {
+    if (unreadIndicatorEnabled && activeSessionId && activeSession?.unread) {
+      void setSessionUnread(activeSessionId, false);
+    }
+  }, [unreadIndicatorEnabled, activeSessionId, activeSession?.unread]);
+
+  // Derive selectedFile/rightPanelView/pickerOpen/pairedMounted resets
+  // during render to satisfy
+  // react-you-might-not-need-an-effect/no-adjust-state-on-prop-change
+  // and react-hooks/set-state-in-effect.
+  const prevActiveSessionIdRef = useRef(activeSessionId);
+  if (activeSessionId !== prevActiveSessionIdRef.current) {
+    prevActiveSessionIdRef.current = activeSessionId;
+    setRightPanelView("agent");
+    setPickerOpen(false);
+    setPairedMounted(false);
+    setSelectedFile(null);
+  }
+
+  // Inline derivation for diffFiles validation: clear a stale diff-list
+  // selection. The staleness rule (cited exemption, path+repo match) lives in
+  // diffSelectionStale so it can be unit-tested. See #1810.
+  if (activeSessionId && diffSelectionStale(selectedFile, diffFilesLoading, diffFiles)) {
+    setSelectedFile(null);
+  }
+
+  // Mount the paired shell on first activation and keep it mounted after.
+  if (rightPanelView === "paired" && !pairedMounted) {
+    setPairedMounted(true);
+  }
+
+  // A plugin pane promoted into the mobile main pane can vanish (plugin
+  // unloaded, or the new session has no such pane). Fall back to the agent
+  // view so the user is never stranded on a blank pane. Mirrors the diff /
+  // paired guards above; render-phase derivation per the block at the top.
+  if (isPluginPaneId(rightPanelView) && !pluginPanes.some((p) => p.id === rightPanelView)) {
+    setRightPanelView("agent");
+  }
+
+  // Refit the newly active terminal after a single-pane view switch: the
+  // layers keep their geometry while hidden (visibility, not display:none),
+  // but a resize nudge re-runs the xterm fit so the grid matches exactly.
+  useEffect(() => {
+    if (!singlePane) return;
+    const id = requestAnimationFrame(() => window.dispatchEvent(new Event("resize")));
+    return () => cancelAnimationFrame(id);
+  }, [singlePane, rightPanelView]);
+
+  const focusKeyboardProxy = () => {
+    if (window.innerWidth < 768 && navigator.maxTouchPoints > 0) {
+      keyboardProxyRef.current?.focus();
+    }
+  };
+  const closeKeyboardProxy = () => {
+    if (window.innerWidth < 768 && navigator.maxTouchPoints > 0) {
+      keyboardProxyRef.current?.blur();
+      if (document.activeElement instanceof HTMLTextAreaElement) document.activeElement.blur();
+    }
+  };
+
+  // The keyboard proxy survives terminal mounts so iOS can retain the focus
+  // authorized by a sidebar tap. Drop its receiver only at a real session
+  // boundary: clearing it while reselecting the active session leaves that
+  // still-mounted terminal without anything to re-register it.
+  const keyboardProxySessionIdRef = useRef(activeSessionId);
+  const transitionKeyboardProxy = useCallback((nextSessionId: string | null) => {
+    if (keyboardProxySessionIdRef.current === nextSessionId) return;
+    keyboardProxySessionIdRef.current = nextSessionId;
+    clearMobileKeyboardProxyInput();
+  }, []);
+
+  // Sidebar selection clears before the proxy can accept another edit. This
+  // also covers browser history and every other route change before the next
+  // input event, without clearing an unchanged session.
+  useLayoutEffect(() => {
+    transitionKeyboardProxy(activeSessionId);
+  }, [activeSessionId, transitionKeyboardProxy]);
+
+  useEffect(() => {
+    const proxy = keyboardProxy;
+    if (!proxy) return;
+    const onBeforeInput = (e: InputEvent) => {
+      switch (e.inputType) {
+        case "insertText":
+        case "insertLineBreak":
+        case "insertParagraph":
+        case "deleteContentBackward":
+        case "insertFromPaste":
+          e.preventDefault();
+          deliverMobileKeyboardProxyInput({
+            inputType: e.inputType,
+            data: e.data,
+            isComposing: e.isComposing,
+          });
+          break;
+        default:
+          break;
+      }
+    };
+    proxy.addEventListener("beforeinput", onBeforeInput);
+    return () => proxy.removeEventListener("beforeinput", onBeforeInput);
+  }, [keyboardProxy]);
+
+  // Selecting a session in the sidebar should land focus on its canonical
+  // "type here" target so the user can start typing without a second click:
+  // the acp composer in acp mode, the xterm textarea otherwise. See
+  // requestSessionInputFocus for the dispatch/latch and coarse-pointer rules.
+  const isCoarse = useIsCoarsePointer();
+  const focusAgentInput = useCallback(
+    (session: SessionResponse | undefined) => requestSessionInputFocus(session, isCoarse),
+    [isCoarse],
+  );
+
+  const handleSelectSession = useCallback(
+    (sessionId: string) => {
+      const ws = workspaces.find((w) => w.sessions.some((s) => s.id === sessionId));
+      if (ws) {
+        const picked = ws.sessions.find((s) => s.id === sessionId);
+        transitionKeyboardProxy(sessionId);
+        navigate(`/session/${encodeURIComponent(sessionId)}`);
+        // iOS does not permit a session's asynchronously mounted terminal
+        // input to inherit this sidebar tap's keyboard authorization. The
+        // persistent keyboard input keeps the gesture-authorized focus while
+        // a terminal is starting; the terminal consumes its input directly
+        // rather than attempting a second, unreliable focus transfer.
+        if (isCoarse) {
+          // Claude's alternate-screen startup still loses the first keyboard
+          // input on iOS (#3285). Start it as a monitoring view until that
+          // separate transport race is fixed; other terminal agents remain
+          // safe to auto-open.
+          if (picked?.tool === "claude" && picked.view !== "structured") {
+            closeKeyboardProxy();
+          } else if (webSettings.autoOpenKeyboard) {
+            focusKeyboardProxy();
+            if (picked?.view === "structured") setPendingTerminalFocus("composer");
+          }
+        } else {
+          focusKeyboardProxy();
+          focusAgentInput(picked);
+        }
+        if (window.innerWidth < 768) setSidebarOpen(false);
+      }
+    },
+    [navigate, workspaces, focusAgentInput, isCoarse, transitionKeyboardProxy, webSettings.autoOpenKeyboard],
+  );
+
+  const handleSelectWorkspace = (workspaceId: string) => {
+    const ws = workspaces.find((w) => w.id === workspaceId);
+    if (ws) {
+      const running = ws.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
+      const picked = running ?? ws.sessions[0] ?? null;
+      if (picked) {
+        transitionKeyboardProxy(picked.id);
+        navigate(`/session/${encodeURIComponent(picked.id)}`);
+        // See handleSelectSession: keep focus on the persistent keyboard input
+        // until the selected surface can receive it.
+        if (isCoarse) {
+          if (picked.tool === "claude" && picked.view !== "structured") {
+            closeKeyboardProxy();
+          } else if (webSettings.autoOpenKeyboard) {
+            focusKeyboardProxy();
+            if (picked.view === "structured") setPendingTerminalFocus("composer");
+          }
+        } else {
+          focusKeyboardProxy();
+          focusAgentInput(picked);
+        }
+      } else {
+        transitionKeyboardProxy(null);
+        navigate("/");
+      }
+    }
+    if (window.innerWidth < 768) {
+      setSidebarOpen(false);
+    }
+  };
+
+  // In-app toast forwarded from the service worker sets this event when
+  // the user taps it; navigate to the session that triggered the push.
+  useEffect(() => {
+    const onOpen = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { sessionId?: string } | undefined;
+      if (detail?.sessionId) {
+        handleSelectSession(detail.sessionId);
+      }
+    };
+    window.addEventListener(OPEN_SESSION_EVENT, onOpen);
+    return () => window.removeEventListener(OPEN_SESSION_EVENT, onOpen);
+  }, [handleSelectSession]);
+
+  const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
+  const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string | null>(null);
+  const [stoppingWorkspaceId, setStoppingWorkspaceId] = useState<string | null>(null);
+  const [switchViewTarget, setSwitchViewTarget] = useState<{ sessionId: string; toStructured: boolean } | null>(null);
+  // `serverAbout === null` conflates "not fetched yet" with "fetch failed", so
+  // the tour gates auto-launch on an explicit loaded flag instead.
+  const [serverAboutLoaded, setServerAboutLoaded] = useState(false);
+
+  const refreshServerAbout = useCallback(async () => {
+    try {
+      const about = await fetchAbout();
+      if (about) setServerAbout(about);
+    } finally {
+      setServerAboutLoaded(true);
+    }
+  }, []);
+
+  // Kick off the initial server-about fetch on mount. The effect body only
+  // calls fetchAbout and schedules the telemetry consent check; neither runs
+  // setState synchronously, so set-state-in-effect is not triggered.
+  useEffect(() => {
+    let active = true;
+    void fetchAbout()
+      .then((about) => {
+        if (!active) return;
+        if (about) setServerAbout(about);
+        // Read-only servers can't persist an opt-in choice, so skip the ping.
+        if (about && !about.read_only) reportTelemetrySeen("web");
+      })
+      // `serverAboutLoaded` gates the shell render, so it must flip on a failed
+      // or missing /api/about too, not only on success. Otherwise the shell
+      // would hang on its placeholder.
+      .finally(() => {
+        if (active) setServerAboutLoaded(true);
+      });
+    void fetchTelemetryStatus()
+      .then((status) => {
+        if (!active || !status) return;
+        if (!status.responded && !status.do_not_track) {
+          setTelemetryConsentNeeded(true);
+        }
+      })
+      .finally(() => {
+        if (active) setTelemetryConsentKnown(true);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // Telemetry: report that the acp web UI was opened, folded into the
+  // daemon's next opt-in snapshot under the `usage_seen` map's `acp` key.
+  // `activeSession` drives both the desktop and mobile acp mounts, so this
+  // single effect covers both layouts. Same guard as the `"web"` ping above:
+  // skip until `serverAbout` loads, skip read-only servers (which can't
+  // persist). The backend folds repeated pings into a monotonic open-count
+  // (decremented by exactly what each snapshot reported), so re-fires on
+  // session switch are harmless. See #1882.
+  useEffect(() => {
+    if (!serverAboutLoaded || serverAbout?.read_only) return;
+    if (activeSession?.view !== "structured") return;
+    reportTelemetrySeen("structured_view");
+  }, [serverAboutLoaded, serverAbout?.read_only, activeSession?.view]);
+
+  const handleTelemetryConsent = useCallback((enabled: boolean) => {
+    setTelemetryConsentNeeded(false);
+    void setTelemetryConsent(enabled);
+  }, []);
+
+  const deletingWorkspace = deletingWorkspaceId ? workspaces.find((w) => w.id === deletingWorkspaceId) : null;
+  const deletingSessions = deletingWorkspace?.sessions ?? [];
+  const liveDeletingSessions = deletingSessions.filter((session) => !session.trashed_at);
+  const deletingSession = deletingWorkspace?.sessions[0] ?? null;
+  const deletingDefaultToTrash = liveDeletingSessions.some((session) => session.cleanup_defaults.delete_to_trash);
+  const deletingCleanupDefaults = deletingSession
+    ? {
+        delete_to_trash: deletingDefaultToTrash,
+        ...workspaceCleanupDefaults(deletingSessions),
+      }
+    : null;
+  const deletingBranchName =
+    deletingSessions.find((session) => session.branch)?.branch ?? deletingSession?.branch ?? null;
+
+  const handleDeleteSession = useCallback((workspaceId: string) => {
+    setDeletingWorkspaceId(workspaceId);
+  }, []);
+
+  const handleConfirmDelete = async (options: DeleteSessionOptions) => {
+    if (!deletingWorkspace) return;
+    const sessions = deletingWorkspace.sessions;
+    // Close the dialog immediately; the loop, ordering, and toast logic live
+    // in deleteWorkspaceSessions so they are unit-testable without the bundle.
+    setDeletingWorkspaceId(null);
+    await deleteWorkspaceSessions(sessions, options, activeSessionId, {
+      setStatus: setSessionStatus,
+      // Drop a deleted session's local-only state (#1358 acp cache + draft,
+      // #1842 diff comments). Cross-tab / cross-device deletes fall to the
+      // startup sweep.
+      purgeLocal: (id) => {
+        clearAcpCache(id);
+        clearDraft(id);
+        clearStoredComments(id);
+      },
+      navigateHome: () => navigate("/"),
+      notify: toastBus.handler,
+    });
+  };
+
+  // Empty Trash (#3167): purge every trashed workspace in one action, mirroring
+  // the TUI's `empty_trash_all`. Reuses the atomic per-workspace delete loop, so
+  // partial failures stay consistent (each call flags only its own failed ids).
+  // Per-workspace toasts are suppressed for one summary; force_delete matches
+  // the TUI so a dirty worktree cannot block a bulk purge.
+  // Rows stay in `trashedWorkspaces` (as Deleting) until the next /api/sessions
+  // poll drops them, so the Trash panel and its Empty Trash button are still
+  // clickable while this loop runs. Without the guard a second confirm starts a
+  // concurrent loop that re-issues a DELETE for every workspace and fires a
+  // second summary toast.
+  const emptyingTrashRef = useRef(false);
+  const handleEmptyTrash = useCallback(async () => {
+    if (trashedWorkspaces.length === 0 || emptyingTrashRef.current) return;
+    emptyingTrashRef.current = true;
+    let anyFailed = false;
+    const notify: Notifier = {
+      error: () => {
+        anyFailed = true;
+      },
+      info: () => {},
+    };
+    // Purge one workspace at a time, matching the CLI's sequential
+    // `for inst in &trashed` loop (src/cli/session.rs) and the TUI's single
+    // shared deletion poller. Running teardowns in series keeps the summary
+    // toast trivially ordered and stops N git worktree removals from racing on
+    // one source repo, the same sequential-await idiom trashActions.ts uses.
+    try {
+      for (const ws of trashedWorkspaces) {
+        await deleteWorkspaceSessions(
+          ws.sessions,
+          {
+            ...workspaceCleanupDefaults(ws.sessions),
+            force_delete: true,
+          },
+          activeSessionId,
+          {
+            setStatus: setSessionStatus,
+            purgeLocal: (id) => {
+              clearAcpCache(id);
+              clearDraft(id);
+              clearStoredComments(id);
+            },
+            navigateHome: () => navigate("/"),
+            notify,
+          },
+        );
+      }
+    } finally {
+      emptyingTrashRef.current = false;
+    }
+    toastBus.handler?.[anyFailed ? "error" : "info"](
+      anyFailed ? "Some trashed sessions could not be deleted" : "Emptied trash",
+    );
+  }, [trashedWorkspaces, activeSessionId, setSessionStatus, navigate]);
+
+  // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
+  // deliberately KEEPS the per-session acp cache, draft, and stored comments
+  // so a restore is faithful; only purge clears them. Trashes every session
+  // in the workspace so a multi-session workspace sinks as a whole.
+  const handleConfirmTrash = async () => {
+    if (!deletingWorkspace) return;
+    const ids = deletingWorkspace.sessions.map((s) => s.id);
+    if (ids.length === 0) return;
+    const wasActive = activeSessionId != null && ids.includes(activeSessionId);
+
+    setDeletingWorkspaceId(null);
+    for (const id of ids) setSessionStatus(id, "Stopped");
+    if (wasActive) {
+      navigate("/");
+    }
+
+    // The returned snapshot re-buckets each row into Trash immediately
+    // instead of on the next poll. See trashSessions.
+    await trashSessions(ids, {
+      applySession,
+      onError: (id) => setSessionStatus(id, "Error"),
+      notify: toastBus.handler,
+    });
+  };
+
+  // Restore a trashed workspace from the sidebar Trash section (#2489).
+  // Restores every session in the workspace (a workspace only lands in Trash
+  // when all of its sessions are trashed), not just the first.
+  const handleRestoreSession = useCallback(
+    (sessionIds: string[]) => restoreSessions(sessionIds, { applySession, notify: toastBus.handler }),
+    [applySession],
+  );
+
+  const stoppingWorkspace = stoppingWorkspaceId ? workspaces.find((w) => w.id === stoppingWorkspaceId) : null;
+  const stoppingSession = stoppingWorkspace?.sessions[0] ?? null;
+
+  const handleStopSession = useCallback((workspaceId: string) => {
+    setStoppingWorkspaceId(workspaceId);
+  }, []);
+
+  const handleConfirmStop = useCallback(async () => {
+    if (!stoppingSession) return;
+    const sessionId = stoppingSession.id;
+
+    // Close the dialog and show "Stopped" immediately; the 2s status poller
+    // reconciles the true state and corrects this if the request fails.
+    setStoppingWorkspaceId(null);
+    setSessionStatus(sessionId, "Stopped");
+
+    const result = await stopSession(sessionId);
+    if (!result) {
+      setSessionStatus(sessionId, "Error");
+      toastBus.handler?.error("Failed to stop session");
+      return;
+    }
+    toastBus.handler?.info("Session stopped");
+  }, [stoppingSession, setSessionStatus]);
+
+  const switchViewSession = switchViewTarget
+    ? (workspaces.flatMap((w) => w.sessions).find((s) => s.id === switchViewTarget.sessionId) ?? null)
+    : null;
+
+  const handleSwitchView = useCallback((sessionId: string, toStructured: boolean) => {
+    setSwitchViewTarget({ sessionId, toStructured });
+  }, []);
+
+  const handleConfirmSwitchView = useCallback(async () => {
+    if (!switchViewTarget) return;
+    const { sessionId, toStructured } = switchViewTarget;
+    // Keep the dialog mounted through the request so its "Switching..." spinner
+    // shows; close it once the switch resolves.
+    const result = toStructured ? await acpEnable(sessionId) : await acpDisable(sessionId);
+    setSwitchViewTarget(null);
+    if (!result) {
+      toastBus.handler?.error(`Failed to switch to ${toStructured ? "structured view" : "terminal"}`);
+      return;
+    }
+    toastBus.handler?.info(`Switched to ${toStructured ? "structured view" : "terminal"}`);
+  }, [switchViewTarget]);
+
+  const handleStartSession = useCallback(
+    async (workspaceId: string) => {
+      const ws = workspaces.find((w) => w.id === workspaceId);
+      const session = ws?.sessions[0];
+      if (!session) return;
+
+      // Optimistic Starting; the status poller reconciles to the real state.
+      setSessionStatus(session.id, "Starting");
+      const result = await startSession(session.id);
+      if (!result) {
+        setSessionStatus(session.id, "Error");
+        toastBus.handler?.error("Failed to start session");
+        return;
+      }
+      toastBus.handler?.info("Session started");
+    },
+    [workspaces, setSessionStatus],
+  );
+
+  const handleCreateSession = useCallback(
+    (repoPath: string) => {
+      const projectSessions = sessions
+        .filter((s) => (s.main_repo_path || s.project_path) === repoPath)
+        .sort((a, b) => (b.last_accessed_at ?? "").localeCompare(a.last_accessed_at ?? ""));
+      const latest = projectSessions[0];
+
+      setWizardPrefill({
+        path: repoPath,
+        tool: latest?.tool ?? "claude",
+        yoloMode: latest?.yolo_mode ?? false,
+        sandboxEnabled: latest?.is_sandboxed ?? false,
+        profile: latest?.profile || undefined,
+        group: latest?.group_path || undefined,
+      });
+      setShowSessionWizard(true);
+    },
+    [sessions],
+  );
+
+  // Pin a repo so its header persists with zero sessions. If the repo is
+  // already a saved project, just set its pin flag (PATCH); otherwise register
+  // it pinned (scope global, matching the TUI's global registry). Then refresh
+  // so the diamond / empty header reflects it. See #2047, #2208.
+  const handlePinProject = useCallback(
+    async (repoPath: string) => {
+      const key = normalizeProjectPathKey(repoPath);
+      const existing = projects.filter((p) => normalizeProjectPathKey(p.path) === key);
+      let failed: { error?: string } | undefined;
+      if (existing.length > 0) {
+        const results = await Promise.all(existing.map((p) => setProjectPinned(p.name, p.scope, true)));
+        failed = results.find((r) => !r.ok);
+      } else {
+        const res = await createProject({ path: repoPath, scope: "global", pinned: true });
+        if (!res.ok) failed = res;
+      }
+      if (failed) {
+        toastBus.handler?.error(failed.error ?? "Failed to pin project");
+        return;
+      }
+      await refreshProjects();
+    },
+    [projects, refreshProjects],
+  );
+
+  // Unpin a repo: clear the pin flag on every pinned registry entry for its
+  // path (a path can be registered under both global and profile scope),
+  // keeping the saved project so it stays in the Projects view and the wizard.
+  // Only the Projects view's Remove deletes the entry. See #2208.
+  const handleUnpinProject = useCallback(
+    async (group: SidebarGroup) => {
+      const pinned = group.registeredProjects.filter((p) => p.pinned);
+      const results = await Promise.all(pinned.map((p) => setProjectPinned(p.name, p.scope, false)));
+      const failed = results.find((r) => !r.ok);
+      if (failed) {
+        toastBus.handler?.error(failed.error ?? "Failed to unpin project");
+      }
+      await refreshProjects();
+    },
+    [refreshProjects],
+  );
+
+  // Add / edit a saved project from the sidebar Projects section. The modal is
+  // open for `add` (no editProject) or `edit` (a specific registration); both
+  // refresh the registry on save. See #2212.
+  const [projectForm, setProjectForm] = useState<{ editProject: ProjectInfo | null } | null>(null);
+  const handleAddProject = useCallback(() => setProjectForm({ editProject: null }), []);
+  const handleEditProject = useCallback((project: ProjectInfo) => setProjectForm({ editProject: project }), []);
+
+  // Remove a saved project: delete every registration for its path, then
+  // refresh. Confirms first since it is not undoable. See #2212.
+  const handleRemoveProject = useCallback(
+    async (group: RepoGroup) => {
+      if (!confirm(`Remove project '${group.displayName}' from the sidebar?`)) return;
+      const results = await Promise.all(group.registeredProjects.map((p) => deleteProject(p.name, p.scope)));
+      const failed = results.find((r) => !r.ok);
+      if (failed) {
+        toastBus.handler?.error(failed.error ?? "Failed to remove project");
+      }
+      await refreshProjects();
+    },
+    [refreshProjects],
+  );
+
+  // The right-panel control toggles the desktop split, but on mobile there
+  // is no split to collapse: it opens the view picker instead (#1452).
+  const toggleDiff = useCallback(() => {
+    if (isMdUp) {
+      toggleKind("diff", "right");
+    } else {
+      setPickerOpen((o) => !o);
+    }
+  }, [isMdUp, toggleKind]);
+
+  // Collapse or restore the whole right dock (the "toggle right panel"
+  // shortcut). Collapse hides the dock without removing its tabs so expanding
+  // restores the active session's previous pane set.
+  const toggleRightDock = useCallback(() => {
+    if (!isMdUp) {
+      setPickerOpen((o) => !o);
+      return;
+    }
+    if (rightDockCollapsed) {
+      setDockCollapsed("right", false);
+      if (availableRightGroups.length === 0) {
+        openTab("diff", "right");
+        openTab(terminalTabId(0), "right");
+      }
+    } else {
+      setDockCollapsed("right", true);
+    }
+  }, [isMdUp, rightDockCollapsed, setDockCollapsed, availableRightGroups.length, openTab]);
+
+  const handlePickView = useCallback((view: RightPanelView) => {
+    setRightPanelView(view);
+    setPickerOpen(false);
+  }, []);
+
+  const handleSelectFile = useCallback((path: string, repoName?: string, line?: number) => {
+    setSelectedFile({ path, repoName, line });
+  }, []);
+
+  // Open a local file reference cited in an acp transcript (Codex
+  // `path:line` markdown links). Resolve the absolute path back to a
+  // repo-relative path for the active session and open it in the in-app
+  // diff/file viewer, keeping the current session route. A path outside
+  // the session's known repo roots surfaces a non-destructive toast
+  // rather than navigating away. The parsed line is threaded through so the
+  // viewer scrolls it into view. See #1718, #1809.
+  const handleOpenFileRef = useCallback(
+    (ref: FileRef) => {
+      if (!activeSession) return;
+      const resolved = resolveToRepoRelative(ref.path, activeSession);
+      // A git session with an in-repo path uses the diff viewer (#1718). A
+      // scratch (non-git) session has no diff endpoint, so it always uses the
+      // provenance-confined /file viewer, as does any out-of-repo absolute path
+      // the agent touched this session (a plan in /tmp, ~/.claude, etc.). #3088.
+      if (resolved && !activeSession.scratch) {
+        setSelectedFile({
+          path: resolved.relativePath,
+          repoName: resolved.repoName,
+          line: ref.line,
+          cited: true,
+        });
+        return;
+      }
+      if (resolved || isAbsolutePath(ref.path)) {
+        setSelectedFile({
+          path: resolved?.relativePath ?? ref.path,
+          line: ref.line,
+          cited: true,
+          external: true,
+        });
+        return;
+      }
+      toastBus.handler?.error(`Could not open ${ref.path}: not inside this session's repo`);
+    },
+    [activeSession],
+  );
+
+  const handleCloseFile = useCallback(() => {
+    setSelectedFile(null);
+  }, []);
+
+  const handleGoDashboard = useCallback(() => {
+    navigate("/");
+    setSelectedFile(null);
+  }, [navigate]);
+
+  const handleOpenSettings = useCallback(() => {
+    navigate("/settings");
+    if (window.innerWidth < 768) setSidebarOpen(false);
+  }, [navigate]);
+
+  // Profiles moved into Settings as a tab; redirect the retired standalone
+  // route so old bookmarks and links still land somewhere valid.
+  useEffect(() => {
+    if (profilesMatch) navigate(`/settings/profiles${window.location.search}`, { replace: true });
+  }, [profilesMatch, navigate]);
+
+  const handleCloseSettings = useCallback(() => {
+    if (activeSessionId) {
+      navigate(`/session/${encodeURIComponent(activeSessionId)}`);
+    } else {
+      navigate("/");
+    }
+  }, [navigate, activeSessionId]);
+
+  const handleOpenHelp = useCallback(() => {
+    setShowHelp(true);
+  }, []);
+
+  const handleOpenAbout = useCallback(() => {
+    setShowAbout(true);
+  }, []);
+
+  const handleToggleSidebar = useCallback(() => {
+    setSidebarOpen((o) => !o);
+  }, []);
+
+  const openSidebar = useCallback(() => setSidebarOpen(true), []);
+  const openDiff = useCallback(() => {
+    if (isMdUp) {
+      openTab("diff", "right");
+    } else {
+      setPickerOpen(true);
+    }
+  }, [isMdUp, openTab]);
+  useEdgeSwipe({
+    edge: "left",
+    // The swipe-right-to-open gesture only makes sense for a left-anchored
+    // drawer; with the sidebar on the right edge it would slide in from the
+    // opposite side of the drag, so disable it there (#2244).
+    enabled: !sidebarOpen && webSettings.sidebarSide !== "right",
+    onSwipe: openSidebar,
+    blurOnSwipe: true,
+    // A swipe-right anywhere on screen opens the sidebar, not just from the
+    // left edge. The right-edge (diff) swipe stays edge-only below.
+    anywhere: true,
+  });
+  useEdgeSwipe({
+    edge: "right",
+    enabled: rightDockCollapsed && !!activeSessionId,
+    onSwipe: openDiff,
+  });
+
+  // Read-only mode hides mutation UI. Guard creation at the handler so every
+  // caller (keyboard shortcut, command palette) is a no-op rather than opening
+  // a wizard that 403s on submit. Caught by the live read-only-mode spec.
+  const handleNewSession = useCallback(() => {
+    if (serverAbout?.read_only) return;
+    setWizardPrefill(undefined);
+    setShowSessionWizard(true);
+  }, [serverAbout?.read_only]);
+
+  const handleNewScratch = useCallback(() => {
+    if (serverAbout?.read_only) return;
+    setWizardPrefill({ scratch: true });
+    setShowSessionWizard(true);
+  }, [serverAbout?.read_only]);
+
+  const handleCloneFromUrl = useCallback(() => {
+    setWizardPrefill({ initialTab: "clone" });
+    setShowSessionWizard(true);
+  }, []);
+
+  const handleToggleTerminalFocus = useCallback(() => {
+    if (!activeSessionId) return;
+    // Probe by data-term attribute rather than a component ref: it is
+    // robust against panel reorderings and against the paired terminal
+    // living in either the desktop split or the mobile single pane.
+    //
+    // Semantic: VSCode-like "Cmd+` opens/focuses the terminal." So if the
+    // user is NOT in the paired terminal, send them there; only flip back
+    // to agent when they're already in paired.
+    const active = document.activeElement;
+    const pairedPanels = document.querySelectorAll<HTMLElement>('[data-term="paired"]');
+    let inPaired = false;
+    if (active) {
+      for (const p of pairedPanels) {
+        if (p.contains(active)) {
+          inPaired = true;
+          break;
+        }
+      }
+    }
+    const target = inPaired ? "agent" : "paired";
+
+    if (singlePane) {
+      // Below md there is one full-viewport pane. Promote the target view,
+      // then dispatch focus on the next frame: the inactive layer is inert
+      // until React commits the switch, and focus() on an inert subtree is
+      // a no-op. The paired shell mounts lazily on first activation, so its
+      // PTY may not be ready when the dispatch fires; latch the intent too,
+      // and PairedTerminal grabs focus once ready.
+      setRightPanelView(target);
+      if (target === "paired") setPendingTerminalFocus("paired");
+      requestAnimationFrame(() => dispatchFocusTerminal(target));
+      return;
+    }
+
+    if (target === "paired") {
+      // The paired shell only mounts when a terminal tab is the active tab of
+      // its group. Prefer a terminal that is already active (and thus mounted)
+      // over the first one, so multi-group layouts focus the live terminal
+      // instead of switching another group's tab.
+      const terminalTabs = (["right", "bottom"] as DockLocation[])
+        .flatMap((d) => dockTabs(paneLayout, d))
+        .filter(isTerminalTabId);
+      const termTab = terminalTabs.find((id) => isActiveTab(paneLayout, id)) ?? terminalTabs[0] ?? terminalTabId(0);
+      const termDock = dockOf(paneLayout, termTab);
+      if (termDock && isActiveTab(paneLayout, termTab)) {
+        // Already the active tab (mounted): move focus synchronously so rapid
+        // agent<->paired toggles stay deterministic.
+        dispatchFocusTerminal("paired");
+        return;
+      }
+      // Not mounted yet: latch the intent and activate/open its tab; the paired
+      // panel grabs focus once its PTY is ready.
+      setPendingTerminalFocus("paired");
+      if (termDock) activateTab(termDock, termTab);
+      else openTab(termTab, "right");
+      return;
+    }
+    if (target === "agent" && selectedFilePath) {
+      // Agent terminal is hidden under the diff viewer; close the diff first
+      // so the wrapper un-hides, then dispatch on the next frame because
+      // focus() on a display:none element is a no-op.
+      setSelectedFile(null);
+      requestAnimationFrame(() => dispatchFocusTerminal("agent"));
+      return;
+    }
+    dispatchFocusTerminal(target);
+  }, [activeSessionId, singlePane, paneLayout, openTab, activateTab, selectedFilePath]);
+
+  // Flattened, display-ordered session ids plus the subset needing attention,
+  // sourced from the same sidebar model the user sees so jump-to-next follows
+  // the visible order under any sort or axis.
+  const attentionJump = useMemo(() => {
+    const orderedIds: string[] = [];
+    const attention = new Set<string>();
+    for (const g of sidebarGroups) {
+      for (const v of g.workspaces) {
+        for (const s of v.workspace.sessions) {
+          orderedIds.push(s.id);
+          if (sessionNeedsAttention(s)) attention.add(s.id);
+        }
+      }
+    }
+    return { orderedIds, attention };
+  }, [sidebarGroups]);
+
+  const handleJumpToAttention = useCallback(() => {
+    const next = nextAttentionSessionId(attentionJump.orderedIds, attentionJump.attention, activeSessionId);
+    if (next) handleSelectSession(next);
+  }, [attentionJump, activeSessionId, handleSelectSession]);
+
+  useKeyboardShortcuts(
+    useCallback(
+      () => ({
+        onNew: handleNewSession,
+        onJumpToAttention: handleJumpToAttention,
+        onNewScratch: handleNewScratch,
+        onDiff: () => toggleDiff(),
+        // Escape closes local UI surfaces only (dialogs, palette,
+        // wizard, settings, help, file viewer). Never wire this to
+        // acp.cancelPrompt; Claude Code CLI does that and stray
+        // Escape presses kill in-flight turns the user didn't mean to
+        // abort. Cancel/stop must stay behind an explicit gesture
+        // (the assistant-ui Stop button in the composer).
+        onEscape: () => {
+          if (showFleet) {
+            setShowFleet(false);
+            return;
+          }
+          if (deletingWorkspaceId) {
+            setDeletingWorkspaceId(null);
+            return;
+          }
+          if (stoppingWorkspaceId) {
+            setStoppingWorkspaceId(null);
+            return;
+          }
+          if (showPalette) {
+            setShowPalette(false);
+            setPaletteQuery("");
+            return;
+          }
+          setShowSessionWizard(false);
+          setShowHelp(false);
+          if (showSettings) handleCloseSettings();
+          setShowAbout(false);
+          setSelectedFile(null);
+        },
+        onHelp: () => setShowHelp((h) => !h),
+        onSettings: () => (showSettings ? handleCloseSettings() : navigate("/settings")),
+        onPalette: () => {
+          setPaletteQuery("");
+          setShowPalette((p) => !p);
+        },
+        onToggleSidebar: () => setSidebarOpen((o) => !o),
+        onToggleRightPanel: () => toggleRightDock(),
+        onToggleTerminalFocus: handleToggleTerminalFocus,
+      }),
+      [
+        toggleDiff,
+        toggleRightDock,
+        showPalette,
+        showFleet,
+        deletingWorkspaceId,
+        stoppingWorkspaceId,
+        showSettings,
+        handleCloseSettings,
+        navigate,
+        handleToggleTerminalFocus,
+        handleNewSession,
+        handleNewScratch,
+        handleJumpToAttention,
+      ],
+    ),
+  );
+
+  // Palette triage toggles for the active session. "snooze" needs a duration,
+  // so it opens the shared modal; the rest are argless server toggles that
+  // apply the returned snapshot immediately (re-bucketing without waiting for
+  // the poll) and surface a toast on failure.
+  const handleSessionStateAction = useCallback(
+    async (id: string, action: SessionStateAction) => {
+      if (action === "snooze") {
+        setSnoozeTargetId(id);
+        return;
+      }
+      const run: Record<Exclude<SessionStateAction, "snooze">, () => Promise<SessionResponse | null>> = {
+        pin: () => setSessionPin(id, true),
+        unpin: () => setSessionPin(id, false),
+        archive: () => setSessionArchive(id, true),
+        unarchive: () => setSessionArchive(id, false),
+        unsnooze: () => setSessionSnooze(id, null),
+        trash: () => trashSession(id),
+        untrash: () => restoreSession(id),
+      };
+      const result = await run[action]();
+      if (result) applySession(result);
+      else reportError(`Failed to ${action} session`);
+    },
+    [applySession],
+  );
+
+  const commandActions = useCommandActions({
+    sessions,
+    activeSessionId,
+    activeSession: activeSession ?? null,
+    loginRequired,
+    hasActiveSession: !!activeSession,
+    readOnly: !!serverAbout?.read_only,
+    onNewSession: handleNewSession,
+    onNewScratch: handleNewScratch,
+    onSelectSession: handleSelectSession,
+    onJumpToAttention: handleJumpToAttention,
+    hasAttentionSession: attentionJump.attention.size > 0,
+    onSessionStateAction: handleSessionStateAction,
+    onToggleDiff: toggleDiff,
+    onOpenSettings: handleOpenSettings,
+    onOpenHelp: handleOpenHelp,
+    onOpenAbout: handleOpenAbout,
+    onGoDashboard: handleGoDashboard,
+    onToggleSidebar: handleToggleSidebar,
+    onLogout,
+  });
+
+  const openSettingsTab = useCallback((tab: string) => navigate(`/settings/${tab}`), [navigate]);
+  const settingsCommands = useSettingsCommands({
+    open: showPalette,
+    readOnly: !!serverAbout?.read_only,
+    onOpenSettingsTab: openSettingsTab,
+  });
+  const { actions: pluginCommandActions, overlay: pluginLinkPicker } = usePluginCommands(
+    pluginUiEntries,
+    activeSessionId,
+  );
+
+  // Conversation-content search for the palette (#2515). paletteQuery is
+  // declared above (near showPalette) so the keyboard handlers can clear it
+  // on close/toggle; consumed here.
+  const { results: conversationHits, loading: conversationSearching } = useConversationSearch(paletteQuery);
+  const conversationActions = useMemo(
+    () =>
+      buildConversationActions(conversationHits, sessions, activeSessionId).map(({ sessionId, ...rest }) => ({
+        ...rest,
+        perform: () => handleSelectSession(sessionId),
+      })),
+    [conversationHits, sessions, activeSessionId, handleSelectSession],
+  );
+
+  const renderContent = () => {
+    if (showSettings) {
+      return (
+        <SettingsView
+          tab={settingsTab}
+          onClose={handleCloseSettings}
+          onSelectTab={(t) => {
+            const p = searchParams.get("profile");
+            navigate(`/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`);
+          }}
+          onServerAboutRefresh={refreshServerAbout}
+          onSettingsRefresh={onSettingsRefresh}
+          profile={searchParams.get("profile")}
+          onSelectProfile={(p) => {
+            const next = new URLSearchParams(searchParams);
+            next.set("profile", p);
+            setSearchParams(next, { replace: true });
+          }}
+          readOnly={serverAbout?.read_only}
+          cityhall={caps.cityhall}
+        />
+      );
+    }
+
+    // Refresh on `/session/<id>` paints once with `sessions === []` before
+    // the first poll resolves. Without this guard the lookup misses, the
+    // dashboard fallback renders, and the acp/terminal view only
+    // reappears once the fetch lands. Hold the minimal pre-auth shell
+    // until the first fetch settles, then let the real fallback decide.
+    // See #1351.
+    if (activeSessionId && !sessionsLoaded) {
+      // The shell (TopBar + sidebar) already renders around this; fill the main
+      // pane with a skeleton rather than blanking it until the first fetch lands.
+      return <MainPaneSkeleton />;
+    }
+
+    if (!activeWorkspace || !activeSession) {
+      return (
+        <Dashboard
+          sessions={sessions}
+          onSelectSession={handleSelectSession}
+          onNewSession={handleNewSession}
+          onCloneFromUrl={handleCloneFromUrl}
+          onToggleSidebar={handleToggleSidebar}
+          onOpenFleet={caps.cityhall ? undefined : () => setShowFleet(true)}
+          readOnly={serverAbout?.read_only}
+          canManageProjects={caps.canManageProjects}
+        />
+      );
+    }
+
+    // Below the md breakpoint there is no room for the side-by-side split.
+    // Render one full-viewport pane and let the picker choose which view
+    // occupies it (#1452). The agent terminal (and the paired shell, once
+    // first opened) stay mounted but hidden so their PTY, scrollback, and
+    // focus survive view switches; the diff view has no xterm so it mounts
+    // on demand. Inactive layers use visibility, never display:none, which
+    // would collapse xterm's measured geometry to zero. The desktop branch
+    // below is left exactly as it was; only this mobile branch is new.
+    if (singlePane) {
+      return (
+        <MobileMainPane
+          view={rightPanelView}
+          pluginPanes={pluginPanes}
+          onBackToAgent={() => setRightPanelView("agent")}
+          pairedMounted={pairedMounted}
+          activeSession={activeSession ?? null}
+          activeSessionId={activeSessionId}
+          sessions={sessions}
+          webSettings={webSettings}
+          selectedFilePath={selectedFilePath}
+          selectedRepoName={selectedRepoName}
+          selectedFileLine={selectedFileLine}
+          revision={revision}
+          diffFiles={diffFiles}
+          perRepoBases={perRepoBases}
+          warning={warning}
+          diffFilesLoading={diffFilesLoading}
+          onSelectFile={handleSelectFile}
+          onOpenFileRef={handleOpenFileRef}
+          onCloseFile={handleCloseFile}
+          onDiffRefresh={refreshDiffFiles}
+          commentsEnabled={commentsEnabled}
+          commentSendEnabled={commentSendEnabled}
+          commentSendDisabledReason={commentSendDisabledReason}
+          diffComments={diffComments}
+          commentsIsMultiRepo={commentsIsMultiRepo}
+          sendDialogOpen={sendDialogOpen}
+          onOpenSendDialog={() => setSendDialogOpen(true)}
+          onCloseSendDialog={() => setSendDialogOpen(false)}
+          onClearSelectedFile={() => setSelectedFile(null)}
+        />
+      );
+    }
+
+    // Render a pane body by id. Passed to the docks as a callback (rather than
+    // building an array of {icon, body} objects here) so the per-session JSX is
+    // constructed inside the dock, not threaded through a prop object.
+    const renderPaneBody = (id: string): ReactNode => {
+      const plugin = pluginPaneById.get(id);
+      if (plugin) return <PluginPaneBody entry={plugin.entry} />;
+      if (id === "agents") {
+        return <BackgroundAgentsPanel sessionId={activeSessionId} />;
+      }
+      if (id === "files") {
+        // Remount on session switch so the selected file (and any in-flight
+        // read) resets instead of requesting the old path from the new
+        // session. See #3088 review.
+        return <FilesPane key={activeSessionId ?? "none"} sessionId={activeSessionId} />;
+      }
+      if (id === "diff") {
+        return (
+          <DiffPane
+            session={activeSession ?? null}
+            sessionId={activeSessionId}
+            files={diffFiles}
+            perRepoBases={perRepoBases}
+            warning={warning}
+            filesLoading={diffFilesLoading}
+            selectedFilePath={selectedFilePath}
+            selectedRepoName={selectedRepoName}
+            onSelectFile={handleSelectFile}
+            onDiffRefresh={refreshDiffFiles}
+            commentsEnabled={commentsEnabled}
+            commentsCount={diffComments.count}
+            commentsSendEnabled={commentSendEnabled}
+            commentsSendDisabledReason={commentSendDisabledReason}
+            onOpenSendDialog={() => setSendDialogOpen(true)}
+            onDiscardAllComments={diffComments.clearComments}
+          />
+        );
+      }
+      return (
+        <PairedShellPane
+          session={activeSession ?? null}
+          sessionId={activeSessionId}
+          terminalIndex={isTerminalTabId(id) ? terminalIndexOf(id) : 0}
+        />
+      );
+    };
+    return (
+      <div className="flex-1 flex flex-col min-h-0">
+        <PaneDndController groupsByDock={groupsByDock} descriptorFor={paneDescriptor} onPlaceTab={placeVisibleTab}>
+          <ContentSplit
+            collapsed={rightDockCollapsed}
+            onToggleCollapse={toggleRightDock}
+            left={
+              <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
+                <div className={selectedFilePath ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
+                  {activeSession?.view === "structured" ? (
+                    <Suspense fallback={<AcpLoadingFallback />}>
+                      <StructuredView
+                        key={activeSessionId}
+                        sessionId={activeSessionId!}
+                        acpWorkerState={activeSession.acp_worker_state ?? "absent"}
+                        tool={activeSession.tool}
+                        acpAgent={activeSession.acp_agent ?? null}
+                        clearAliases={activeSession.clear_aliases}
+                        archivedAt={activeSession.archived_at ?? null}
+                        snoozedUntil={activeSession.snoozed_until ?? null}
+                        trashedAt={activeSession.trashed_at ?? null}
+                        onRestore={
+                          activeSession.trashed_at
+                            ? () => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, activeSessionId!))
+                            : undefined
+                        }
+                        onOpenFileRef={handleOpenFileRef}
+                        fileRefSession={activeSession}
+                        onOpenAgentsPane={openAgentsPane}
+                        isSandboxed={activeSession.is_sandboxed}
+                      />
+                    </Suspense>
+                  ) : (
+                    <TerminalSessionStack
+                      activeSessionId={activeSessionId!}
+                      sessions={sessions.filter((session) => session.view !== "structured")}
+                      persistent={webSettings.persistentTerminals}
+                      maxPersistentTerminals={webSettings.maxPersistentTerminals}
+                    />
+                  )}
+                </div>
+
+                {selectedFilePath &&
+                  activeSessionId &&
+                  (selectedFileExternal ? (
+                    <FileContentViewer
+                      sessionId={activeSessionId}
+                      filePath={selectedFilePath}
+                      onBack={handleCloseFile}
+                    />
+                  ) : (
+                    <DiffFileViewer
+                      sessionId={activeSessionId}
+                      filePath={selectedFilePath}
+                      repoName={selectedRepoName}
+                      targetLine={selectedFileLine}
+                      revision={revision}
+                      onClose={handleCloseFile}
+                      commentsEnabled={commentsEnabled}
+                      commentsStore={diffComments}
+                    />
+                  ))}
+              </div>
+            }
+            right={
+              <div {...tourAnchor(TOUR_ANCHORS.rightPanel)} className="flex min-h-0 min-w-0 flex-1">
+                <DockGroups
+                  location="right"
+                  groups={rightGroups}
+                  descriptorFor={paneDescriptor}
+                  renderBody={renderPaneBody}
+                  onActivate={(id) => activateTab("right", id)}
+                  onMove={movePaneAny}
+                  onClose={closePaneAny}
+                  onNewTerminal={serverAbout?.read_only ? undefined : () => addTerminal("right")}
+                />
+              </div>
+            }
+          />
+          {bottomGroups.length > 0 && (
+            <BottomDock
+              groups={bottomGroups}
+              descriptorFor={paneDescriptor}
+              renderBody={renderPaneBody}
+              onActivate={(id) => activateTab("bottom", id)}
+              onMove={movePaneAny}
+              onClose={closePaneAny}
+              onNewTerminal={serverAbout?.read_only ? undefined : () => addTerminal("bottom")}
+            />
+          )}
+        </PaneDndController>
+        {sendDialogOpen && commentsEnabled && activeSessionId && (
+          <SendCommentsDialog
+            sessionId={activeSessionId}
+            comments={diffComments.comments}
+            isMultiRepo={commentsIsMultiRepo}
+            sendEnabled={commentSendEnabled}
+            sendDisabledReason={commentSendDisabledReason}
+            introDraft={diffComments.introDraft}
+            outroDraft={diffComments.outroDraft}
+            clearAfterSend={diffComments.clearAfterSend}
+            onChangeIntro={diffComments.setIntroDraft}
+            onChangeOutro={diffComments.setOutroDraft}
+            onChangeClearAfterSend={diffComments.setClearAfterSend}
+            onClose={() => setSendDialogOpen(false)}
+            onSent={() => {
+              if (diffComments.clearAfterSend) {
+                diffComments.clearComments();
+                diffComments.setIntroDraft("");
+                diffComments.setOutroDraft("");
+              }
+              setSendDialogOpen(false);
+              // Close the diff viewer so the acp transcript is in
+              // view: the user just dispatched feedback and wants to
+              // see the agent's response. They can re-open any file
+              // from the right-panel list afterwards.
+              setSelectedFile(null);
+              toastBus.handler?.info("Comments sent to agent");
+            }}
+          />
+        )}
+      </div>
+    );
+  };
+
+  // No root-height pin remains: every mobile terminal surface (agent,
+  // paired host, paired container) is the capture-snapshot live view
+  // now, with no PTY to protect from keyboard-driven layout shrink. The
+  // natural `100dvh` shrink keeps bottom-anchored UI above the keyboard
+  // everywhere (#1177, #1452 are fully superseded).
+
+  const acpPrefs = useMemo(
+    () => ({
+      showToolDurations: serverAbout?.acp_show_tool_durations ?? true,
+      replayEvents: serverAbout?.acp_replay_events ?? 0,
+      compactionReminder: serverAbout?.acp_compaction_reminder ?? false,
+      compactionReminderPercent: serverAbout?.acp_compaction_reminder_percent ?? 75,
+    }),
+    [
+      serverAbout?.acp_show_tool_durations,
+      serverAbout?.acp_replay_events,
+      serverAbout?.acp_compaction_reminder,
+      serverAbout?.acp_compaction_reminder_percent,
+    ],
+  );
+
+  const tourScope: TourScope =
+    !activeWorkspace || !activeSession
+      ? "dashboard"
+      : activeSession.view === "structured"
+        ? "structured-view"
+        : "session";
+  // First-run tour "seen" state, sourced from the backend (app_state) so it
+  // follows the user across browsers and devices. `tourSeenKnown` stays false
+  // until settings resolve, so the tour never flashes on a `false` default
+  // while the request is in flight (and never auto-launches when the fetch
+  // fails). Fetched here in AppContent (post-auth) so the request runs as the
+  // authenticated user. `LEGACY_TOUR_SEEN_KEY` is the pre-#1832 per-browser
+  // flag, read once to migrate existing users so they are not re-shown the tour.
+  const [tourSeen, setTourSeen] = useState(false);
+  const [tourSeenKnown, setTourSeenKnown] = useState(false);
+
+  useEffect(() => {
+    fetchSettings().then((settings) => {
+      // Fetch failed: leave the seen state unknown so the tour does not
+      // auto-launch over an error/recovery screen. The menu trigger still works.
+      if (!settings) return;
+      const backendSeen = settings.app_state?.has_seen_web_tour === true;
+      const legacySeen = safeGetItem(LEGACY_TOUR_SEEN_KEY) === "1";
+      // Treat the legacy local flag as a suppression hint while the migration
+      // POST is in flight, so the tour cannot flash before the backend agrees.
+      const seenAtLoad = backendSeen || legacySeen;
+      setTourSeen(seenAtLoad);
+      setTourSeenKnown(true);
+      // Capture whether onboarding was already done at load so completing the
+      // tour this session does not then pop the tip-of-the-day on top of it.
+      tourSeenAtLoadRef.current = seenAtLoad;
+      if (legacySeen && !backendSeen) {
+        void markWebTourSeen().then((ok) => {
+          if (ok) safeRemoveItem(LEGACY_TOUR_SEEN_KEY);
+        });
+      }
+    });
+  }, []);
+
+  // Persist the seen flag when the user finishes or skips the tour. Optimistic:
+  // flip local state immediately so a failed POST (e.g. read-only 403) cannot
+  // re-auto-launch the tour for the rest of this page's lifetime.
+  const handleTourSeen = useCallback(() => {
+    setTourSeen(true);
+    void markWebTourSeen();
+  }, []);
+
+  // Only auto-launch on a settled, unobstructed dashboard. Any open overlay or
+  // an in-flight session route defers it (the flag stays unset until then).
+  const tourAutoLaunchReady =
+    serverAboutLoaded &&
+    sessionsLoaded &&
+    !activeSessionId &&
+    !showSettings &&
+    !showSessionWizard &&
+    !showHelp &&
+    !showFleet &&
+    !showAbout &&
+    !showPalette &&
+    !projectForm;
+  // First-run theme choice is phase one of onboarding. It decides on the same
+  // settled-dashboard gate as the tour, then the tour follows once the modal
+  // resolves so the two never overlap on first load.
+  const welcome = useWelcomePhase({
+    scope: tourScope,
+    readOnly: !!serverAbout?.read_only,
+    autoLaunchReady: tourAutoLaunchReady,
+    tourSeen,
+    tourSeenKnown,
+  });
+  const tour = useTour({
+    scope: tourScope,
+    readOnly: !!serverAbout?.read_only,
+    cityhall: caps.cityhall,
+    isDesktop: !isCoarse,
+    autoLaunchReady: tourAutoLaunchReady && welcome.resolved,
+    seen: tourSeen,
+    seenKnown: tourSeenKnown,
+    onSeen: handleTourSeen,
+    onNavigate: (tab) => (tab ? navigate(`/settings/${tab}`) : handleCloseSettings()),
+  });
+
+  // Auto-pop the tip-of-the-day once per load, after onboarding settles, like
+  // GIMP/DBeaver. Gated like the tour: only on a settled dashboard, only when a
+  // tip is unseen and tips are enabled, never while the welcome/telemetry/tour
+  // flows are up, and never in an automated browser session (so the modal can't
+  // intercept the rest of the Playwright suite). Only for users who already
+  // finished onboarding before this load: first-run users get the welcome and
+  // tour, not a tips modal piled on top. Reopen any time from the menu.
+  useEffect(() => {
+    if (tipsAutoPoppedRef.current) return;
+    const gate = shouldAutoPopTips({
+      loaded: tips.loaded,
+      hasUnseen: tips.hasUnseen,
+      tourSeenAtLoad: tourSeenAtLoadRef.current,
+      onboardingReady: tourAutoLaunchReady && welcome.resolved,
+      // Treat "not resolved yet" as pending so tips can't pop ahead of a consent
+      // modal that the in-flight status fetch is about to raise.
+      telemetryPending: !telemetryConsentKnown || telemetryConsentNeeded,
+      tourActive: tour.isTourActive,
+      automated: isAutomatedSession(),
+    });
+    if (!gate) return;
+    tipsAutoPoppedRef.current = true;
+    // Defer one frame so the open happens off the effect body (mirrors the
+    // tour's begin()), keeping the state change out of the effect. The frame is
+    // deliberately NOT cancelled when this effect re-runs: `useTips()` returns a
+    // fresh object each render, so `tips` changes identity on every render and
+    // this effect re-runs constantly. Cancelling on re-run meant any render in
+    // the ~16ms before the frame fired (an in-flight fetch resolving, the 3s
+    // session poll) killed the pending open, and the ref guard above then
+    // stopped it from ever being rescheduled: the tip modal silently never
+    // appeared for that load. The ref already makes the pop one-shot, so the
+    // only cleanup needed is on unmount (below).
+    tipsAutoPopFrameRef.current = requestAnimationFrame(() => tips.open());
+  }, [
+    tips,
+    tourSeenKnown,
+    tourAutoLaunchReady,
+    welcome.resolved,
+    telemetryConsentKnown,
+    telemetryConsentNeeded,
+    tour.isTourActive,
+  ]);
+
+  // Drop a still-pending auto-pop frame on unmount only, so a committed open is
+  // never cancelled by an unrelated re-render (see the effect above).
+  useEffect(
+    () => () => {
+      if (tipsAutoPopFrameRef.current !== null) {
+        cancelAnimationFrame(tipsAutoPopFrameRef.current);
+      }
+    },
+    [],
+  );
+
+  // Hold the shell behind a placeholder until /api/about resolves, so
+  // CityHall-gated affordances (Clone URL, advanced sidebar) never flash in
+  // before caps.cityhall settles. Early return (matching the other loading
+  // gates) rather than a wrapper so the shell markup stays unindented. See #7.
+  if (!serverAboutLoaded) {
+    return <div className="h-dvh bg-surface-900 safe-area-inset" />;
+  }
+
+  // The header collapse is a phone affordance for the conversation view only:
+  // at md and up there is room for both the bar and the transcript, and on the
+  // dashboard / settings / diff panes the bar is the only navigation there is.
+  const headerCollapsible =
+    singlePane &&
+    !showSettings &&
+    !!activeWorkspace &&
+    activeSession?.view === "structured" &&
+    rightPanelView === "agent";
+
+  return (
+    <AcpPrefsProvider value={acpPrefs}>
+      {/* The daemon now owns the prompt queue and drains it server-side even
+          with no tab open, so the old headless background drainers are gone.
+          See docs/development/server-side-prompt-queue.md. */}
+      <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
+        {/* Wrapped unconditionally, not behind the `headerCollapsible`
+            ternary: swapping the element type at this position would remount
+            `TopBar` (and reset its overflow menu) every time the boundary
+            flips, e.g. opening settings on a phone. An expanded region is a
+            `1fr` grid row around a fixed-height bar, so the wrapper is inert
+            for every view that cannot collapse. */}
+        <CollapsibleRegion id="conversation-header" collapsed={headerCollapsible && headerCollapsed}>
+          <TopBar
+            activeWorkspace={activeWorkspace}
+            activeSession={activeSession ?? null}
+            onToggleSidebar={handleToggleSidebar}
+            onOpenPalette={() => setShowPalette(true)}
+            onToggleDiff={toggleDiff}
+            paneIds={allPaneIds}
+            paneDescriptor={paneDescriptor}
+            isPaneOpen={isPaneOpen}
+            onTogglePane={togglePaneAny}
+            onOpenHelp={handleOpenHelp}
+            onOpenFleet={caps.cityhall ? undefined : () => setShowFleet(true)}
+            onOpenAbout={handleOpenAbout}
+            onStartTutorial={tour.startTour}
+            onLogout={onLogout}
+            loginRequired={loginRequired}
+            isOffline={!!error}
+            isDevBuild={isDebugBuild(serverAbout)}
+            onOpenTips={tips.open}
+            onGoDashboard={handleGoDashboard}
+            sidebarColumnVisible={!showSettings && sidebarOpen}
+            rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !rightDockCollapsed}
+          />
+        </CollapsibleRegion>
+
+        <DisconnectBanner />
+        <UpdateBanner />
+        <DashboardUpdateBanner />
+
+        {/* Below the banners, not directly under the bar: the handle is
+            absolutely positioned at the top-right, and hanging it off the bar
+            puts it on top of the update banner's dismiss button (same corner),
+            which then cannot be tapped at all. */}
+        {headerCollapsible && (
+          <ChromeCollapseHandle
+            edge="top"
+            collapsed={headerCollapsed}
+            onToggle={() => setHeaderCollapsed((v) => !v)}
+            collapseLabel="Collapse conversation header"
+            expandLabel="Expand conversation header"
+            controlsId="conversation-header"
+            testId="header-collapse-toggle"
+          />
+        )}
+
+        <div className="flex flex-1 min-h-0">
+          {!showSettings && (
+            <WorkspaceSidebar
+              groups={sidebarGroups}
+              nestedGroups={nestedGroups}
+              orgGroups={orgGroups}
+              trashedWorkspaces={trashedWorkspaces}
+              onToggleSubgroup={toggleSubgroupCollapsed}
+              onToggleOrg={toggleOrgCollapsed}
+              onToggleOrgRepo={toggleOrgRepoCollapsed}
+              onReorderWorkspaces={handleReorderWorkspaces}
+              onReorderGroups={reorderRepoGroups}
+              activeId={activeWorkspace?.id ?? null}
+              open={sidebarOpen}
+              onToggle={() => setSidebarOpen(false)}
+              onSelect={handleSelectWorkspace}
+              onToggleGroup={toggleSidebarGroup}
+              onUpdateRepoAppearance={updateRepoAppearance}
+              onNew={() => {
+                setWizardPrefill(undefined);
+                setShowSessionWizard(true);
+              }}
+              onCreateSession={handleCreateSession}
+              onPinProject={handlePinProject}
+              onUnpinProject={handleUnpinProject}
+              savedProjects={savedProjects}
+              onAddProject={handleAddProject}
+              onEditProject={handleEditProject}
+              onRemoveProject={handleRemoveProject}
+              onSettings={handleOpenSettings}
+              onDeleteSession={handleDeleteSession}
+              onRestoreSession={handleRestoreSession}
+              onEmptyTrash={handleEmptyTrash}
+              onStopSession={handleStopSession}
+              onStartSession={handleStartSession}
+              onSwitchView={handleSwitchView}
+              readOnly={serverAbout?.read_only}
+              canManageProjects={caps.canManageProjects}
+              sortMode={sidebarSortMode}
+              onSortModeChange={selectSidebarSortMode}
+              pluginSortRef={pluginSortRef}
+              onPluginSortChange={setPluginSortRef}
+              axis={sidebarAxis}
+              onAxisChange={setSidebarAxis}
+            />
+          )}
+
+          <div className="flex-1 flex flex-col min-h-0 min-w-0">{renderContent()}</div>
+        </div>
+
+        {showSessionWizard && (
+          <SessionWizard
+            onClose={() => {
+              setShowSessionWizard(false);
+              setWizardPrefill(undefined);
+            }}
+            onCreated={(session?: SessionResponse) => {
+              if (session) {
+                injectSession(session);
+                navigate(`/session/${encodeURIComponent(session.id)}`);
+                if (window.innerWidth < 768) setSidebarOpen(false);
+              }
+              setShowSessionWizard(false);
+              setWizardPrefill(undefined);
+            }}
+            prefill={wizardPrefill}
+            nameOnly={caps.nameOnlyWizard}
+          />
+        )}
+
+        {projectForm && (
+          <ProjectFormModal
+            initial={projectForm.editProject}
+            onClose={() => setProjectForm(null)}
+            onSaved={() => refreshProjects()}
+          />
+        )}
+
+        {welcome.showWelcome && <ThemeIntro onDone={welcome.dismissWelcome} />}
+
+        {tour.tourElement}
+
+        {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
+
+        {showFleet && (
+          <Suspense fallback={null}>
+            <FleetOperations onClose={() => setShowFleet(false)} onSelectSession={handleSelectSession} />
+          </Suspense>
+        )}
+
+        {tips.isOpen && (
+          <TipsModal
+            tips={tips.tips}
+            startIndex={tips.startIndex}
+            enabled={tips.enabled}
+            onMarkSeen={tips.markSeen}
+            onSetEnabled={tips.setEnabled}
+            onClose={tips.close}
+          />
+        )}
+
+        {showAbout && <AboutModal onClose={() => setShowAbout(false)} sessionId={activeSessionId} />}
+        {telemetryConsentNeeded && <TelemetryConsentModal onChoose={handleTelemetryConsent} />}
+
+        {deletingSession && deletingCleanupDefaults && (
+          <DeleteSessionDialog
+            sessionTitle={deletingSession.title}
+            branchName={deletingBranchName}
+            hasManagedWorktree={deletingSessions.some((session) => session.has_cleanable_worktree ?? false)}
+            isSandboxed={deletingSessions.some((session) => session.is_sandboxed)}
+            isScratch={deletingSessions.some((session) => session.scratch)}
+            cleanupDefaults={deletingCleanupDefaults}
+            defaultToTrash={deletingDefaultToTrash}
+            affectedSessions={deletingSessions.map((session) => ({
+              id: session.id,
+              title: session.title,
+              isSandboxed: session.is_sandboxed,
+            }))}
+            onConfirm={handleConfirmDelete}
+            onTrash={handleConfirmTrash}
+            onCancel={() => setDeletingWorkspaceId(null)}
+          />
+        )}
+
+        {stoppingSession && (
+          <StopSessionDialog
+            sessionTitle={stoppingSession.title}
+            onConfirm={handleConfirmStop}
+            onCancel={() => setStoppingWorkspaceId(null)}
+          />
+        )}
+
+        {switchViewTarget && switchViewSession && (
+          <SwitchViewDialog
+            sessionTitle={switchViewSession.title}
+            toStructured={switchViewTarget.toStructured}
+            keepsContext={switchViewSession.keeps_context ?? false}
+            onConfirm={handleConfirmSwitchView}
+            onCancel={() => setSwitchViewTarget(null)}
+          />
+        )}
+
+        <CommandPalette
+          open={showPalette}
+          onClose={() => {
+            setShowPalette(false);
+            setPaletteQuery("");
+          }}
+          actions={[...commandActions, ...conversationActions, ...settingsCommands, ...pluginCommandActions]}
+          onSearchChange={setPaletteQuery}
+          searching={conversationSearching}
+        />
+
+        {pluginLinkPicker}
+
+        {snoozeTargetId && (
+          <SnoozeModal
+            title="Snooze session"
+            onCancel={() => setSnoozeTargetId(null)}
+            onPick={(minutes) => {
+              const id = snoozeTargetId;
+              setSnoozeTargetId(null);
+              void setSessionSnooze(id, minutes).then((result) => {
+                if (result) applySession(result);
+                else reportError("Failed to snooze session");
+              });
+            }}
+          />
+        )}
+
+        {activeWorkspace && activeSession && (
+          <MobileRightPanelPicker
+            open={pickerOpen && singlePane}
+            active={rightPanelView}
+            pluginPanes={pluginPanes}
+            onSelect={handlePickView}
+            onClose={() => setPickerOpen(false)}
+          />
+        )}
+
+        <textarea
+          ref={setKeyboardProxyRef}
+          data-keyboard-proxy
+          aria-hidden="true"
+          tabIndex={-1}
+          // Keep the element in the visual viewport. Focusing a zero-size
+          // textarea thousands of pixels above an iOS PWA can leave WebKit's
+          // focus scroll in a broken state until the keyboard is toggled.
+          // This matches the live terminal's hidden input geometry.
+          className="fixed bottom-0 left-0 w-px h-px opacity-0 pointer-events-none"
+          style={{ caretColor: "transparent", color: "transparent" }}
+        />
+      </div>
+    </AcpPrefsProvider>
+  );
+}
+
+function AcpLoadingFallback() {
+  return (
+    <div className="flex h-full items-center justify-center bg-surface-900 text-text-dim">
+      <div className="text-xs font-mono uppercase tracking-wide">Loading acp…</div>
+    </div>
+  );
+}

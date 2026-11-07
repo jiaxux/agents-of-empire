@@ -1,0 +1,923 @@
+#!/usr/bin/env node
+// Fake ACP agent for structured view Playwright tests.
+//
+// Speaks just enough of the Agent Client Protocol (newline-delimited
+// JSON-RPC 2.0) for `src/acp/acp_client.rs` to drive a turn:
+//
+//   initialize          -> return protocolVersion + agentCapabilities
+//   session/new         -> return a deterministic sessionId
+//   session/load        -> restore the requested id; Codex omits it from the response
+//   session/prompt      -> emit scripted session/update notifications,
+//                          then return a stop response. Script entries
+//                          with `sessionUpdate: "permission_request"`
+//                          are translated into a real outbound
+//                          `session/request_permission` JSON-RPC
+//                          REQUEST; the fake awaits the client's
+//                          response before continuing the turn.
+//   session/set_mode    -> change mode; most fixtures also emit
+//                          current_mode_update (accepts the legacy
+//                          camelCase `session/setMode` too)
+//   session/cancel      -> notification (no response); sets a per-
+//                          session cancel flag that the in-flight
+//                          session/prompt loop polls so the prompt
+//                          returns with stopReason "cancelled"
+//
+// Script source:
+//
+//   The env var FAKE_ACP_SCRIPT points to a JSON file describing the
+//   event sequence(s) to emit per `session/prompt` call. If unset, the
+//   default is a single happy-path turn that emits one agent_message_chunk
+//   then stops.
+//
+// Script shape (rough):
+//
+//   {
+//     "turns": [
+//       {
+//         "updates": [
+//           { "sessionUpdate": "agent_message_chunk", "content": {...} },
+//           ...
+//         ],
+//         "stopReason": "end_turn"
+//       },
+//       ...
+//     ]
+//   }
+//
+// Each `session/prompt` consumes one entry from `turns`. If the array is
+// exhausted, subsequent prompts get the default happy-path turn.
+
+import { createInterface } from "node:readline";
+import { readFileSync, existsSync, appendFileSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+
+// Silently swallow EPIPE/EBADF on stdout/stderr writes. The fake is a
+// noisy stdout writer (one JSON line per session/update notification);
+// if the supervisor briefly stalls draining the pipe (CI under v8
+// coverage instrumentation has spent ~hundreds of ms behind the
+// runtime worker), a subsequent write can emit EPIPE; without a
+// handler, Node treats that as an uncaught exception and exits the
+// process. The runner sees the child exit, deletes the worker_registry
+// entry, the supervisor's reap pass publishes Stopped {
+// reason: "user_stopped" }, and the UI banners "Structured view worker
+// stopped" mid-turn. That matched the symptom in #1383 (see Once /
+// upon visible but "a time." never arriving in the composer-streamed
+// trace). Swallowing the error is safe: write failures here mean the
+// peer is gone, and there is no surface in the fake that benefits
+// from observing them.
+const FAKE_DEBUG_PATH = process.env.FAKE_ACP_DEBUG_LOG;
+function fakeDebug(line) {
+  if (!FAKE_DEBUG_PATH) return;
+  try {
+    appendFileSync(FAKE_DEBUG_PATH, `[${Date.now()}] ${line}\n`);
+  } catch {
+    // ignore
+  }
+}
+process.stdout.on("error", (err) => {
+  fakeDebug(`stdout error swallowed: ${err.code ?? err.message}`);
+});
+process.stderr.on("error", () => {});
+// Log the failure cause to fake-acp.log so post-mortems can see why
+// the agent died, then crash-fast. Default Node behavior on
+// uncaughtException is exit(1); merely registering a listener
+// suppresses that, which lets a real bug keep the fake agent
+// half-alive and surface as a confusing supervisor timeout downstream
+// instead of the actual stack trace.
+process.on("uncaughtException", (err) => {
+  fakeDebug(`uncaughtException: ${err?.stack ?? err}`);
+  process.exit(1);
+});
+process.on("unhandledRejection", (reason) => {
+  fakeDebug(`unhandledRejection: ${reason}`);
+  process.exit(1);
+});
+process.on("exit", (code) => {
+  fakeDebug(`process.exit code=${code}`);
+});
+process.on("SIGTERM", () => {
+  fakeDebug("SIGTERM received, exiting 0");
+  process.exit(0);
+});
+process.on("SIGINT", () => {
+  fakeDebug("SIGINT received, exiting 0");
+  process.exit(0);
+});
+process.on("SIGPIPE", () => {
+  fakeDebug("SIGPIPE received (ignored)");
+});
+process.on("SIGHUP", () => {
+  fakeDebug("SIGHUP received (ignored)");
+});
+fakeDebug(`fake-acp starting pid=${process.pid} argv=${JSON.stringify(process.argv)}`);
+
+const DEFAULT_TURN = {
+  updates: [
+    {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "Hello from fake ACP agent." },
+    },
+  ],
+  stopReason: "end_turn",
+};
+
+function loadScript() {
+  const path = process.env.FAKE_ACP_SCRIPT;
+  if (!path || !existsSync(path)) return { turns: [] };
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch (err) {
+    process.stderr.write(`[fakeAcpAgent] failed to parse FAKE_ACP_SCRIPT=${path}: ${err}\n`);
+    return { turns: [] };
+  }
+}
+
+const script = loadScript();
+
+// Turn cursor is per-process by default. When FAKE_ACP_TURN_STATE points at a
+// file, persist the cursor there so it survives a respawn: a resume-after-
+// rate-limit spawns a fresh fake process, and a test that needs the resumed
+// turn to differ from the parked one (e.g. rate-limit -> resume -> continue)
+// must not restart at turn 0. Opt-in so every other test keeps the simple
+// per-process behavior.
+const TURN_STATE_PATH = process.env.FAKE_ACP_TURN_STATE;
+let turnCursor = (() => {
+  if (!TURN_STATE_PATH || !existsSync(TURN_STATE_PATH)) return 0;
+  const n = Number.parseInt(readFileSync(TURN_STATE_PATH, "utf8").trim(), 10);
+  return Number.isFinite(n) && n >= 0 ? n : 0;
+})();
+
+function nextTurn() {
+  const turn = turnCursor < script.turns.length ? script.turns[turnCursor++] : DEFAULT_TURN;
+  if (TURN_STATE_PATH) {
+    try {
+      writeFileSync(TURN_STATE_PATH, String(turnCursor));
+    } catch (err) {
+      process.stderr.write(`[fakeAcpAgent] failed to persist turn cursor: ${err}\n`);
+    }
+  }
+  return turn;
+}
+
+function send(obj) {
+  process.stdout.write(JSON.stringify(obj) + "\n");
+}
+
+function sendResult(id, result) {
+  send({ jsonrpc: "2.0", id, result });
+}
+
+function sendError(id, code, message, data) {
+  const error = { code, message };
+  if (data !== undefined) error.data = data;
+  send({ jsonrpc: "2.0", id, error });
+}
+
+function sendNotification(method, params) {
+  send({ jsonrpc: "2.0", method, params });
+}
+
+// Track outbound requests we send to the client so we can resolve them
+// when the client's response arrives. Keyed on the request id.
+let nextOutboundId = 1;
+const pendingOutbound = new Map();
+
+// 15s ceiling so a wedged supervisor surfaces as an explicit timeout
+// instead of a hung promise that stalls the script's remaining updates
+// and leaves Playwright to time out generically.
+const OUTBOUND_REQUEST_TIMEOUT_MS = 15_000;
+
+function sendRequest(method, params) {
+  const id = `fake-acp-req-${nextOutboundId++}`;
+  send({ jsonrpc: "2.0", id, method, params });
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      if (pendingOutbound.delete(id)) {
+        reject(new Error(`fakeAcpAgent: outbound ${method} id=${id} timed out after ${OUTBOUND_REQUEST_TIMEOUT_MS}ms`));
+      }
+    }, OUTBOUND_REQUEST_TIMEOUT_MS);
+    pendingOutbound.set(id, {
+      resolve: (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      reject: (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    });
+  });
+}
+
+function resolveOutbound(msg) {
+  const entry = pendingOutbound.get(msg.id);
+  if (!entry) {
+    process.stderr.write(`[fakeAcpAgent] response for unknown id ${msg.id}\n`);
+    return;
+  }
+  pendingOutbound.delete(msg.id);
+  if (msg.error) {
+    entry.reject(msg.error);
+  } else {
+    entry.resolve(msg.result);
+  }
+}
+
+// Default permission options when a `permission_request` script entry
+// omits its own. Covers every PermissionOptionKind aoe's
+// `pick_option_id` (src/acp/acp_client.rs) consults so an
+// `allow` / `allow_always` / `deny` decision always maps cleanly.
+const DEFAULT_PERMISSION_OPTIONS = [
+  { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+  { optionId: "allow-always", name: "Allow always", kind: "allow_always" },
+  { optionId: "reject-once", name: "Reject once", kind: "reject_once" },
+  { optionId: "reject-always", name: "Reject always", kind: "reject_always" },
+];
+
+// Per-session cancel flags. session/cancel is a notification (no id);
+// the in-flight session/prompt loop polls this flag at each step and
+// short-circuits when set so the prompt returns with stopReason
+// "cancelled" instead of running the rest of the scripted updates.
+const cancelFlags = new Map();
+
+// Config-option mode fixtures. A truthy
+// FAKE_ACP_MODE_VIA_CONFIG_OPTION uses OpenCode's config-only channel;
+// the `codex` value advertises Codex's current modes through both mode
+// channels. This covers manual picker routing (#1764) and startup
+// auto-approve channel precedence.
+const OPENCODE_MODE_CHOICES = [
+  { value: "build", name: "Build" },
+  { value: "plan", name: "Plan" },
+];
+const CODEX_MODE_CHOICES = [
+  {
+    value: "read-only",
+    name: "Read-only",
+    description: "Requires approval to edit files and run commands.",
+  },
+  {
+    value: "agent",
+    name: "Agent",
+    description: "Read and edit files, and run commands.",
+  },
+  {
+    value: "agent-full-access",
+    name: "Agent (full access)",
+    description: "Edit outside the workspace and use network access.",
+  },
+];
+const modeBySession = new Map();
+
+function modeFixture() {
+  if (process.env.FAKE_ACP_MODE_VIA_CONFIG_OPTION === "codex") {
+    return {
+      choices: CODEX_MODE_CHOICES,
+      defaultValue: "agent",
+      includeSessionModes: true,
+    };
+  }
+  if (process.env.FAKE_ACP_MODE_VIA_CONFIG_OPTION) {
+    return {
+      choices: OPENCODE_MODE_CHOICES,
+      defaultValue: "build",
+      includeSessionModes: false,
+    };
+  }
+  return null;
+}
+
+function makeModeOption(currentValue, fixture) {
+  return {
+    id: "mode",
+    name: "Session Mode",
+    category: "mode",
+    type: "select",
+    currentValue,
+    options: fixture.choices,
+  };
+}
+
+// The per-session selectors (model + effort, plus the synthetic OpenCode-shape
+// mode option when FAKE_ACP_MODE_VIA_CONFIG_OPTION is set) that ship in the
+// session/new, session/load, and session/fork *responses*. Shared so a forked
+// session hydrates the same selectors as a fresh one; returns undefined when
+// FAKE_ACP_EMIT_CONFIG_OPTIONS is "0" so the caller can omit the field.
+function buildSessionConfigOptions(sessionId) {
+  if (process.env.FAKE_ACP_EMIT_CONFIG_OPTIONS === "0") return undefined;
+  const configOptions = [
+    {
+      id: "model",
+      name: "Model",
+      category: "model",
+      type: "select",
+      currentValue: "claude-opus-4-7",
+      options: [
+        { value: "claude-opus-4-7", name: "Claude Opus 4.7" },
+        { value: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
+      ],
+    },
+    {
+      id: "effort",
+      name: "Reasoning Effort",
+      category: "thought_level",
+      type: "select",
+      currentValue: "default",
+      options: [
+        { value: "default", name: "Default" },
+        { value: "low", name: "Low" },
+        { value: "medium", name: "Medium" },
+        { value: "high", name: "High" },
+      ],
+    },
+  ];
+  const fixture = modeFixture();
+  if (fixture) {
+    const current = modeBySession.get(sessionId) ?? fixture.defaultValue;
+    modeBySession.set(sessionId, current);
+    configOptions.push(makeModeOption(current, fixture));
+  }
+  return configOptions;
+}
+
+function buildSessionModes(sessionId) {
+  const fixture = modeFixture();
+  if (!fixture?.includeSessionModes) return undefined;
+  const current = modeBySession.get(sessionId) ?? fixture.defaultValue;
+  modeBySession.set(sessionId, current);
+  return {
+    availableModes: fixture.choices.map(({ value, name, description }) => ({
+      id: value,
+      name,
+      ...(description ? { description } : {}),
+    })),
+    currentModeId: current,
+  };
+}
+
+async function emitSessionUpdates(sessionId, updates) {
+  for (const u of updates) {
+    if (cancelFlags.get(sessionId)) return;
+    if (u && u.sessionUpdate === "wait_ms") {
+      // Story-spec helper: pause emission inside a turn so the UI
+      // observes the turn as active long enough to click Stop, queue a
+      // follow-up, etc. Not part of ACP; the fake just swallows it.
+      // Clamp the raw value: NaN, Infinity, or negative numbers would
+      // make setTimeout fire immediately or behave unpredictably and
+      // mask bad fixture data. Cap at 60s so a typo can't hang CI.
+      const raw = typeof u.ms === "number" && Number.isFinite(u.ms) ? u.ms : 200;
+      const ms = Math.min(60_000, Math.max(0, Math.floor(raw)));
+      // Sleep in 50ms slices so a cancel notification arriving during
+      // a long wait_ms doesn't have to wait for the full duration
+      // before the cancel flag is observed.
+      const sliceMs = 50;
+      let remaining = ms;
+      while (remaining > 0) {
+        if (cancelFlags.get(sessionId)) return;
+        const slice = Math.min(sliceMs, remaining);
+        await new Promise((resolve) => setTimeout(resolve, slice));
+        remaining -= slice;
+      }
+      continue;
+    }
+    if (u && u.sessionUpdate === "permission_request") {
+      // ACP carries permissions on a separate JSON-RPC request, not on
+      // session/update. Translate the scripted entry into a real
+      // `session/request_permission` request and wait for the client's
+      // decision before continuing the turn so the assertions in the
+      // approval spec can observe ApprovalRequested + resolve it.
+      await sendRequest("session/request_permission", {
+        sessionId,
+        toolCall: u.toolCall ?? {
+          toolCallId: `fake-tool-call-${Date.now()}`,
+          title: "fake tool call",
+          kind: "edit",
+        },
+        options: u.options ?? DEFAULT_PERMISSION_OPTIONS,
+      }).catch((err) => {
+        process.stderr.write(`[fakeAcpAgent] permission_request rejected: ${JSON.stringify(err)}\n`);
+      });
+      continue;
+    }
+    if (u && u.sessionUpdate === "elicitation_request") {
+      // AskUserQuestion rides ACP's form-mode `elicitation/create` request
+      // (not session/update). Translate the scripted entry into a real
+      // request and wait for the client's accept/decline/cancel so the
+      // elicitation spec can observe the card and resolve it.
+      await sendRequest("elicitation/create", {
+        mode: "form",
+        sessionId,
+        message: u.message ?? "Pick one",
+        requestedSchema: u.requestedSchema ?? {
+          type: "object",
+          properties: {
+            question_0: {
+              type: "string",
+              title: u.message ?? "Pick one",
+              oneOf: [
+                { const: "Yes", title: "Yes" },
+                { const: "No", title: "No" },
+              ],
+            },
+          },
+        },
+      }).catch((err) => {
+        process.stderr.write(`[fakeAcpAgent] elicitation/create rejected: ${JSON.stringify(err)}\n`);
+      });
+      continue;
+    }
+    sendNotification("session/update", { sessionId, update: u });
+    // Inter-update tick so the structured view reducer can apply each event in
+    // order rather than batching them. Bumped from 1ms to 5ms after
+    // CI flakes (#1383): under 6-worker contention on the 4-core CI
+    // runner, a 1ms tick didn't survive the event-loop pressure and
+    // some specs lost the first chunk before the React reducer ran.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+function makeSessionId() {
+  return `fake-acp-${Date.now()}-${randomBytes(4).toString("hex")}`;
+}
+
+const INITIALIZE_RESULT = {
+  protocolVersion: 1,
+  agentCapabilities: {
+    loadSession: true,
+    // Advertise the unstable session lifecycle methods the real
+    // claude-agent-acp exposes. Only `fork` is consulted by aoe's structured
+    // fork gate (session_capabilities.fork.is_some()); the rest mirror the
+    // real shape so the fixture stays realistic.
+    sessionCapabilities: {
+      fork: {},
+      resume: {},
+      list: {},
+      close: {},
+      delete: {},
+    },
+    promptCapabilities: {
+      image: false,
+      embeddedContext: false,
+    },
+    mcpCapabilities: {
+      http: false,
+      sse: false,
+    },
+  },
+  agentInfo: {
+    name: "@agentclientprotocol/claude-agent-acp",
+    // Keep at (or above) the agent_compat floor in src/acp/agent_compat.rs
+    // (CLAUDE_AGENT_ACP_MIN_VERSION); the gate rejects the fake's handshake
+    // otherwise, which fails every live Playwright acp spec and the acp
+    // live-daemon e2e suite (#2077 bumped the floor without this fixture and
+    // broke both; #2573 bumped it to 0.55.0 for the upstream idle-turn fix).
+    version: "0.55.0",
+  },
+  // No authMethods key at all. An empty array is interpreted by some
+  // ACP client implementations as "auth methods listed but none
+  // available", which surfaces as AuthRequired on the next call.
+  // Omitting the key signals "no auth required" cleanly.
+};
+
+// The same fake is shimmed under several binary names (claude /
+// claude-agent-acp / aoe-agent / opencode / codex-acp). The agent_compat gate keys
+// its policy off the binary the supervisor spawned, so when this process
+// stands in for opencode it must report opencode's own name and a version
+// at or above the opencode floor (OPENCODE_MIN_VERSION in
+// src/acp/agent_compat.rs); otherwise the gate rejects the handshake and
+// the opencode live specs (acp-mode-picker) fail. The shim sets
+// FAKE_ACP_IMPERSONATE; default stays claude.
+// Mid-turn steering (#2805). Off by default so the existing specs keep
+// exercising the queue-after path. When on, the fake advertises the
+// `_session/steering` extension and reports a version at the separate
+// steering floor (CLAUDE_AGENT_ACP_STEERING_MIN_VERSION in
+// src/acp/agent_compat.rs), which the gate requires on top of the
+// advertised bit.
+const STEERING_ENABLED = process.env.FAKE_ACP_STEERING === "1";
+const STEERING_MIN_VERSION = "0.64.0";
+
+// Sessions with a `session/prompt` still running. `steer()` reads this
+// the way the real adapter reads its unsettled `turnQueue`: it decides
+// `injected` vs `promptRequired`, and the daemon applies that answer.
+const activeTurns = new Set();
+
+function resolveAgentInfo() {
+  if (process.env.FAKE_ACP_IMPERSONATE === "opencode") {
+    // Keep at (or above) the agent_compat opencode floor (>=1.16.0).
+    return { name: "OpenCode", version: "1.16.0" };
+  }
+  if (process.env.FAKE_ACP_IMPERSONATE === "codex") {
+    return { name: "@agentclientprotocol/codex-acp", version: "1.1.9" };
+  }
+  if (STEERING_ENABLED) {
+    return { ...INITIALIZE_RESULT.agentInfo, version: STEERING_MIN_VERSION };
+  }
+  return INITIALIZE_RESULT.agentInfo;
+}
+
+async function handleRequest(msg) {
+  const { id, method, params } = msg;
+  fakeDebug(`handleRequest method=${method} id=${id}`);
+  if (process.env.FAKE_ACP_DEBUG) {
+    try {
+      const { appendFileSync } = await import("node:fs");
+      appendFileSync(
+        process.env.FAKE_ACP_DEBUG,
+        `req method=${method} id=${id} params=${JSON.stringify(params).slice(0, 200)}\n`,
+      );
+    } catch {
+      // ignore log errors
+    }
+  }
+  // Script-controlled failure injection: lets specs simulate "adapter
+  // returns a JSON-RPC error on method X" without needing a hand-rolled
+  // ACP server per failure mode. Shape: script.failOn = { method:
+  // "session/new", code: -32603, message: "Internal error", data: {...} }.
+  // Single-shot by default; set `repeat: true` to keep failing on every
+  // call. See web/tests/live/acp-stories/startup-error-banner-native-binary.spec.ts.
+  if (script.failOn && script.failOn.method === method) {
+    const f = script.failOn;
+    sendError(
+      id,
+      typeof f.code === "number" ? f.code : -32603,
+      typeof f.message === "string" ? f.message : "Internal error",
+      f.data,
+    );
+    if (!f.repeat) {
+      script.failOn = null;
+    }
+    return;
+  }
+
+  switch (method) {
+    case "initialize": {
+      // A script may advertise prompt capabilities (image / audio /
+      // embeddedContext) so attachment specs can exercise the gate
+      // without a real agent. Defaults stay all-false. See #1000 / #965.
+      const result = script.promptCapabilities
+        ? {
+            ...INITIALIZE_RESULT,
+            agentInfo: resolveAgentInfo(),
+            agentCapabilities: {
+              ...INITIALIZE_RESULT.agentCapabilities,
+              promptCapabilities: {
+                ...INITIALIZE_RESULT.agentCapabilities.promptCapabilities,
+                ...script.promptCapabilities,
+              },
+            },
+          }
+        : { ...INITIALIZE_RESULT, agentInfo: resolveAgentInfo() };
+      // Top-level `_meta`, sibling of agentCapabilities, matching where
+      // the real adapter advertises the steering extension.
+      if (STEERING_ENABLED) {
+        result._meta = { steering: { supported: true } };
+      }
+      sendResult(id, result);
+      return;
+    }
+
+    // Mid-turn steering (#2805). Mirrors the real adapter: a message
+    // handed to a running turn is `injected` and streams its own
+    // updates; one that arrives after the turn settled is
+    // `promptRequired`, meaning the content was NOT consumed and the
+    // host must resend it as a normal session/prompt.
+    case "_session/steering": {
+      const sessionId = params?.sessionId;
+      if (!STEERING_ENABLED) {
+        sendError(id, -32601, "method not found");
+        return;
+      }
+      if (!activeTurns.has(sessionId)) {
+        sendResult(id, { outcome: "promptRequired", reason: "noRunningTurn" });
+        return;
+      }
+      const text = (params?.prompt ?? [])
+        .filter((b) => b?.type === "text")
+        .map((b) => b.text)
+        .join("");
+      // Echo the steered message into the running turn so a spec can
+      // assert it landed there rather than in a turn of its own.
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: `steered: ${text}` },
+          },
+        },
+      });
+      sendResult(id, { outcome: "injected" });
+      return;
+    }
+
+    case "session/new":
+    case "session/load": {
+      const sessionId = params?.sessionId ?? makeSessionId();
+      // Test hook: when FAKE_ACP_COMMANDS is set, emit an
+      // `available_commands_update` session/update notification right
+      // after the session/new response so the structured view composer's
+      // slash-command popover is populated for stories that drive the
+      // `/` picker (e.g. composer-slash-pick-no-arg #1512).
+      const commandsJson = process.env.FAKE_ACP_COMMANDS;
+      if (commandsJson) {
+        try {
+          const parsed = JSON.parse(commandsJson);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            // ACP wire shape (per
+            // agent-client-protocol-schema 0.12 client.rs:447-508):
+            // each AvailableCommand has `name`, `description`, and an
+            // optional `input` of `{ hint: "..." }` for unstructured
+            // free-form args. accepts_input=false serializes as input
+            // omitted.
+            const availableCommands = parsed.map((c) => ({
+              name: c.name,
+              description: c.description ?? "",
+              ...(c.accepts_input ? { input: { hint: c.hint ?? "" } } : {}),
+            }));
+            // Defer emission to the next tick so the session/new
+            // response lands first; the structured view acp_client wires the
+            // session id from the response before it can route follow-up
+            // session/update notifications.
+            setImmediate(() => {
+              sendNotification("session/update", {
+                sessionId,
+                update: {
+                  sessionUpdate: "available_commands_update",
+                  availableCommands,
+                },
+              });
+            });
+          }
+        } catch (err) {
+          process.stderr.write(`[fakeAcpAgent] bad FAKE_ACP_COMMANDS: ${err}\n`);
+        }
+      }
+      // Mirror claude-agent-acp v0.37.0: the initial set of
+      // per-session selectors (model + effort + mode) ships in the
+      // session/new and session/load *response*, not as a subsequent
+      // notification. The structured view's acp_client reads the response
+      // field and emits Event::ConfigOptionsUpdated. See #1403.
+      // LoadSessionResponse has no sessionId field. Keep Claude's historical
+      // extension for its existing fixtures, but model pinned codex-acp's
+      // standard response shape when this fake explicitly impersonates Codex.
+      const result = method === "session/load" && process.env.FAKE_ACP_IMPERSONATE === "codex" ? {} : { sessionId };
+      const configOptions = buildSessionConfigOptions(sessionId);
+      if (configOptions) result.configOptions = configOptions;
+      const modes = buildSessionModes(sessionId);
+      if (modes) result.modes = modes;
+      // Test hook for the import flow (#2276): on session/load, replay a
+      // deterministic transcript chunk the way claude-agent-acp re-emits
+      // prior history during a load. Lets the import spec assert the
+      // imported transcript renders (seed-not-suppressed), while a normal
+      // reattach would drop it.
+      const loadReplay = process.env.FAKE_ACP_LOAD_REPLAY;
+      const replayLoadHistory = () => {
+        // Replay a prior USER turn first (claude-agent-acp emits
+        // user_message_chunk for historical user messages), then the
+        // assistant reply, so the import spec can assert both render.
+        const userReplay = process.env.FAKE_ACP_LOAD_REPLAY_USER;
+        if (userReplay) {
+          sendNotification("session/update", {
+            sessionId,
+            update: {
+              sessionUpdate: "user_message_chunk",
+              content: { type: "text", text: userReplay },
+            },
+          });
+        }
+        sendNotification("session/update", {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: loadReplay },
+          },
+        });
+      };
+      const replayBeforeResponse = process.env.FAKE_ACP_LOAD_REPLAY_BEFORE_RESPONSE === "1";
+      if (method === "session/load" && loadReplay && replayBeforeResponse) {
+        replayLoadHistory();
+      }
+      sendResult(id, result);
+      if (method === "session/load" && loadReplay && !replayBeforeResponse) {
+        setImmediate(replayLoadHistory);
+      }
+      return;
+    }
+
+    case "session/fork": {
+      // Test hook: FAKE_ACP_FORK_FAIL makes the adapter reject session/fork the
+      // way a permanent agent-side failure would (parent GC'd, protocol error,
+      // build without fork). The Rust side must fail the spawn cleanly and
+      // clear fork_pending (no reconciler retry loop) rather than fall through
+      // to session/new. Mirrors the other failure knobs (e.g. RATE_LIMIT).
+      if (process.env.FAKE_ACP_FORK_FAIL) {
+        sendError(id, -32000, "fork failed: parent session not found");
+        return;
+      }
+      // Mirror claude-agent-acp's unstable_forkSession: mint a brand-new
+      // session id distinct from the parent (params.sessionId) rather than
+      // echoing it, and carry the same configOptions shape session/new ships
+      // so the structured view hydrates the forked session's selectors.
+      // Tag the forked id so the e2e can prove session/fork (not session/new)
+      // minted it: a plain new or structured session carries a "fake-acp-"
+      // id from makeSessionId(), so only a real session/fork yields the
+      // "fork-" marker.
+      const forkedId = `fake-acp-fork-${randomBytes(4).toString("hex")}`;
+      const result = { sessionId: forkedId };
+      const configOptions = buildSessionConfigOptions(forkedId);
+      if (configOptions) result.configOptions = configOptions;
+      const modes = buildSessionModes(forkedId);
+      if (modes) result.modes = modes;
+      sendResult(id, result);
+      return;
+    }
+
+    case "session/setMode":
+    case "session/set_mode": {
+      // ACP wire method name is `session/set_mode` (snake_case) per
+      // agent-client-protocol-schema. Accept both spellings so a future
+      // rename doesn't silently regress this fake.
+      const sessionId = params?.sessionId;
+      const modeId = params?.modeId;
+      const fixture = modeFixture();
+      if (fixture && !fixture.choices.some((m) => m.value === modeId)) {
+        // Reject values outside the active adapter fixture's real list.
+        sendError(id, -32000, `mode not found: ${modeId}`);
+        return;
+      }
+      sendResult(id, {});
+      if (sessionId && modeId) {
+        if (fixture?.includeSessionModes) {
+          // codex-acp changes its internal mode but returns no follow-up
+          // current_mode_update. Keep the config snapshot stale until the
+          // next config response, reproducing the dual-channel bug without
+          // pretending the legacy request itself failed.
+          modeBySession.set(sessionId, modeId);
+          return;
+        }
+        // Emit the ACP-correct variant so the supervisor translates to
+        // a server-side Event::CurrentModeChanged for the reducer.
+        await emitSessionUpdates(sessionId, [{ sessionUpdate: "current_mode_update", currentModeId: modeId }]);
+      }
+      return;
+    }
+
+    case "session/set_config_option": {
+      // Mirrors claude-agent-acp's setSessionConfigOption: accept the
+      // new value, return the updated configOptions list in the
+      // response payload. Real claude-agent-acp's setSessionConfigOption
+      // does NOT emit a follow-up config_option_update notification
+      // (acp-agent.js:1003-1057); the response carries the new state
+      // and aoe synthesizes Event::ConfigOptionsUpdated from it. Tests
+      // opt into a rejected response by setting
+      // FAKE_ACP_REJECT_CONFIG_OPTION. See #1403.
+      const configId = params?.configId;
+      const value = params?.value;
+      if (process.env.FAKE_ACP_REJECT_CONFIG_OPTION) {
+        sendError(id, -32000, process.env.FAKE_ACP_REJECT_CONFIG_OPTION);
+        return;
+      }
+      const fixture = modeFixture();
+      if (fixture && configId === "mode") {
+        if (!fixture.choices.some((m) => m.value === value)) {
+          sendError(id, -32000, `mode not found: ${value}`);
+          return;
+        }
+        const sessionId = params?.sessionId;
+        if (sessionId) modeBySession.set(sessionId, value);
+        sendResult(id, { configOptions: [makeModeOption(value, fixture)] });
+        return;
+      }
+      const configOptions =
+        configId && value
+          ? [
+              {
+                id: configId,
+                name: configId === "model" ? "Model" : "Reasoning Effort",
+                category: configId === "model" ? "model" : "thought_level",
+                type: "select",
+                currentValue: value,
+                options:
+                  configId === "model"
+                    ? [
+                        { value: "claude-opus-4-7", name: "Claude Opus 4.7" },
+                        {
+                          value: "claude-sonnet-4-6",
+                          name: "Claude Sonnet 4.6",
+                        },
+                      ]
+                    : [
+                        { value: "default", name: "Default" },
+                        { value: "low", name: "Low" },
+                        { value: "medium", name: "Medium" },
+                        { value: "high", name: "High" },
+                      ],
+              },
+            ]
+          : [];
+      sendResult(id, { configOptions });
+      return;
+    }
+
+    case "session/prompt": {
+      const sessionId = params?.sessionId;
+      const turn = nextTurn();
+      // Reset any prior cancel flag so this turn starts clean.
+      if (sessionId) cancelFlags.set(sessionId, false);
+      if (sessionId) {
+        // Marked for the whole emission window so a `_session/steering`
+        // arriving during a `wait_ms` sees a running turn, and one
+        // arriving after it does not.
+        activeTurns.add(sessionId);
+        try {
+          await emitSessionUpdates(sessionId, turn.updates);
+        } finally {
+          activeTurns.delete(sessionId);
+        }
+      }
+      const wasCancelled = sessionId ? cancelFlags.get(sessionId) : false;
+      if (sessionId) cancelFlags.set(sessionId, false);
+      // Rate-limit park: a turn with `rateLimit` returns session/prompt as
+      // a JSON-RPC error carrying the fingerprint aoe's
+      // classify_rate_limit_error reads, instead of a normal stopReason. The
+      // structured view worker then emits a typed RateLimit event and parks
+      // the session. See #1281 / #1715. A cancel mid-turn still wins over
+      // the park.
+      //
+      // `errorKind` is the whole payload, matching claude-agent-acp
+      // (`errorKindData` returns only that). A reset time reaches aoe solely
+      // through a `usage_update`'s `_meta._claude/rateLimit` with
+      // `status: "rejected"`, so a turn that needs one puts it in `updates`.
+      // See #3152.
+      if (!wasCancelled && turn.rateLimit) {
+        sendError(id, -32000, turn.rateLimit.message ?? "rate limit reached", {
+          errorKind: "rate_limit",
+        });
+        return;
+      }
+      sendResult(id, {
+        stopReason: wasCancelled ? "cancelled" : (turn.stopReason ?? "end_turn"),
+      });
+      return;
+    }
+
+    default:
+      sendError(id, -32601, `fakeAcpAgent: method '${method}' not implemented`);
+  }
+}
+
+async function main() {
+  fakeDebug("main() entry");
+  const rl = createInterface({ input: process.stdin });
+  process.stdin.on("end", () => fakeDebug("stdin end"));
+  process.stdin.on("close", () => fakeDebug("stdin close"));
+  process.stdin.on("error", (err) => fakeDebug(`stdin error: ${err.code ?? err.message}`));
+  rl.on("line", async (line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let msg;
+    try {
+      msg = JSON.parse(trimmed);
+    } catch (err) {
+      process.stderr.write(`[fakeAcpAgent] bad JSON: ${err}\n`);
+      return;
+    }
+    if (msg.id !== undefined && msg.method) {
+      try {
+        await handleRequest(msg);
+      } catch (err) {
+        process.stderr.write(`[fakeAcpAgent] handler error: ${err}\n`);
+        sendError(msg.id, -32603, `internal: ${err}`);
+      }
+    } else if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
+      // Response to one of our outbound requests (e.g.
+      // session/request_permission). Resolve the awaiting Promise.
+      resolveOutbound(msg);
+    } else if (msg.method) {
+      // Notification from client. session/cancel is the one we model:
+      // per ACP spec it's a notification (no id), and the in-flight
+      // session/prompt MUST be aborted with stopReason="cancelled".
+      // Other notifications (fs/* responses, etc) are ignored; tests
+      // that need them script their turns to avoid triggering tool
+      // calls.
+      if (msg.method === "session/cancel") {
+        const sid = msg.params?.sessionId;
+        fakeDebug(`session/cancel sessionId=${sid ?? ""}`);
+        if (sid) cancelFlags.set(sid, true);
+      } else {
+        process.stderr.write(`[fakeAcpAgent] received notification: ${msg.method}\n`);
+      }
+    }
+  });
+
+  rl.on("close", () => {
+    fakeDebug("readline close, exiting 0");
+    process.exit(0);
+  });
+}
+
+main().catch((err) => {
+  process.stderr.write(`[fakeAcpAgent] fatal: ${err}\n`);
+  process.exit(1);
+});

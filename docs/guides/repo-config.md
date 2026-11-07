@@ -1,0 +1,167 @@
+# Repository Configuration & Hooks
+
+AoE supports per-repo configuration via a `.agent-of-empires/config.toml` file in your project root. This lets you define project-specific defaults and hooks that apply to every team member using AoE on that repo.
+
+## Getting Started
+
+Generate a template config:
+
+```bash
+aoe init
+```
+
+This creates `.agent-of-empires/config.toml` with commented-out examples. Edit the file to enable the settings you need.
+
+> **Migrating from `.aoe/`?** AoE still reads the legacy `.aoe/config.toml` path, but we recommend renaming it: `mv .aoe .agent-of-empires`. If both exist, `.agent-of-empires/` takes priority.
+
+## Configuration Sections
+
+### Hooks
+
+Hooks run shell commands at specific points in the session lifecycle.
+
+```toml
+[hooks]
+# Run once when a session is first created (failures abort creation)
+on_create = ["npm install", "cp .env.example .env"]
+
+# Run every time a session starts (failures are logged but non-fatal)
+on_launch = ["npm install"]
+
+# Run when a session is deleted, before cleanup (failures are logged but non-fatal)
+on_destroy = ["docker-compose down"]
+```
+
+For single commands, you can use a plain string instead of an array:
+
+```toml
+[hooks]
+on_launch = "npm install"
+```
+
+**`on_create`** runs only once, when the session is first created. If any command fails, session creation is aborted. Use this for one-time setup like installing dependencies or generating config files.
+
+**`on_launch`** runs every time a session starts (including the first time, and every restart). Failures are logged as warnings and do not prevent user-initiated starts. During startup recovery, a timed-out `on_launch` hook marks the recovered session as errored instead of silently launching with partial setup. Use this for things like ensuring dependencies are up to date.
+
+**`on_destroy`** runs when a session is deleted, before worktree and sandbox cleanup. This lets teardown commands access resources that are still available (e.g. running containers). Failures are logged as warnings but never prevent deletion. Use this for cleanup like stopping Docker services or removing temporary resources.
+
+For sandboxed sessions, hooks run inside the Docker container.
+
+#### Available environment variables
+
+Lifecycle hooks (`on_create`, `on_launch`, `on_destroy`) receive session metadata as environment variables:
+
+| Variable | Value |
+| --- | --- |
+| `AOE_SESSION_ID` | Stable session identifier (e.g. `s_abc123`). |
+| `AOE_SESSION_TITLE` | Session title (also the worktree branch name). |
+| `AOE_PROJECT_PATH` | Absolute path to the working directory. Equals `$PWD` inside `on_create` / `on_launch`. |
+| `AOE_PROFILE` | Resolved profile name. |
+| `AOE_TOOL` | Agent tool name (e.g. `claude`, `codex`). |
+| `AOE_GROUP_PATH` | Group path for grouped sessions; empty otherwise. |
+| `AOE_SESSION_BRANCH` | Git branch name. Set only for worktree sessions. |
+
+Quote any expansion that may contain spaces (titles often do):
+
+```toml
+[hooks]
+on_create = ["port \"$AOE_SESSION_TITLE\""]
+on_destroy = ["port rm \"$AOE_SESSION_TITLE\""]
+```
+
+Container hooks get the same variables (forwarded via `docker exec -e`). Status-transition hooks in `[status_hooks]` add `AOE_OLD_STATUS`, `AOE_NEW_STATUS`, and `AOE_STATUS_CHANGED_AT`.
+
+### Session
+
+```toml
+[session]
+default_tool = "opencode"   # Override the default agent for this repo
+agent_detect_as = { my-agent = "claude" }
+```
+
+Any supported agent name (run `aoe add --help` to see the list).
+
+`default_tool` and `agent_detect_as` are the only `[session]` keys a repo may set. Everything else in that section is ignored from repo config (with a warning naming the keys), because fields like `custom_agents`, `agent_command_override`, `agent_extra_args`, `agent_acp_cmd`, `yolo_mode_default`, and `approval_autopilot` decide what command AoE launches or how much it is allowed to do. Set command options in your global or profile config; `approval_autopilot` is global-only.
+
+### Sandbox
+
+Override sandbox settings for this repo:
+
+```toml
+[sandbox]
+environment = ["NODE_ENV", "DATABASE_URL", "CUSTOM_KEY=value"]
+volume_ignores = ["node_modules", ".next", "target"]
+cpu_limit = "8"
+memory_limit = "16g"
+auto_cleanup = true
+default_terminal_mode = "host"   # "host" or "container"
+```
+
+`enabled_by_default`, `default_image`, `extra_volumes` and `mount_ssh` are ignored from repo config (with a warning naming the keys): together they let a repo put you in a container you did not ask for, running an image it chose, with your filesystem and SSH keys mounted in. Set them in your global or profile config, or pass `--sandbox` / `--sandbox-image` per session.
+
+List fields (`environment`, `volume_ignores`, `port_mappings`) accept either an array or a single string:
+
+```toml
+[sandbox]
+environment = "ANTHROPIC_API_KEY"          # single value
+volume_ignores = ["node_modules", ".next"] # multiple values
+```
+
+### Worktree
+
+Override worktree settings for this repo:
+
+```toml
+[worktree]
+enabled = true
+path_template = "../{repo-name}-worktrees/{branch}"
+bare_repo_path_template = "./{branch}"
+auto_cleanup = true
+delete_branch_on_cleanup = false
+```
+
+## Hook Trust System
+
+When AoE encounters hooks in a repo for the first time, it prompts you to review and approve them before execution. This prevents untrusted repos from running arbitrary commands.
+
+- Trust decisions are stored globally (shared across all profiles)
+- If hook commands change (e.g., someone updates `.agent-of-empires/config.toml`), AoE prompts for re-approval
+- Use `--trust-hooks` with `aoe add` to skip the trust prompt (useful for CI or repos you control)
+
+```bash
+# Trust hooks automatically
+aoe add --trust-hooks .
+```
+
+## Config Precedence
+
+Settings are resolved in this order (later overrides earlier):
+
+1. **Global config** (`~/.agent-of-empires/config.toml`)
+2. **Profile config** (`~/.agent-of-empires/profiles/<name>/config.toml`)
+3. **Repo config** (`.agent-of-empires/config.toml`)
+
+Only settings that are explicitly set in the repo config override the global/profile values. Unset fields inherit from the higher-level config.
+
+## Example: Full Repo Config
+
+```toml
+[hooks]
+on_create = ["npm install", "npx prisma generate"]
+on_launch = ["npm install"]
+on_destroy = ["docker-compose down"]
+
+[session]
+default_tool = "claude"
+
+[sandbox]
+environment = ["DATABASE_URL", "REDIS_URL", "NODE_ENV=development"]
+volume_ignores = ["node_modules", ".next"]
+
+[worktree]
+enabled = true
+```
+
+## Checking Into Version Control
+
+The `.agent-of-empires/config.toml` file is meant to be committed to your repo so the entire team shares the same configuration. The hook trust system ensures that each developer explicitly approves hook commands before they run.

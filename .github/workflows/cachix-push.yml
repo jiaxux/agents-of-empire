@@ -1,0 +1,57 @@
+name: Push to Cachix
+
+# Builds aoe-with-web (default features, web UI embedded) for Linux and macOS
+# and pushes the results to the Cachix binary cache so users can install
+# without compiling. Runs a matrix so both systems build in parallel.
+#
+# Requires two repository secrets:
+#   CACHIX_AUTH_TOKEN  - from cachix.org (Settings > Auth Tokens)
+#   CACHIX_CACHE_NAME  - your cache name (e.g. "agent-of-empires")
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'build_git_watch.rs'
+      # Paths whose contents are embedded into the binary at compile time; a
+      # change here must rebuild and re-push the cache even when it does not
+      # touch src/ or the flake.
+      - 'acp-worker/adapters/**'
+      - 'docker/**'
+      - 'themes/**'
+      - 'plugins/**'
+      # web/** is excluded: lockfile bumps land on main via the
+      # nix-npm-hash bot's PR which bumps flake.nix in the same commit.
+  workflow_dispatch:
+
+jobs:
+  cachix:
+    name: Build and push (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+
+      - name: Set up Cachix
+        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: ${{ secrets.CACHIX_CACHE_NAME }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Build aoe-with-web
+        run: nix build .#aoe-with-web
+
+      - name: Push to Cachix
+        run: cachix push ${{ secrets.CACHIX_CACHE_NAME }} ./result

@@ -1,0 +1,35 @@
+# Kanagawa Wave, aligned with the palette used by kanagawa.nvim and Ghostty.
+# Sumi Ink keeps the chrome calm; Crystal/Spring Blue and Oni Violet carry
+# focus; Carp/Ronin yellow carries attention; the seasonal colors keep status
+# and diffs readable without introducing neon tones.
+appearance = "dark"
+
+background = "#1f1f28"
+border = "#54546d"
+terminal_border = "#7fb4ca"
+selection = "#223249"
+session_selection = "#2d4f67"
+title = "#7e9cd8"
+text = "#dcd7ba"
+dimmed = "#727169"
+hint = "#938aa9"
+running = "#98bb6c"
+waiting = "#ff9e3b"
+fresh_idle = "#dca561"
+idle = "#727169"
+unread = "#7e9cd8"
+error = "#ff5d62"
+terminal_active = "#7fb4ca"
+group = "#7fb4ca"
+search = "#e6c384"
+accent = "#957fb8"
+diff_add = "#98bb6c"
+diff_delete = "#e46876"
+diff_modified = "#e6c384"
+diff_header = "#7e9cd8"
+help_key = "#e6c384"
+branch = "#7aa89f"
+sandbox = "#d27e99"
+
+[syntax]
+shiki_theme = "github-dark-dimmed"

@@ -1,0 +1,5317 @@
+//! Main TUI application
+
+use anyhow::{Context, Result};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    MouseButton, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
+use futures_util::StreamExt;
+use ratatui::prelude::*;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
+
+use super::attached_status_hooks::AttachedStatusHookWatcher;
+use super::home::{HomeView, TerminalMode};
+use super::status_poller::StatusUpdate;
+use super::styles::Theme;
+use crate::containers::image_update::ImageUpdate;
+use crate::session::{get_update_settings, update_app_state, Config};
+use crate::tmux::AvailableTools;
+use crate::update::{check_for_update, UpdateInfo};
+
+/// Minimum elapsed time between considering periodic update re-checks.
+/// Gating on this gap keeps the `get_update_settings()` config read off
+/// periodic maintenance wakes while still re-evaluating well under the daily
+/// re-check interval.
+const UPDATE_CHECK_THROTTLE_GAP: Duration = Duration::from_secs(60);
+
+/// The push consumer treats input in the last 30 seconds as active use. Touch
+/// that marker at a much lower cadence than keystrokes: rewriting it for every
+/// character puts directory creation and file I/O directly on typing's UI
+/// thread, while a five-second refresh still leaves a generous freshness
+/// margin for notification suppression.
+const TUI_ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Fast refresh while a preview selection is being dragged at a pane edge.
+/// Live pane output is event-driven by the capture worker instead.
+const PREVIEW_DRAG_REFRESH_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Baseline cadence for status result drains, spinner animation, and other
+/// low-frequency maintenance while the preview is not actively moving.
+const MAINTENANCE_REFRESH_INTERVAL: Duration = Duration::from_millis(120);
+
+/// How often a long-running TUI re-checks for updates, matching the
+/// `check_for_update` cache TTL (`update::UPDATE_CHECK_INTERVAL_HOURS`).
+const PERIODIC_RECHECK_INTERVAL: Duration =
+    Duration::from_secs(crate::update::UPDATE_CHECK_INTERVAL_HOURS * 3600);
+
+/// Inter-key timeout for the paste-burst detector. After any printable Char
+/// or Enter, the event loop polls for the next event with this timeout; if
+/// another burst-candidate arrives before the deadline, it joins the burst.
+/// Mosh strips bracketed-paste markers, so dictation from iOS clients lands
+/// as a tightly-packed stream of individual key events; 5ms is comfortably
+/// wider than a Mosh paste's inter-key gap and well under any human typing
+/// rhythm, so it discriminates between paste and typing without making
+/// single-key shortcuts feel laggy.
+const PASTE_BURST_INTER_KEY_MS: u64 = 5;
+
+/// Minimum length (in burst-candidate events) for an accumulated burst to be
+/// routed through `handle_paste`. Shorter accumulations are replayed as
+/// individual key events so genuine typing isn't mistaken for a paste.
+const PASTE_BURST_MIN_LEN: usize = 3;
+
+/// Process-local session-create trend counter for the TUI surface, mirroring the
+/// serve daemon's `telemetry_session_creates` (#1897). A long-lived TUI creates
+/// sessions over its lifetime; this monotonic accumulator carries that count
+/// into the opt-in `usage_snapshot.session_creates_since_last_snapshot` field.
+/// It is incremented on each create in [`record_session_create`], read
+/// without reset when a snapshot is built, and decremented by exactly the
+/// reported value only after a confirmed send so a create that lands during an
+/// in-flight send rolls into the next snapshot rather than being double-counted
+/// or dropped. A no-op for opted-out installs (no snapshot is ever sent).
+static TUI_SESSION_CREATES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Point-in-time read of the create counter, so a snapshot can later be cleared
+/// by exactly the value it reported.
+fn reported_session_creates() -> u32 {
+    TUI_SESSION_CREATES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Decrement the create counter by exactly `reported` after a confirmed send,
+/// mirroring serve's `decrement_reported_count`. Subtracting the reported amount
+/// rather than zeroing preserves any create that landed between the snapshot
+/// build and the confirmed send. A no-op when nothing was reported or the send
+/// was not confirmed (`Deduped`/`Failed` retain the count for the next snapshot).
+/// The subtraction saturates rather than underflow-wrapping the `AtomicU32`.
+fn clear_reported_session_creates(reported: u32, outcome: crate::telemetry::SendOutcome) {
+    if reported == 0 || outcome != crate::telemetry::SendOutcome::Sent {
+        return;
+    }
+    use std::sync::atomic::Ordering;
+    let _ = TUI_SESSION_CREATES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(reported))
+    });
+}
+
+/// Count one TUI session create for the opt-in telemetry trend counter. Bounded
+/// accumulator, read-and-decremented by the snapshot paths; a no-op for
+/// opted-out installs (the snapshot is never built / sent). Called from
+/// `HomeView::add_instance`, the single funnel every TUI create passes through.
+pub(super) fn record_session_create() {
+    TUI_SESSION_CREATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Test-only read of the process-local create counter, so the `home` module's
+/// `add_instance` gating test can assert real creates count and `Creating`
+/// stubs do not. Tests sharing the counter use the `telemetry_creates` serial
+/// group to avoid racing on this global.
+#[cfg(test)]
+pub(crate) fn session_create_count_for_test() -> u32 {
+    reported_session_creates()
+}
+
+struct UpdateStatus {
+    text: String,
+    expires_at: Option<std::time::Instant>,
+}
+
+impl UpdateStatus {
+    fn persistent(text: String) -> Self {
+        Self {
+            text,
+            expires_at: None,
+        }
+    }
+
+    fn transient(text: String) -> Self {
+        Self {
+            text,
+            expires_at: Some(std::time::Instant::now() + std::time::Duration::from_secs(10)),
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        match self.expires_at {
+            Some(deadline) => std::time::Instant::now() >= deadline,
+            None => false,
+        }
+    }
+}
+
+pub struct App {
+    home: HomeView,
+    should_quit: bool,
+    theme: Theme,
+    /// Identity of the currently applied `theme` (global theme name +
+    /// palette-downsample mode). `set_theme` compares against this so a
+    /// re-apply with the same identity is a no-op. The config-file watcher
+    /// re-dispatches the theme on EVERY `config.toml` save (it can't tell
+    /// what changed), and a needless `set_theme` there sets `needs_redraw`,
+    /// forcing a full-screen `clear_terminal` that flickers. Guarding here
+    /// keeps any config save (collapse persistence, list resize, `i`,
+    /// settings) from clearing the screen when the theme is unchanged.
+    theme_name: String,
+    theme_palette_mode: bool,
+    needs_redraw: bool,
+    update_info: Option<UpdateInfo>,
+    update_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<UpdateInfo>>>,
+    update_status: Option<UpdateStatus>,
+    update_status_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<()>>>,
+    /// Latest version the user dismissed via Ctrl+x. Persisted to
+    /// `app_state.dismissed_update_version` so the snooze survives
+    /// `aoe` restarts (per #1140). The banner stays hidden while the
+    /// fetched latest_version equals this value, and returns
+    /// automatically when a newer release ships.
+    dismissed_update_version: Option<String>,
+    /// A newer sandbox image detected in its registry, surfaced as the
+    /// lowest-priority bottom banner (below app-update and transient status).
+    /// `None` until the background check finds a drift the user hasn't snoozed.
+    image_update: Option<ImageUpdate>,
+    image_update_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<Option<ImageUpdate>>>>,
+    /// In-flight `docker pull` of the sandbox image, kicked off when the user
+    /// accepts the banner's confirm. Result promotes into a transient toast.
+    image_pull_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<()>>>,
+    /// Registry digest the user dismissed via Ctrl+x on the image banner.
+    /// Persisted to `app_state.dismissed_image_digest`; the banner stays hidden
+    /// while the registry still resolves to this digest.
+    dismissed_image_digest: Option<String>,
+    /// Held in an Option so `with_raw_mode_disabled` can drop it before
+    /// spawning child processes. Crossterm's EventStream runs a background
+    /// reader thread on stdin; if it's alive when tmux attach-session starts,
+    /// the two compete for stdin and tmux fails to initialize its client.
+    event_stream: Option<EventStream>,
+    /// Tracks whether we currently have xterm mouse-tracking enabled. The TUI
+    /// turns it off while a copy-friendly surface is open (`HomeView::
+    /// wants_text_selection`) so users can drag-select natively, then turns
+    /// it back on when the surface dismisses. Default true to match the
+    /// startup `EnableMouseCapture` in `tui::run`.
+    mouse_captured: bool,
+    /// Whether the resolved config permits xterm mouse tracking (the
+    /// `session.mouse_capture` field plus the `AOE_MOUSE_CAPTURE` backstop).
+    /// This is permission, not live state: `mouse_captured` tracks whether
+    /// tracking is actually engaged right now. Refreshed from disk on the
+    /// periodic reload so toggling Settings > Interaction > Mouse Capture takes
+    /// effect without a restart. When false, `sync_mouse_capture` keeps xterm
+    /// tracking off entirely.
+    mouse_capture_allowed: bool,
+    host_title: super::host_title::HostTitleTracker,
+    /// True when running under Mosh (`MOSH_CONNECTION` set). Mosh mangles
+    /// xterm mouse-tracking escapes, so `tui::run` skips the startup
+    /// `EnableMouseCapture` and `sync_mouse_capture` must not re-enable
+    /// tracking mid-session either.
+    mosh_active: bool,
+    /// Set by `Action::OpenStructuredView` so the async main loop can pick it
+    /// up and enter the acp view (which needs `event_stream` access
+    /// the sync `execute_action` can't lend out).
+    #[cfg(feature = "serve")]
+    pending_structured_view_open: Option<String>,
+    /// Set by `Action::SwitchSessionView` so the async main loop can run
+    /// the daemon switch POST (awaited; the sync handler can't).
+    #[cfg(feature = "serve")]
+    pending_view_switch: Option<String>,
+    /// Set by `Action::StartDaemonThenOpenStructured` (the Yes on the
+    /// "start a local daemon?" confirm) so the async loop can spawn the
+    /// daemon, wait for health, and then open the structured view.
+    #[cfg(feature = "serve")]
+    pending_daemon_start_open: Option<String>,
+    /// Set by `Action::SmartRenameNow` so the async loop can run the daemon
+    /// `/smart-rename` POST for a structured session (#3039).
+    #[cfg(feature = "serve")]
+    pending_smart_rename: Option<String>,
+    /// Debounce for structured preview-on-select: the session the cursor
+    /// settled on and when, so rapid list navigation doesn't connect a
+    /// WebSocket per keystroke. The mounted view itself lives on
+    /// `HomeView::structured_preview` (it is preview content); this App
+    /// side only drives the async mount/unmount.
+    #[cfg(feature = "serve")]
+    preview_mount_pending: Option<(String, std::time::Instant)>,
+    /// Version of the install currently being attempted (auto or manual).
+    /// Set when the install task is spawned; transferred to
+    /// `last_installed_version_in_session` on confirmed success in
+    /// `poll_update_status`. Cleared on failure so the user can retry.
+    pending_install_version: Option<String>,
+    /// Version we successfully installed this session. The running binary's
+    /// compile-time `CARGO_PKG_VERSION` stays at the old value until
+    /// restart, so without this guard every periodic re-check (#1471) would
+    /// surface the same release again: as an auto-install loop in auto
+    /// mode, and as a re-appearing banner in notify mode. A genuinely newer
+    /// release clears the guard automatically because the version string
+    /// differs. Single-process scope; on restart the new binary's
+    /// `CARGO_PKG_VERSION` makes the underlying check return "no update".
+    last_installed_version_in_session: Option<String>,
+}
+
+/// Check if the app version changed and return the previous version if changelog should be shown.
+/// This is called before App::new to allow async cache refresh.
+pub fn check_version_change() -> Result<Option<String>> {
+    let config = Config::load_or_warn();
+    let current_version = env!("CARGO_PKG_VERSION");
+
+    if config.app_state.has_seen_welcome
+        && config.app_state.last_seen_version.as_deref() != Some(current_version)
+    {
+        Ok(config.app_state.last_seen_version)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Whether applying `next` `(theme name, palette-downsample mode)` would change
+/// the active theme `current`. Pulled out of `App::set_theme` so the
+/// idempotency guard (which keeps a config-file-watcher theme re-dispatch from
+/// forcing a flickering full-screen clear on every `config.toml` save) is
+/// unit-testable without constructing a full `App`.
+fn theme_apply_needed(current: (&str, bool), next: (&str, bool)) -> bool {
+    current != next
+}
+
+/// RAII guard that ignores `SIGINT` and `SIGQUIT` for as long as it's
+/// alive, restoring whatever disposition was in effect beforehand on drop.
+///
+/// `with_raw_mode_disabled` calls `disable_raw_mode()` before handing the
+/// terminal to a child process (tmux attach, an editor shell-out). With raw
+/// mode off, the kernel goes back to delivering keyboard-generated signals
+/// to aoe's own foreground process group. If the child pane is dead or
+/// hung and the user hits Ctrl+C to escape, that SIGINT lands on aoe
+/// itself, not just the child, and aoe has no handler for it: it dies
+/// immediately with zero cleanup, taking down every tmux session/pane it
+/// was managing. Holding this guard for the duration of the closure closes
+/// that window.
+#[cfg(unix)]
+struct IgnoreSignalsGuard {
+    prev_sigint: Option<nix::sys::signal::SigAction>,
+    prev_sigquit: Option<nix::sys::signal::SigAction>,
+}
+
+#[cfg(unix)]
+impl IgnoreSignalsGuard {
+    fn new() -> Self {
+        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+
+        let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+
+        // SAFETY: SIG_IGN is async-signal-safe per POSIX, which is the only
+        // requirement for sigaction calls made outside a signal handler.
+        let prev_sigint = unsafe { sigaction(Signal::SIGINT, &ignore) }
+            .inspect_err(|e| tracing::warn!(target: "tui.input", "Failed to ignore SIGINT: {}", e))
+            .ok();
+        // SAFETY: see above.
+        let prev_sigquit = unsafe { sigaction(Signal::SIGQUIT, &ignore) }
+            .inspect_err(|e| tracing::warn!(target: "tui.input", "Failed to ignore SIGQUIT: {}", e))
+            .ok();
+
+        Self {
+            prev_sigint,
+            prev_sigquit,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for IgnoreSignalsGuard {
+    fn drop(&mut self) {
+        use nix::sys::signal::{sigaction, Signal};
+
+        if let Some(prev) = self.prev_sigint.take() {
+            // SAFETY: restoring a previously-saved disposition is likewise
+            // async-signal-safe; sigaction only mutates process-wide signal
+            // state.
+            let _ = unsafe { sigaction(Signal::SIGINT, &prev) };
+        }
+        if let Some(prev) = self.prev_sigquit.take() {
+            // SAFETY: see above.
+            let _ = unsafe { sigaction(Signal::SIGQUIT, &prev) };
+        }
+    }
+}
+
+/// Whether `draw` should skip its explicit pre-render `cursor::Hide`.
+///
+/// The pre-draw Hide exists only to keep an IME candidate window from being
+/// dragged by the backend's transient cursor moves during the diff paint. In
+/// live-send with no overlay or preview selection open, the only cursor is the
+/// remote preview-pane caret (no local IME), and the early Hide (flushed before
+/// the ~2-3ms widget build, while ratatui's trailing Show is flushed after it)
+/// is what straddles the vsync boundary and reads as ~30fps flicker on terminals
+/// without synchronized-update (Terminal.app). Skipping it there removes the
+/// blink; every other state keeps the Hide. A preview selection keeps the Hide
+/// because its cursor is intentionally suppressed for a stable highlight.
+fn skip_predraw_cursor_hide(
+    live_send_active: bool,
+    has_overlay: bool,
+    has_preview_selection: bool,
+) -> bool {
+    live_send_active && !has_overlay && !has_preview_selection
+}
+
+/// Whether preview-specific wake sources should produce a frame. A frozen
+/// preview deliberately holds the same cells, so only unrelated UI changes or
+/// direct selection/scroll input need to draw until it unfreezes.
+fn preview_signals_need_refresh(
+    woke_via_post_key: bool,
+    woke_via_preview: bool,
+    preview_frozen: bool,
+) -> bool {
+    !preview_frozen && (woke_via_post_key || woke_via_preview)
+}
+
+fn tui_activity_write_due(last_write: std::time::Instant, now: std::time::Instant) -> bool {
+    now.saturating_duration_since(last_write) >= TUI_ACTIVITY_REFRESH_INTERVAL
+}
+
+#[inline]
+fn refresh_tui_activity(last_write: &mut std::time::Instant) {
+    let now = std::time::Instant::now();
+    if tui_activity_write_due(*last_write, now) {
+        crate::session::write_tui_activity();
+        *last_write = now;
+    }
+}
+
+/// Whether a printable key needs the short look-ahead used to recognize an
+/// unmarked paste burst. Home-list text needs it because pasted letters would
+/// otherwise trigger shortcuts. A surface that already owns text input
+/// (live-send, a compose dialog, or the embedded composer) can accept each key
+/// immediately on an ordinary terminal; bracketed paste still arrives as one
+/// `Event::Paste`. Mosh is the exception because it strips those markers, so
+/// it keeps the look-ahead everywhere the burst path is supported.
+fn paste_burst_probe_needed(
+    wants_paste_burst: bool,
+    mosh_active: bool,
+    has_dialog: bool,
+    embedded_composer_active: bool,
+) -> bool {
+    wants_paste_burst && (mosh_active || (!has_dialog && !embedded_composer_active))
+}
+
+/// A live full-screen pane consumes wheel input asynchronously. When the
+/// preview was and remains at its live edge, drawing immediately can only
+/// repaint the stale pre-scroll snapshot; the capture-worker wake will paint
+/// the changed agent frame. Skipping that no-op draw lets trackpad bursts drain
+/// without building a render backlog. Any frozen-state transition still draws
+/// immediately (ordinary aoe scrollback or clearing a selection).
+fn skip_immediate_live_scroll_draw(
+    live_send_active: bool,
+    hit_preview: bool,
+    was_frozen: bool,
+    is_frozen: bool,
+) -> bool {
+    live_send_active && hit_preview && !was_frozen && !is_frozen
+}
+
+impl App {
+    /// Is this key event a candidate for paste-burst accumulation?
+    /// Printable ASCII Char or Enter, with no modifiers (or shift only).
+    /// Burst detection ignores Ctrl/Alt-modified chords because those
+    /// are genuine intentional shortcuts and never come from a paste-burst.
+    /// Enter is included so embedded CR/LF inside a Mosh-stripped paste
+    /// (voice/dictation often inserts sentence-break newlines) gets
+    /// captured into the burst as \n instead of breaking it in two and
+    /// firing Submit/select on the deferred Enter.
+    fn is_burst_candidate(key: &KeyEvent) -> bool {
+        let mods = key.modifiers;
+        let mods_ok = mods.is_empty() || mods == KeyModifiers::SHIFT;
+        if !mods_ok {
+            return false;
+        }
+        match key.code {
+            KeyCode::Char(c) => c == ' ' || c.is_ascii_graphic(),
+            KeyCode::Enter => true,
+            _ => false,
+        }
+    }
+
+    /// Translate a burst-candidate key event back to its text byte for the
+    /// accumulated burst string. Char yields the char; Enter yields '\n'.
+    fn burst_char_for(key: &KeyEvent) -> Option<char> {
+        match key.code {
+            KeyCode::Char(c) => Some(c),
+            KeyCode::Enter => Some('\n'),
+            _ => None,
+        }
+    }
+
+    /// Holding a key produces a stream of Press events on terminals that do not
+    /// report key-event types, or an initial Press followed by Repeat events on
+    /// terminals that do. That stream has the same timing as Mosh's paste
+    /// fallback, but it is navigation, not pasted text. Keep it on the normal
+    /// input path so held `j`/`k` continue scrolling the session list instead of
+    /// opening the message composer.
+    fn is_auto_repeat_burst(keys: &[KeyEvent]) -> bool {
+        let Some(first) = keys.first() else {
+            return false;
+        };
+        keys.iter()
+            .skip(1)
+            .all(|key| key.code == first.code && key.modifiers == first.modifiers)
+    }
+
+    /// Peel a trailing Enter off a paste burst so plain-Enter Submit
+    /// semantics survive when the user types or dictates fast enough to
+    /// pump everything through the burst path.
+    ///
+    /// Without this peel, an "hi<Enter>" with sub-5ms key gaps
+    /// (fast typing, clipboard paste with trailing newline, VoiceInk
+    /// dictation that punctuates with a return) lands as a single
+    /// burst `[h, i, Enter]` whose string is `"hi\n"`. The current
+    /// code forwards that whole string through `handle_paste`, which
+    /// inserts `\n` as a literal newline in the textarea, so the
+    /// `Enter` never reaches the dialog's Submit branch and the
+    /// message never sends.
+    ///
+    /// The fix preserves embedded `\n` (mid-burst sentence breaks from
+    /// Mosh-stripped voice paste; the original reason Enter was added
+    /// to `is_burst_candidate`) and only peels the trailing Enter,
+    /// which is intent-to-submit, not data.
+    ///
+    /// Returns `(paste_text, trailing_enter)`:
+    ///   * `paste_text`: the string to forward to `handle_paste` with
+    ///     any trailing `\n` removed.
+    ///   * `trailing_enter`: `Some(KeyEvent)` to replay via
+    ///     `handle_key` after `handle_paste` runs, so the dialog's
+    ///     plain-Enter Submit branch fires; `None` if the burst did
+    ///     not end on Enter.
+    fn split_trailing_enter(
+        burst_str: &str,
+        burst_keys: &[KeyEvent],
+    ) -> (String, Option<KeyEvent>) {
+        match burst_keys.last() {
+            Some(last) if last.code == KeyCode::Enter => {
+                let trimmed = burst_str
+                    .strip_suffix('\n')
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| burst_str.to_string());
+                (trimmed, Some(*last))
+            }
+            _ => (burst_str.to_string(), None),
+        }
+    }
+
+    pub fn new(
+        profile: &str,
+        available_tools: AvailableTools,
+        suppress_first_run_dialogs: bool,
+        mosh_active: bool,
+        file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
+    ) -> Result<Self> {
+        let no_agents = !available_tools.any_available();
+        let active_profile = if profile.is_empty() {
+            None // all-profiles mode
+        } else {
+            Some(profile.to_string())
+        };
+        let mut home = HomeView::new(active_profile, available_tools, file_watch)?;
+
+        // Check if we need to show welcome or changelog dialogs
+        let config = Config::load_or_warn();
+
+        // Theme is a global preference: read it from the global config, never
+        // profile-merged, so boot matches Settings-close and the web dashboard
+        // (see config::resolve_theme_name). Empty maps to the `default` builtin.
+        let theme_name = config.effective_theme_name();
+        let palette_mode = config.theme_palette_mode();
+        let theme = crate::tui::styles::load_theme_with_mode(&theme_name, palette_mode);
+        let current_version = env!("CARGO_PKG_VERSION").to_string();
+
+        if no_agents {
+            // Show the no-agents onboarding dialog (takes priority over welcome/changelog)
+            home.show_no_agents();
+        } else if suppress_first_run_dialogs {
+            // A startup warning will be shown by the caller; skip welcome and
+            // changelog so the warning is what the user sees first.
+        } else if !config.app_state.has_seen_welcome {
+            home.show_intro(&theme_name);
+            if let Err(e) = update_app_state(|state| {
+                state.has_seen_welcome = true;
+                state.last_seen_version = Some(current_version.clone());
+            }) {
+                tracing::warn!(
+                    target: "tui.startup",
+                    error = %e,
+                    "failed to persist has_seen_welcome/last_seen_version"
+                );
+            }
+        } else if config.app_state.last_seen_version.as_deref() != Some(&current_version) {
+            // Cache should already be refreshed by tui::run() before App::new
+            home.show_changelog(config.app_state.last_seen_version.clone());
+            if let Err(e) = update_app_state(|state| {
+                state.last_seen_version = Some(current_version.clone());
+            }) {
+                tracing::warn!(
+                    target: "tui.startup",
+                    error = %e,
+                    "failed to persist last_seen_version"
+                );
+            }
+        } else if !config.app_state.has_responded_to_telemetry {
+            // Existing users who finished the walkthrough before telemetry
+            // existed get a one-time opt-in popup. Gated behind the changelog
+            // branch above (mutually exclusive in this if/else chain), so it
+            // never co-renders with the changelog; and because it is a modal
+            // dialog, the version update modal (opened only by an explicit
+            // keypress) can't open on top of it while it is up. No save here:
+            // the dialog's response handler persists the answer.
+            home.show_telemetry_consent();
+        }
+
+        let dismissed_update_version = config.app_state.dismissed_update_version.clone();
+        let dismissed_image_digest = config.app_state.dismissed_image_digest.clone();
+
+        Ok(Self {
+            home,
+            should_quit: false,
+            theme,
+            theme_name,
+            theme_palette_mode: palette_mode,
+            needs_redraw: true,
+            update_info: None,
+            update_rx: None,
+            update_status: None,
+            update_status_rx: None,
+            dismissed_update_version,
+            image_update: None,
+            image_update_rx: None,
+            image_pull_rx: None,
+            dismissed_image_digest,
+            // Crossterm's stream needs a live event reader, which a unit
+            // test runtime does not have; the TUI loop never runs in tests.
+            event_stream: (!cfg!(test)).then(EventStream::new),
+            // Initial state matches whatever `tui::run` did at startup: capture
+            // is requested by default, but Mosh suppresses the actual escape, so
+            // `mouse_captured` (live state) also factors in `mosh_active`.
+            // `mouse_capture_allowed` is permission only and ignores Mosh.
+            mouse_captured: crate::tui::mouse_capture_requested(&config.session) && !mosh_active,
+            mouse_capture_allowed: crate::tui::mouse_capture_requested(&config.session),
+            host_title: super::host_title::HostTitleTracker::default(),
+            mosh_active,
+            #[cfg(feature = "serve")]
+            pending_structured_view_open: None,
+            #[cfg(feature = "serve")]
+            pending_daemon_start_open: None,
+            #[cfg(feature = "serve")]
+            preview_mount_pending: None,
+            #[cfg(feature = "serve")]
+            pending_view_switch: None,
+            #[cfg(feature = "serve")]
+            pending_smart_rename: None,
+            pending_install_version: None,
+            last_installed_version_in_session: None,
+        })
+    }
+
+    /// Turn xterm mouse tracking on or off to match the current view state.
+    ///
+    /// **Contract**: must be called after any handler that may open or close
+    /// a surface counted by `HomeView::wants_text_selection`. Currently the
+    /// event-loop `Event::Key` arm and the tail of `with_raw_mode_disabled`
+    /// cover this; new event sources that mutate dialog state need to call
+    /// this too or mouse capture will lag a frame behind reality.
+    fn sync_mouse_capture(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
+        // Mouse capture is on by default; the Mouse Capture setting (or the
+        // AOE_MOUSE_CAPTURE=0 backstop) opts out so iOS Mosh + Termius/Blink
+        // use the terminal app's native scrollback for touch-scroll (Mosh
+        // doesn't reliably forward mouse-tracking escapes to mobile clients).
+        // Folding `mouse_capture_allowed` into `desired` (rather than an early
+        // return) means flipping the setting off mid-session disables tracking
+        // on the next sync instead of leaving it stuck on. `mosh_active` is
+        // folded in too so a mid-session enable never emits the escape under
+        // Mosh, matching the startup gate in `tui::run`.
+        let desired =
+            self.mouse_capture_allowed && !self.mosh_active && !self.home.wants_text_selection();
+        if desired == self.mouse_captured {
+            return Ok(());
+        }
+        if desired {
+            crossterm::execute!(terminal.backend_mut(), EnableMouseCapture)?;
+        } else {
+            crossterm::execute!(terminal.backend_mut(), DisableMouseCapture)?;
+        }
+        self.mouse_captured = desired;
+        Ok(())
+    }
+
+    /// Emit only changed titles, after drawing, without filesystem or tmux probes.
+    fn sync_host_title(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
+        if let Some(title) = self
+            .host_title
+            .sync(self.home.host_tab_title, self.home.selected_session_title())
+        {
+            crossterm::execute!(terminal.backend_mut(), crossterm::terminal::SetTitle(title))?;
+            super::host_title::note_emitted();
+        }
+        Ok(())
+    }
+
+    /// Draw a frame without exposing ratatui's intermediate cursor moves.
+    ///
+    /// The backend moves the real terminal cursor while flushing changed
+    /// cells. If an IME is composing text, those transient moves can pull the
+    /// candidate window toward refreshed UI such as the status list before the
+    /// frame's final cursor position is restored. Synchronized update batches
+    /// the frame, and hiding the cursor before the batch keeps the only visible
+    /// cursor transition at ratatui's final `Frame::set_cursor_position`.
+    ///
+    /// `skip_predraw_cursor_hide` skips that pre-draw Hide specifically in
+    /// live-send with no overlay or preview selection open: that is the one
+    /// state that visibly flickers on terminals without synchronized-update
+    /// support (Terminal.app), because the only cursor set in that state is the
+    /// remote live-preview pane caret, not a local IME candidate window, so
+    /// there's nothing for the early Hide to protect.
+    fn draw(&mut self, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
+        // An ACTIVE embedded structured view sets a composer caret every
+        // frame, just like the live-send preview caret: hiding it before each
+        // periodic redraw makes it strobe (the reported "cursor blinks really
+        // fast"). Skip the pre-draw Hide while it's active, the same treatment
+        // live-send gets. A preview shows no caret, so it needs no skip.
+        #[cfg(feature = "serve")]
+        let embedded_active = self
+            .home
+            .structured_preview
+            .as_ref()
+            .is_some_and(|v| v.is_active());
+        #[cfg(not(feature = "serve"))]
+        let embedded_active = false;
+        let skip_hide = embedded_active
+            || skip_predraw_cursor_hide(
+                self.home.live_send.is_some(),
+                self.home.has_non_live_send_overlay(),
+                self.home.preview_selection.is_some(),
+            );
+        // QUEUE, never execute: `execute!` flushes, and flushing the batch
+        // opener on its own puts the ~10ms widget build INSIDE the
+        // synchronized-update bracket, so the terminal holds its display
+        // frozen for a third of every frame instead of batching the result of
+        // one. Queued, these ride out in `terminal.draw`'s own flush together
+        // with the cells and the trailing Show, which is the whole point of
+        // the bracket: one write, one atomic frame.
+        crossterm::queue!(
+            terminal.backend_mut(),
+            crossterm::terminal::BeginSynchronizedUpdate
+        )?;
+        let draw_result = (|| -> Result<()> {
+            if !skip_hide {
+                crossterm::queue!(terminal.backend_mut(), crossterm::cursor::Hide)?;
+            }
+            terminal.draw(|f| self.render(f))?;
+            Ok(())
+        })();
+        let end_result = crossterm::execute!(
+            terminal.backend_mut(),
+            crossterm::terminal::EndSynchronizedUpdate
+        );
+        draw_result?;
+        end_result?;
+        self.sync_host_title(terminal)?;
+        Ok(())
+    }
+
+    /// Temporarily leave TUI mode, run a closure, and restore TUI mode.
+    /// Drops the EventStream before the closure so child processes (tmux,
+    /// editors) have exclusive access to stdin, then creates a fresh one.
+    fn with_raw_mode_disabled<F, R>(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        f: F,
+    ) -> Result<R>
+    where
+        F: FnOnce() -> R,
+    {
+        crossterm::terminal::disable_raw_mode()?;
+        // Pop the kitty enhancement stack before handing the terminal to the
+        // child closure (typically `tmux attach`). Symmetric with the repush
+        // after `EnterAlternateScreen` below so the stack depth is preserved
+        // across the suspend, and tmux gets a clean outer terminal regardless
+        // of its own extended-keys configuration (#2362).
+        #[cfg(unix)]
+        let _ = crossterm::execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+        crossterm::execute!(
+            terminal.backend_mut(),
+            crossterm::terminal::LeaveAlternateScreen,
+            DisableBracketedPaste,
+        )?;
+        if self.mouse_captured {
+            crossterm::execute!(terminal.backend_mut(), DisableMouseCapture)?;
+        }
+        crossterm::execute!(terminal.backend_mut(), crossterm::cursor::Show)?;
+        self.mouse_captured = false;
+        std::io::Write::flush(terminal.backend_mut())?;
+
+        // Drop the event stream so its background reader releases stdin.
+        // Without this, tmux attach-session fails because crossterm's
+        // reader thread competes for stdin reads.
+        self.event_stream.take();
+
+        // Raw mode is off from here until it's re-enabled below, so the
+        // kernel is delivering Ctrl+C/Ctrl+\ to aoe's own foreground process
+        // group again. Ignore them for the handoff so a Ctrl+C meant for a
+        // hung/dead child pane can't kill aoe out from under every session
+        // it's managing (the tokio SIGINT arm still catches anything that
+        // slips past this window before raw mode is re-enabled).
+        #[cfg(unix)]
+        let _signals_guard = IgnoreSignalsGuard::new();
+
+        let result = f();
+
+        #[cfg(unix)]
+        drop(_signals_guard);
+
+        crossterm::terminal::enable_raw_mode()?;
+        crossterm::execute!(
+            terminal.backend_mut(),
+            crossterm::terminal::EnterAlternateScreen,
+            EnableBracketedPaste,
+            crossterm::cursor::Hide
+        )?;
+        // Repush the kitty enhancement stack symmetric with the pop above
+        // (#2362). Best-effort, mirrors `TerminalGuard::enter`.
+        #[cfg(unix)]
+        let _ = crossterm::execute!(
+            terminal.backend_mut(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+        );
+        // Defer mouse-capture restore to sync_mouse_capture so we don't
+        // briefly enable it only to disable again when the user returned
+        // to the serve view. sync_mouse_capture itself respects the Mouse
+        // Capture setting and the AOE_MOUSE_CAPTURE opt-out.
+        self.sync_mouse_capture(terminal)?;
+        self.host_title.invalidate();
+        self.sync_host_title(terminal)?;
+        std::io::Write::flush(terminal.backend_mut())?;
+
+        // Recreate the event stream with a fresh reader before re-entering the
+        // event loop, then force a full redraw of the home screen. The stream is
+        // recreated after raw mode and the alternate screen are restored so it is
+        // born into raw mode rather than attached to a briefly-cooked tty.
+        self.event_stream = Some(EventStream::new());
+        crate::tui::clear_terminal(terminal)?;
+
+        Ok(result)
+    }
+
+    fn with_attached_status_hooks<F, R>(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        f: F,
+    ) -> Result<(R, Vec<StatusUpdate>)>
+    where
+        F: FnOnce() -> R,
+    {
+        let watcher = AttachedStatusHookWatcher::start(self.home.attached_status_hook_sessions());
+        let result = self.with_raw_mode_disabled(terminal, f);
+        let mut attached_status_updates = Vec::new();
+
+        if let Some(watcher) = watcher {
+            attached_status_updates = watcher.stop();
+        }
+        self.home.reset_status_refresh();
+
+        result.map(|result| (result, attached_status_updates))
+    }
+
+    pub fn show_startup_warning(&mut self, message: &str) {
+        // Warnings preempt onboarding dialogs so the user sees the problem
+        // before the intro walkthrough.
+        self.home.intro_dialog = None;
+        self.home.changelog_dialog = None;
+        self.home.telemetry_consent_dialog = None;
+        tracing::info!(target: "tui.dialog", dialog = "warning", "opening warning dialog");
+        self.home.info_dialog = Some(crate::tui::dialogs::InfoDialog::sized_to_fit(
+            "Warning", message,
+        ));
+    }
+
+    pub fn set_theme(&mut self, name: &str) {
+        // Honor the saved color_mode (Palette vs Truecolor). If we don't, a
+        // SetTheme dispatched from the Settings view preview/apply flow will
+        // re-load the theme with raw RGB colors, "breaking the coloration"
+        // on terminals that were working with the user's palette preference
+        // (Termius/mosh edge cases, 8-bit-only TTYs, etc.). Read from the
+        // global config: theme (and its color_mode) is a global preference,
+        // not profile-merged.
+        let palette_mode = crate::session::config::resolve_theme_palette_mode();
+        // No-op when the theme is already applied. The config watcher
+        // re-dispatches the theme on every `config.toml` save, so without
+        // this a list-resize / `i` / collapse-persistence / settings save
+        // would force a full-screen `clear_terminal` and flicker even though
+        // nothing visual changed.
+        if !theme_apply_needed(
+            (&self.theme_name, self.theme_palette_mode),
+            (name, palette_mode),
+        ) {
+            return;
+        }
+        self.theme = crate::tui::styles::load_theme_with_mode(name, palette_mode);
+        self.theme_name = name.to_string();
+        self.theme_palette_mode = palette_mode;
+        self.needs_redraw = true;
+    }
+
+    pub async fn run(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
+        // Initial render
+        crate::tui::clear_terminal(terminal)?;
+        // Sync mouse capture before the first paint so any onboarding
+        // surface that wants native drag-to-select (intro Welcome page,
+        // changelog, info dialog) gets capture turned off on frame 1.
+        // Otherwise the user would have to press a key first.
+        self.sync_mouse_capture(terminal)?;
+        self.draw(terminal)?;
+
+        // Refresh tmux session cache
+        crate::tmux::refresh_session_cache();
+
+        // Spawn async update check at startup. The periodic re-check below
+        // covers long-running sessions (#1471). `last_update_check` stays
+        // `None` when the startup spawn does not fire (mode=off) so that
+        // toggling the mode on later triggers a check immediately, instead
+        // of waiting up to `PERIODIC_RECHECK_INTERVAL` from process launch.
+        let settings = get_update_settings();
+        let mut last_update_check: Option<std::time::Instant> =
+            if settings.update_check_mode.is_enabled() {
+                self.spawn_update_check();
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+
+        // Check the sandbox image for a newer registry build, once at startup.
+        // Gated on the same network-checks toggle as app updates, and only for
+        // users who actually run sandboxed sessions (so non-sandbox users never
+        // see a docker banner).
+        if settings.update_check_mode.is_enabled() && self.sandbox_in_use() {
+            self.spawn_image_update_check();
+        }
+
+        // SIGHUP/SIGTERM/SIGINT futures so we exit cleanly when the terminal
+        // emulator is force-quit, preventing PTY slot leaks (#541).
+        // These are polled directly inside tokio::select!, which guarantees
+        // they get scheduled even when no terminal events arrive. The SIGINT
+        // arm is belt-and-suspenders: `IgnoreSignalsGuard` (see
+        // `with_raw_mode_disabled`) should absorb a Ctrl+C aimed at a
+        // dead/hung tmux pane during an attach, but any SIGINT that arrives
+        // outside that window (or in a race right at guard install/teardown)
+        // lands here and triggers a clean shutdown instead of the default
+        // terminate-immediately behavior.
+        #[cfg(unix)]
+        let (mut sighup, mut sigterm, mut sigint) = {
+            use tokio::signal::unix::{signal, SignalKind};
+            let hup = signal(SignalKind::hangup());
+            let term = signal(SignalKind::terminate());
+            let int = signal(SignalKind::interrupt());
+            if let Err(ref e) = hup {
+                tracing::warn!(target: "tui.input", "Failed to register SIGHUP handler: {}", e);
+            }
+            if let Err(ref e) = term {
+                tracing::warn!(target: "tui.input", "Failed to register SIGTERM handler: {}", e);
+            }
+            if let Err(ref e) = int {
+                tracing::warn!(target: "tui.input", "Failed to register SIGINT handler: {}", e);
+            }
+            (hup.ok(), term.ok(), int.ok())
+        };
+
+        // Pane changes wake the loop directly, and the post-key timer below
+        // covers typed echo. The fast ticker (~30fps) is therefore only needed
+        // during an in-progress preview drag. A separate 120ms maintenance
+        // ticker keeps status drains and animation alive everywhere else.
+        //
+        // A 33ms drag tick comfortably drives the 40ms line-autoscroll pace.
+        // The previous 16ms experiment produced visible tearing on terminals
+        // without synchronized-update support, notably macOS Terminal.app,
+        // without improving selection motion.
+        let mut fast_refresh_interval = tokio::time::interval(PREVIEW_DRAG_REFRESH_INTERVAL);
+        fast_refresh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut maintenance_interval = tokio::time::interval(MAINTENANCE_REFRESH_INTERVAL);
+        maintenance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // After any keystroke routed to live-send, schedule one extra
+        // refresh ~15ms later (roughly input dispatch plus agent-echo time) so
+        // the resulting capture catches the echo deterministically. Cleared
+        // when the wake fires; re-armed by each subsequent key.
+        let mut last_live_key_at: Option<std::time::Instant> = None;
+        const POST_KEY_WAKE_DELAY: Duration = Duration::from_millis(15);
+        // Track the last painted frame so a low-priority periodic request
+        // cannot immediately duplicate a live preview paint. This protects
+        // terminals without synchronized-update support from back-to-back
+        // per-cell writes while deterministic change wakes still pass through.
+        let mut last_refresh_at: Option<std::time::Instant> = None;
+        const REFRESH_COOLDOWN: Duration = Duration::from_millis(15);
+        let mut last_status_refresh = std::time::Instant::now();
+        let mut last_metrics_sample = std::time::Instant::now();
+        #[cfg(feature = "serve")]
+        let mut last_daemon_status_refresh = std::time::Instant::now();
+        let mut last_disk_refresh = std::time::Instant::now();
+        let mut last_spinner_redraw = std::time::Instant::now();
+        let mut last_heartbeat = std::time::Instant::now();
+        let mut last_presence_refresh = std::time::Instant::now();
+        let mut last_session_idle_reap = std::time::Instant::now();
+        // Throttle for how often the periodic block re-reads settings;
+        // without this, the inner guards would re-fire on every loop
+        // iteration once any time has passed, hitting the config file at
+        // the 20Hz loop rate.
+        let mut last_update_eval = std::time::Instant::now();
+        const STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+        // Structured rows read their status over HTTP from the daemon rather
+        // than from a local tmux scrape, and `/api/sessions` costs the daemon
+        // a few SQLite lookups per structured row. Half the tmux cadence
+        // keeps a status dot feeling live while halving that request rate.
+        #[cfg(feature = "serve")]
+        const DAEMON_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+        const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+        // Diagnostics-strip sampling. 1s keeps the sparkline responsive to a
+        // fast memory climb; request_metrics_refresh is a no-op unless the strip
+        // is visible, so this costs nothing when the pane is hidden.
+        const METRICS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+        // Fastest spinner (breathe) changes every 180ms; 120ms ensures smooth animation
+        const SPINNER_REDRAW_INTERVAL: Duration = Duration::from_millis(120);
+        const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+        // How often to recount live TUIs for the footer indicator. Cheap dir
+        // listing (a handful of entries), so a tight-ish cadence keeps the
+        // "another instance appeared/left" signal responsive without disk I/O
+        // on the hot render path.
+        const PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+        // How often the standalone TUI evaluates plain tmux sessions for idle
+        // auto-stop (`session.auto_stop_idle_secs`, #1690). Matches the serve
+        // daemon's cadence; both reapers claim under the storage lock so they
+        // never double-stop a session when run side by side.
+        const SESSION_IDLE_REAP_INTERVAL: Duration = Duration::from_secs(60);
+        // A presence file counts as live while its mtime is within this window.
+        // Larger than the liveness heartbeat so a couple of missed beats (busy loop,
+        // brief stall) don't drop an instance; matches the push consumer.
+        const PRESENCE_FRESH_WINDOW: Duration = Duration::from_secs(30);
+
+        // Register this TUI as live for the footer, and as recently interacted
+        // with for short-lived push suppression.
+        crate::session::write_tui_heartbeat();
+        crate::session::write_tui_activity();
+        let mut last_tui_activity_write = std::time::Instant::now();
+        self.home.active_tui_count = crate::session::count_active_tuis(PRESENCE_FRESH_WINDOW);
+
+        // Telemetry (opt-in, no-op otherwise): announce this surface on boot,
+        // send an initial snapshot, then refresh it periodically and once more
+        // on graceful exit. All sends are detached and swallow errors. The
+        // periodic interval carries bounded jitter (4h + up to 30m) so installs
+        // that boot together don't snapshot in lockstep; the boot snapshot above
+        // stays immediate.
+        let telemetry_snapshot_interval = crate::telemetry::snapshot_interval();
+        crate::telemetry::spawn_process_start(crate::telemetry::Surface::Tui);
+        self.emit_telemetry_snapshot();
+        let mut last_telemetry_snapshot = std::time::Instant::now();
+
+        loop {
+            // Force full redraw if needed (e.g., after returning from tmux).
+            // with_raw_mode_disabled drops and recreates the EventStream, so
+            // there are no stale events to drain.
+            if self.needs_redraw {
+                crate::tui::clear_terminal(terminal)?;
+                self.needs_redraw = false;
+            }
+
+            // Compute the post-key wake deadline once per iteration so
+            // the select! arm doesn't have to dance with the Option.
+            // `None` here becomes `pending` inside the arm.
+            let post_key_deadline = last_live_key_at.map(|t| t + POST_KEY_WAKE_DELAY);
+            let mut woke_via_post_key = false;
+            // The capture worker notifies this when it has fresh, changed
+            // pane content; the arm below wakes the loop so the new preview
+            // paints without busy-polling. Cloned per iteration so the
+            // select! arm doesn't borrow `self`.
+            let preview_wake = self.home.preview_wake.clone();
+            let mut woke_via_preview = false;
+
+            // Whether an embedded structured view is mounted this
+            // iteration, so its WebSocket is pumped. This is true for a
+            // preview too (it streams into the pane), not just an active
+            // view. Computed outside the select! so the arm's `expect` is
+            // guarded by the same check that enables it.
+            #[cfg(feature = "serve")]
+            let embedded_mounted = self.home.structured_preview.is_some();
+            #[cfg(not(feature = "serve"))]
+            let embedded_mounted = false;
+
+            // Select exactly one periodic ticker. Live pane changes have their
+            // own notification, so only a selection drag needs the fast wake.
+            let fast_refresh_active = self.home.is_preview_select_dragging();
+
+            // All event sources are polled cooperatively via tokio::select!.
+            // This ensures signal futures actually get scheduled (fixing #608
+            // defect 1), and that EOF from a dead tty is detected (defect 2).
+            tokio::select! {
+                event = self.event_stream.as_mut().expect("event_stream missing").next() => {
+                    match event {
+                        Some(Ok(Event::Key(key))) => {
+                            // Only act on key-down / auto-repeat. Terminals that
+                            // report release events (Windows console always does;
+                            // kitty-protocol terminals do when enhancement flags are
+                            // on) would otherwise deliver a Release for every press
+                            // and double-fire every handler, so a toggle like `i`
+                            // (hide the info header) nets to zero and "won't hide".
+                            // The acp and remote-home loops already filter this;
+                            // the home loop has to as well.
+                            if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                                continue;
+                            }
+                            refresh_tui_activity(&mut last_tui_activity_write);
+                            // Paste-burst detector for VoiceInk + Mosh ergonomics.
+                            // Mosh strips bracketed-paste markers, so pasted
+                            // dictation arrives as a stream of individual KeyEvents
+                            // that would otherwise fire home-view shortcuts (Q=quit,
+                            // N=new, X=stop, D=delete, ...). Look-ahead-poll the
+                            // event stream with a short inter-key timeout; if
+                            // PASTE_BURST_MIN_LEN printable chars accumulate, route
+                            // through handle_paste instead of dispatching them
+                            // individually. Below the threshold we replay the
+                            // captured keys as normal events.
+                            //
+                            // Only fire when home accepts paste routing
+                            // (`wants_paste_burst`). Non-paste-aware dialogs
+                            // — command palette, profile picker, projects,
+                            // info, etc. — capture text via `handle_key`
+                            // only; bursting through them strands the input
+                            // in `pending_paste` and leaves the dialog empty.
+                            // CI caught this regression with e2e harnesses
+                            // that type fast enough to trip the burst.
+                            // Text-owning surfaces do not need to hold every
+                            // ordinary keystroke for the 5ms burst probe: no
+                            // home shortcut can fire there, and real local
+                            // paste keeps its bracketed `Event::Paste` marker.
+                            // Mosh still probes because it strips that marker.
+                            #[cfg(feature = "serve")]
+                            let embedded_composer_active = self
+                                .home
+                                .structured_preview
+                                .as_ref()
+                                .is_some_and(|view| view.is_active());
+                            #[cfg(not(feature = "serve"))]
+                            let embedded_composer_active = false;
+                            if paste_burst_probe_needed(
+                                self.home.wants_paste_burst(),
+                                self.mosh_active,
+                                self.home.has_dialog(),
+                                embedded_composer_active,
+                            ) && Self::is_burst_candidate(&key)
+                            {
+                                let first_char = Self::burst_char_for(&key)
+                                    .expect("is_burst_candidate guarantees burst_char_for returns Some");
+                                let mut burst_str = String::new();
+                                burst_str.push(first_char);
+                                let mut burst_keys: Vec<KeyEvent> = vec![key];
+                                let mut deferred: Option<Event> = None;
+                                loop {
+                                    let next = tokio::time::timeout(
+                                        Duration::from_millis(PASTE_BURST_INTER_KEY_MS),
+                                        self.event_stream.as_mut().expect("event_stream missing").next(),
+                                    ).await;
+                                    match next {
+                                        // Ignore key-release / non-press events mid-burst, same
+                                        // gate as the arm entry. On terminals that report releases
+                                        // they would otherwise be taken as burst chars (doubling the
+                                        // pasted text) or stashed as the deferred key.
+                                        Ok(Some(Ok(Event::Key(k))))
+                                            if !matches!(
+                                                k.kind,
+                                                KeyEventKind::Press | KeyEventKind::Repeat
+                                            ) => {}
+                                        Ok(Some(Ok(Event::Key(k)))) if Self::is_burst_candidate(&k) => {
+                                            if let Some(c) = Self::burst_char_for(&k) {
+                                                burst_str.push(c);
+                                                burst_keys.push(k);
+                                            }
+                                        }
+                                        Ok(Some(Ok(other))) => {
+                                            deferred = Some(other);
+                                            break;
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                                if burst_keys.len() >= PASTE_BURST_MIN_LEN
+                                    && !Self::is_auto_repeat_burst(&burst_keys)
+                                {
+                                    // Peel a trailing Enter so the dialog's
+                                    // plain-Enter Submit branch still fires.
+                                    // Embedded mid-burst Enters stay as '\n'
+                                    // in the paste text (the original reason
+                                    // Enter is a burst candidate).
+                                    let (paste_text, trailing_enter) =
+                                        Self::split_trailing_enter(&burst_str, &burst_keys);
+                                    if !paste_text.is_empty() {
+                                        tracing::debug!(target: "tui.input",
+                                            "paste-burst: routed {} chars via handle_paste (chars={:?})",
+                                            paste_text.len(), paste_text
+                                        );
+                                        // An ACTIVE structured view owns text
+                                        // input: the burst belongs to its
+                                        // composer, same as a real Paste
+                                        // event. A merely-mounted preview
+                                        // must not eat it.
+                                        #[cfg(feature = "serve")]
+                                        if let Some(view) = self
+                                            .home
+                                            .structured_preview
+                                            .as_mut()
+                                            .filter(|v| v.is_active())
+                                        {
+                                            if let Err(e) = view
+                                                .handle_event(Event::Paste(paste_text.clone()))
+                                                .await
+                                            {
+                                                self.close_embedded_structured();
+                                                self.update_status =
+                                                    Some(UpdateStatus::transient(format!(
+                                                        "structured view: {e}"
+                                                    )));
+                                            }
+                                        } else {
+                                            self.home.handle_paste(&paste_text);
+                                        }
+                                        #[cfg(not(feature = "serve"))]
+                                        self.home.handle_paste(&paste_text);
+                                    }
+                                    if let Some(enter) = trailing_enter {
+                                        if !self.should_quit {
+                                            self.handle_key(enter, terminal).await?;
+                                        }
+                                    }
+                                } else {
+                                    for k in burst_keys {
+                                        self.handle_key(k, terminal).await?;
+                                        if self.should_quit { break; }
+                                    }
+                                }
+                                if !self.should_quit {
+                                    if let Some(evt) = deferred {
+                                        match evt {
+                                            Event::Key(k) => { self.handle_key(k, terminal).await?; }
+                                            Event::Paste(text) => { self.home.handle_paste(&text); }
+                                            Event::Resize(_, _) => { terminal.autoresize()?; self.needs_redraw = true; }
+                                            // Mirror the non-burst Mouse arm: scroll wheel
+                                            // events can land between burst chars on touch
+                                            // devices (scroll-while-dictating). Forward
+                                            // ScrollUp/Down to the home view's scroll hit
+                                            // targets so they don't get silently dropped.
+                                            Event::Mouse(mouse) => {
+                                                let hit_list = self.home.hit_list(mouse.column, mouse.row);
+                                                let hit_preview = self.home.hit_preview(mouse.column, mouse.row);
+                                                let hit_diff = self.home.is_diff_open()
+                                                    && self.home.hit_diff(mouse.column, mouse.row);
+                                                // See the non-burst arm: settings takeover
+                                                // makes the whole screen a scroll target.
+                                                let hit_scroll_target = hit_diff
+                                                    || hit_list
+                                                    || hit_preview
+                                                    || self.home.is_settings_open();
+                                                match mouse.kind {
+                                                    MouseEventKind::ScrollUp if hit_scroll_target => { self.home.handle_scroll_up(mouse.column, mouse.row); }
+                                                    MouseEventKind::ScrollDown if hit_scroll_target => { self.home.handle_scroll_down(mouse.column, mouse.row); }
+                                                    // Burst-deferred clicks update selection but can't
+                                                    // execute an activation action mid-burst (it'd tear
+                                                    // down and reattach the terminal while we're still
+                                                    // draining keystrokes). A user double-clicking
+                                                    // during dictation can click again after the burst
+                                                    // ends.
+                                                    MouseEventKind::Down(MouseButton::Left) => {
+                                                        if self.home.handle_context_menu_click(mouse.column, mouse.row) {
+                                                            // Click consumed by the context menu
+                                                            // (item dispatched, kept open, or
+                                                            // dismissed on outside-click).
+                                                        } else if self.home.handle_dialog_click(mouse.column, mouse.row) {
+                                                            // A modal (e.g. the telemetry consent
+                                                            // popup) swallowed the click. Mirrors the
+                                                            // non-burst path so dialog buttons are
+                                                            // clickable even when a mouse event lands
+                                                            // right after a paste/dictation burst.
+                                                        } else if self.home.handle_sidebar_collapse_click(mouse.column, mouse.row) {
+                                                            // Sidebar collapse/expand toggle; must
+                                                            // precede hit_list (button is on the
+                                                            // list's top border).
+                                                        } else if self.home.handle_diagnostics_click(mouse.column, mouse.row) {
+                                                            // Compact system-health strip opened the read-only detail view.
+                                                        } else if self.home.handle_tips_badge_click(mouse.column, mouse.row) {
+                                                            // Footer tips badge opened the overlay;
+                                                            // drop any stale preview highlight, like
+                                                            // the non-burst click path does.
+                                                            let _ = self.home.clear_preview_selection();
+                                                        } else if hit_list {
+                                                            let action = self.home.handle_click(mouse.column, mouse.row);
+                                                            if action.is_none() {
+                                                                let _ = self.home.handle_empty_list_click(mouse.column, mouse.row);
+                                                            }
+                                                        }
+                                                    }
+                                                    MouseEventKind::Down(MouseButton::Right) if hit_list => { self.home.handle_right_click(mouse.column, mouse.row); }
+                                                    MouseEventKind::Moved => { self.home.handle_hover(mouse.column, mouse.row); }
+                                                    _ => {}
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                // Mouse-capture state may have changed if the
+                                // burst opened or closed a copy-friendly surface
+                                // (info/changelog/serve dialog). Keep it in sync
+                                // before the next render, matching the
+                                // non-burst Event::Key arm below.
+                                self.sync_mouse_capture(terminal)?;
+                                if !self.needs_redraw {
+                                    self.draw(terminal)?;
+                                }
+                                if self.should_quit {
+                                    break;
+                                }
+                                continue;
+                            }
+
+                            self.handle_key(key, terminal).await?;
+                            self.sync_mouse_capture(terminal)?;
+
+                            // Arm the post-key wake when the key was
+                            // routed into live-send. We don't have an
+                            // explicit signal from handle_key for that
+                            // (it returns ()), but `live_send.is_some()`
+                            // after the call is a good proxy: a key
+                            // that EXITS live-send won't arm a wake,
+                            // and keys outside live-send leave it None
+                            // anyway since we never set it.
+                            let live_after = self.home.live_send.is_some();
+                            if live_after {
+                                last_live_key_at = Some(std::time::Instant::now());
+                            }
+
+                            // Skip the immediate draw when:
+                            //   - We're returning from tmux attach
+                            //     (`needs_redraw` triggers a clear +
+                            //     stale event drain on the next
+                            //     iteration; drawing before the drain
+                            //     wastes a frame and can flicker), OR
+                            //   - We're inside live-send. The key was
+                            //     queued to the worker but has NOT been
+                            //     dispatched to tmux yet, so the home
+                            //     view's preview cache is still stale.
+                            //     Drawing now produces a frame
+                            //     identical to the previous one
+                            //     (ratatui's diff is empty) and then
+                            //     the post-key wake fires ~15ms later
+                            //     with fresh post-echo content.
+                            //     Skipping the immediate draw avoids a
+                            //     no-op paint that on non-sync-update
+                            //     terminals can still emit cursor-move
+                            //     bytes mid-frame.
+                            if !self.needs_redraw && !live_after {
+                                self.draw(terminal)?;
+                            }
+
+                            if self.should_quit {
+                                break;
+                            }
+                            continue;
+                        }
+                        Some(Ok(Event::Mouse(mouse))) => {
+                            if !matches!(mouse.kind, MouseEventKind::Moved) {
+                                refresh_tui_activity(&mut last_tui_activity_write);
+                            }
+                            // Structured preview mouse routing is deliberately
+                            // thin: the transcript is ordinary preview content,
+                            // so drags fall through to the home view's own
+                            // drag-select machinery (fed by the transcript
+                            // geometry each render) and a double-click
+                            // activates via `preview_double_click_action`,
+                            // both identical to terminal previews. Only the
+                            // wheel is claimed here (it scrolls the
+                            // transcript, which home cannot do), plus the
+                            // "clicked off the pane while entered" drop back
+                            // to preview so sidebar clicks keep selecting.
+                            #[cfg(feature = "serve")]
+                            {
+                                let in_pane = self.home.structured_preview.is_some()
+                                    && self.home.preview_pane_area.contains(
+                                        ratatui::layout::Position::from((
+                                            mouse.column,
+                                            mouse.row,
+                                        )),
+                                    );
+                                if in_pane
+                                    && matches!(
+                                        mouse.kind,
+                                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                                    )
+                                {
+                                    if let Some(view) = self.home.structured_preview.as_mut() {
+                                        let _ = view.handle_event(Event::Mouse(mouse)).await;
+                                    }
+                                    if !self.needs_redraw {
+                                        self.draw(terminal)?;
+                                    }
+                                    continue;
+                                }
+                                let active = self
+                                    .home
+                                    .structured_preview
+                                    .as_ref()
+                                    .is_some_and(|v| v.is_active());
+                                if active
+                                    && !in_pane
+                                    && matches!(
+                                        mouse.kind,
+                                        MouseEventKind::Down(MouseButton::Left)
+                                            | MouseEventKind::Down(MouseButton::Right)
+                                    )
+                                {
+                                    if let Some(v) = self.home.structured_preview.as_mut() {
+                                        v.deactivate();
+                                    }
+                                }
+                                if active
+                                    && in_pane
+                                    && matches!(
+                                        mouse.kind,
+                                        MouseEventKind::Down(MouseButton::Left)
+                                    )
+                                    && !mouse.modifiers.contains(KeyModifiers::SHIFT)
+                                {
+                                    if let Some(view) = self.home.structured_preview.as_mut() {
+                                        let _ = view.handle_event(Event::Mouse(mouse)).await;
+                                    }
+                                    if !self.needs_redraw {
+                                        self.draw(terminal)?;
+                                    }
+                                    continue;
+                                }
+                            }
+                            // Footer toolbar: a left-click on a button
+                            // synthesizes its shortcut and routes it through
+                            // the full key handler, so clicking behaves
+                            // exactly like pressing the key (global handling,
+                            // action dispatch, structured-view drain). The
+                            // footer is a disjoint area from the list/preview/
+                            // diff, so nothing else in this arm needs to run.
+                            // This runs ahead of the dialog/context-menu click
+                            // handlers, but that is not a hazard: when an
+                            // overlay is open `footer_button_at` returns `None`
+                            // (its `has_non_live_send_overlay()` guard), so a
+                            // click can never fire a shortcut behind a modal.
+                            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                                if let Some(key) =
+                                    self.home.footer_button_at(mouse.column, mouse.row)
+                                {
+                                    let _ = self.home.clear_preview_selection();
+                                    self.handle_key(key, terminal).await?;
+                                    self.sync_mouse_capture(terminal)?;
+                                    if !self.needs_redraw {
+                                        self.draw(terminal)?;
+                                    }
+                                    if self.should_quit {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            }
+                            // A double-click on the preview pane opens/attaches
+                            // the previewed session, the same as a sidebar
+                            // double-click. Checked BEFORE forwarding so the
+                            // agent doesn't swallow the second press; a single
+                            // press records its timing here and falls through to
+                            // the forward path below.
+                            if let Some(action) = self.home.preview_double_click_action(
+                                mouse.kind,
+                                mouse.modifiers,
+                                mouse.column,
+                                mouse.row,
+                            ) {
+                                let _ = self.home.clear_preview_selection();
+                                self.execute_action(action, terminal)?;
+                                // Mirror the list double-click path: an acp
+                                // session only stashes its id, so drain and open
+                                // the structured view here too.
+                                #[cfg(feature = "serve")]
+                                if let Some(session_id) =
+                                    self.pending_structured_view_open.take()
+                                {
+                                    self.open_structured_view(&session_id).await?;
+                                }
+                                self.sync_mouse_capture(terminal)?;
+                                if self.should_quit {
+                                    break;
+                                }
+                                if !self.needs_redraw {
+                                    self.draw(terminal)?;
+                                }
+                                continue;
+                            }
+                            // Mouse-tracking agent under the preview (live-send
+                            // OR passive hover): forward the press / drag /
+                            // release straight to it, exactly as a direct attach
+                            // would, so its native selection / scroll works.
+                            // Shift falls through to aoe's own preview text-
+                            // selection. Consumes the event when it forwards.
+                            if self.home.forward_mouse_to_preview(
+                                mouse.kind,
+                                mouse.modifiers,
+                                mouse.column,
+                                mouse.row,
+                            ) {
+                                if !self.needs_redraw {
+                                    self.draw(terminal)?;
+                                }
+                                continue;
+                            }
+                            let hit_list = self.home.hit_list(mouse.column, mouse.row);
+                            let hit_preview = self.home.hit_preview(mouse.column, mouse.row);
+                            let hit_diff = self.home.is_diff_open()
+                                && self.home.hit_diff(mouse.column, mouse.row);
+                            // Settings is a full-screen takeover: the whole
+                            // screen is a scroll target because its fields
+                            // panel is the only scrollable surface and the
+                            // list/preview rects it covers are stale.
+                            let hit_scroll_target = hit_diff
+                                || hit_list
+                                || hit_preview
+                                || self.home.is_settings_open();
+                            // Left-click is handled outside the unified
+                            // match because it returns an `Option<Action>`
+                            // (a double-click activates the session and
+                            // needs to flow through `execute_action`), not
+                            // a bool. The single-click selection always
+                            // mutates `cursor` so we redraw unconditionally
+                            // before dispatching the action.
+                            //
+                            // Priority order for `Down(Left)`:
+                            //   1. context menu outside-click (close it)
+                            //   2. modal dialog click (e.g. delete Yes/No)
+                            //   3. drag-start (divider, or preview text
+                            //      selection)
+                            //   4. list row click (existing select/activate)
+                            // A bare press on the preview seeds a 1x1
+                            // PreviewSelect; `handle_drag_end` collapses it
+                            // back to no selection on release if the cursor
+                            // never moved.
+                            let click_action = if matches!(
+                                mouse.kind,
+                                MouseEventKind::Down(MouseButton::Left)
+                            ) {
+                                if self
+                                    .home
+                                    .handle_context_menu_click(mouse.column, mouse.row)
+                                {
+                                    // Click consumed by the context menu:
+                                    // either dispatched an item (Rename /
+                                    // Delete), kept the menu open (border
+                                    // hit), or dismissed it (click outside).
+                                    self.draw(terminal)?;
+                                    None
+                                } else if self.home.handle_dialog_click(mouse.column, mouse.row)
+                                {
+                                    // A modal swallowed the click — drop any
+                                    // leftover preview highlight so it doesn't
+                                    // linger behind / through the dialog.
+                                    let _ = self.home.clear_preview_selection();
+                                    // Intro dialog can queue a live theme
+                                    // preview or a final pick on click; apply
+                                    // it before redrawing so the next frame
+                                    // already reflects the choice.
+                                    if let Some(name) = self.home.take_pending_intro_theme() {
+                                        self.set_theme(&name);
+                                    }
+                                    self.sync_mouse_capture(terminal)?;
+                                    self.draw(terminal)?;
+                                    None
+                                } else if self
+                                    .home
+                                    .handle_sidebar_collapse_click(mouse.column, mouse.row)
+                                {
+                                    // Collapse button (expanded list border) or
+                                    // the collapsed strip toggled the sidebar.
+                                    // Runs before hit_list because the button
+                                    // lives on the list's top border.
+                                    let _ = self.home.clear_preview_selection();
+                                    self.draw(terminal)?;
+                                    None
+                                } else if self
+                                    .home
+                                    .handle_diagnostics_click(mouse.column, mouse.row)
+                                {
+                                    let _ = self.home.clear_preview_selection();
+                                    self.draw(terminal)?;
+                                    None
+                                } else if self
+                                    .home
+                                    .handle_tips_badge_click(mouse.column, mouse.row)
+                                {
+                                    // Footer tips badge opened the overlay.
+                                    let _ = self.home.clear_preview_selection();
+                                    self.draw(terminal)?;
+                                    None
+                                } else if self
+                                    .home
+                                    .handle_drag_start(mouse.column, mouse.row)
+                                {
+                                    // handle_drag_start already overwrote the
+                                    // selection if it started a PreviewSelect;
+                                    // a fresh ListDivider drag is unrelated to
+                                    // the highlight and should drop it.
+                                    if !self.home.is_preview_select_dragging() {
+                                        let _ = self.home.clear_preview_selection();
+                                    }
+                                    None
+                                } else if hit_list {
+                                    let _ = self.home.clear_preview_selection();
+                                    let action = self
+                                        .home
+                                        .handle_click(mouse.column, mouse.row);
+                                    // A click inside the list area that
+                                    // didn't resolve to a row (empty space
+                                    // below the last session) opens the
+                                    // new-session dialog, mirroring `n`.
+                                    if action.is_none() {
+                                        let _ = self
+                                            .home
+                                            .handle_empty_list_click(mouse.column, mouse.row);
+                                    }
+                                    self.draw(terminal)?;
+                                    action
+                                } else if hit_diff {
+                                    // The diff view file-list panel
+                                    // accepts clicks to select files,
+                                    // matching j/k navigation. Other
+                                    // diff regions are no-op.
+                                    let _ = self.home.clear_preview_selection();
+                                    self.home.handle_diff_click(mouse.column, mouse.row);
+                                    self.draw(terminal)?;
+                                    None
+                                } else {
+                                    let _ = self.home.clear_preview_selection();
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            // A forwarded live-pane wheel event changes the
+                            // agent asynchronously. Remember whether aoe's
+                            // own preview was frozen so we can distinguish it
+                            // from local scrollback/selection transitions
+                            // below and avoid repainting a stale frame for
+                            // every trackpad notch.
+                            let preview_was_frozen = self.home.preview_is_frozen();
+                            let handled = match mouse.kind {
+                                MouseEventKind::ScrollUp if hit_scroll_target => {
+                                    self.home.handle_scroll_up(mouse.column, mouse.row)
+                                }
+                                MouseEventKind::ScrollDown if hit_scroll_target => {
+                                    self.home.handle_scroll_down(mouse.column, mouse.row)
+                                }
+                                // Drag(Left) without a matching drag_state
+                                // is a no-op inside the handler; we don't
+                                // need a separate guard here.
+                                MouseEventKind::Drag(MouseButton::Left) => {
+                                    self.home.handle_drag_move(mouse.column, mouse.row)
+                                }
+                                MouseEventKind::Up(MouseButton::Left) => {
+                                    // Finalize the drag here, but defer the
+                                    // clipboard write until after the next
+                                    // draw: the renderer captures cell text
+                                    // while the buffer is still populated
+                                    // (ratatui resets the back buffer on
+                                    // every frame, so reading post-draw
+                                    // sees empty cells).
+                                    self.home.handle_drag_end()
+                                }
+                                // Right-click opens the sidebar context menu
+                                // (Rename / Delete) for the clicked row.
+                                // hit_list is the only place it makes sense
+                                // today; other surfaces fall through.
+                                MouseEventKind::Down(MouseButton::Right) if hit_list => {
+                                    self.home.handle_right_click(mouse.column, mouse.row)
+                                }
+                                // Moved events are dispatched unconditionally
+                                // (no `hit_list` guard) so the handler can
+                                // clear the hover state the moment the
+                                // cursor leaves the list, even when the new
+                                // position lands on the preview or border.
+                                MouseEventKind::Moved => {
+                                    // Bare motion over the preview is also
+                                    // reported to a hover-capable (any-event
+                                    // tracking) agent so its own hover UI
+                                    // works like a direct attach. It never
+                                    // consumes the event: aoe's hover below
+                                    // still runs, and no aoe redraw is
+                                    // needed (the capture worker picks up
+                                    // the agent's repaint).
+                                    self.home
+                                        .forward_hover_to_preview(mouse.column, mouse.row);
+                                    // Route hover to the diff view's
+                                    // file list when one is open AND
+                                    // the mouse is over it; that's an
+                                    // OR with the home view's own hover
+                                    // (which already covers list +
+                                    // overlay dialogs).
+                                    let mut changed =
+                                        self.home.handle_hover(mouse.column, mouse.row);
+                                    if hit_diff {
+                                        changed |= self
+                                            .home
+                                            .handle_diff_hover(mouse.column, mouse.row);
+                                    }
+                                    changed
+                                }
+                                _ => false,
+                            };
+                            let scroll_event = matches!(
+                                mouse.kind,
+                                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                            );
+                            let skip_stale_scroll_draw = scroll_event
+                                && skip_immediate_live_scroll_draw(
+                                    self.home.live_send.is_some(),
+                                    hit_preview,
+                                    preview_was_frozen,
+                                    self.home.preview_is_frozen(),
+                                );
+                            if handled && !skip_stale_scroll_draw {
+                                self.draw(terminal)?;
+                            }
+                            // After the draw that paints a freshly-finalized
+                            // preview selection, the renderer has captured
+                            // the cell text into `preview_copy_text`. Drain
+                            // it and write to the user's clipboard.
+                            if let Some(text) = self.home.take_preview_copy_text() {
+                                crate::tui::clipboard::copy_to_clipboard(&text);
+                            }
+                            if let Some(action) = click_action {
+                                self.execute_action(action, terminal)?;
+                                // Mirror the handle_key path: Action::OpenStructuredView
+                                // only stashes the id in `pending_structured_view_open`
+                                // because the acp view needs async
+                                // EventStream access that the sync
+                                // `execute_action` can't lend. Drain here so a
+                                // double-click on an acp session actually
+                                // opens it.
+                                #[cfg(feature = "serve")]
+                                if let Some(session_id) = self.pending_structured_view_open.take() {
+                                    self.open_structured_view(&session_id).await?;
+                                }
+                            }
+                            // Drain any Action stashed by a modal-dialog
+                            // click (e.g. clicking `[Yes]` on a stop or
+                            // quit confirm). The keyboard path returns
+                            // these through handle_key; the click path
+                            // can't, so it stashes them here.
+                            if let Some(action) = self.home.pending_dialog_click_action.take() {
+                                self.execute_action(action, terminal)?;
+                                // A [Yes] click on the switch-view confirm
+                                // stashes the switch; run it now, since this
+                                // click path never reaches the key-path drain.
+                                #[cfg(feature = "serve")]
+                                if let Some(session_id) = self.pending_view_switch.take() {
+                                    self.perform_view_switch(&session_id, terminal).await;
+                                }
+                                // Same for a [Yes] click on the start-daemon
+                                // confirm from a structured-view open.
+                                #[cfg(feature = "serve")]
+                                if let Some(session_id) = self.pending_daemon_start_open.take() {
+                                    self.start_daemon_then_open(&session_id, terminal).await;
+                                }
+                                // Same for an "Auto-name now" palette/menu click.
+                                #[cfg(feature = "serve")]
+                                if let Some(session_id) = self.pending_smart_rename.take() {
+                                    self.perform_smart_rename(&session_id).await;
+                                }
+                            }
+                            continue;
+                        }
+                        Some(Ok(Event::Paste(text))) => {
+                            refresh_tui_activity(&mut last_tui_activity_write);
+                            // An ACTIVE structured view owns pasted text (it
+                            // goes to its composer, same as the full-screen
+                            // view). A merely-mounted preview must NOT eat
+                            // it: the user is driving the home screen, and a
+                            // paste belongs to whatever home surface is up.
+                            #[cfg(feature = "serve")]
+                            if let Some(view) = self
+                                .home
+                                .structured_preview
+                                .as_mut()
+                                .filter(|v| v.is_active())
+                            {
+                                if let Err(e) = view.handle_event(Event::Paste(text)).await {
+                                    self.close_embedded_structured();
+                                    self.update_status = Some(UpdateStatus::transient(format!(
+                                        "structured view: {e}"
+                                    )));
+                                }
+                                self.draw(terminal)?;
+                                continue;
+                            }
+                            self.home.handle_paste(&text);
+
+                            self.draw(terminal)?;
+
+                            continue;
+                        }
+                        Some(Ok(Event::Resize(_, _))) => {
+                            // Soft keyboard slides up/down on iPad/iPhone Mosh
+                            // (and ordinary terminal resizes) emit Resize. The
+                            // catch-all below would silently drop them, leaving
+                            // the screen mid-stale until the next refresh tick.
+                            // Redraw now so viewport-driven layout
+                            // (responsive::dialog_width, STACKED_BREAKPOINT,
+                            // etc.) re-evaluates; ratatui's draw() autoresizes
+                            // internally before rendering.
+                            self.draw(terminal)?;
+                            continue;
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => {
+                            // IO error reading from the terminal (broken pipe,
+                            // EOF, etc.) means the tty is gone. Exit cleanly
+                            // instead of spinning (#608 defect 2).
+                            tracing::info!(target: "tui.input", "Terminal event stream error, exiting: {}", e);
+                            self.should_quit = true;
+                            break;
+                        }
+                        None => {
+                            // EventStream ended (EOF on stdin). The terminal is
+                            // gone; exit instead of busy-looping (#608 defect 2).
+                            tracing::info!(target: "tui.input", "Terminal event stream ended (EOF), exiting");
+                            self.should_quit = true;
+                            break;
+                        }
+                    }
+                }
+                // Embedded structured view: pump one daemon-side event
+                // (ws frame, plugin snapshot, path roots). `next_event`
+                // is cancel-safe (channel awaits only); the apply below
+                // runs in the arm body where it can no longer be raced,
+                // so a mid-replay cancellation cannot corrupt the state.
+                ev = async {
+                    #[cfg(feature = "serve")]
+                    {
+                        self.home.structured_preview
+                            .as_mut()
+                            .expect("guarded by embedded_mounted")
+                            .next_event()
+                            .await
+                    }
+                    #[cfg(not(feature = "serve"))]
+                    {
+                        std::future::pending::<()>().await
+                    }
+                }, if embedded_mounted => {
+                    #[cfg(feature = "serve")]
+                    {
+                        if let Some(view) = self.home.structured_preview.as_mut() {
+                            view.apply_event(ev).await;
+                        }
+                        self.draw(terminal)?;
+                    }
+                    #[cfg(not(feature = "serve"))]
+                    {
+                        let _: () = ev;
+                    }
+                }
+                _ = fast_refresh_interval.tick(), if fast_refresh_active => {}
+                _ = maintenance_interval.tick(), if !fast_refresh_active => {}
+                _ = preview_wake.notified() => {
+                    // The capture worker produced fresh content, a changed
+                    // cursor, or a clipboard event. An idle pane never fires
+                    // this, so the home view stays quiet when nothing changes.
+                    woke_via_preview = true;
+                    // A real changed frame supersedes the speculative 15ms
+                    // post-key wake. Cancelling it avoids rebuilding the same
+                    // frame twice when echo arrives quickly.
+                    last_live_key_at = None;
+                }
+                _ = async {
+                    match post_key_deadline {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    // Targeted refresh ~15ms after a live-send key,
+                    // catching the agent's echo before the next ticker.
+                    woke_via_post_key = true;
+                    last_live_key_at = None;
+                }
+                _ = async {
+                    #[cfg(unix)]
+                    match sighup {
+                        Some(ref mut s) => { s.recv().await; }
+                        None => { std::future::pending::<()>().await; }
+                    }
+                    #[cfg(not(unix))]
+                    std::future::pending::<()>().await;
+                } => {
+                    tracing::info!(target: "tui.input", "Received SIGHUP, exiting");
+                    self.should_quit = true;
+                    break;
+                }
+                _ = async {
+                    #[cfg(unix)]
+                    match sigterm {
+                        Some(ref mut s) => { s.recv().await; }
+                        None => { std::future::pending::<()>().await; }
+                    }
+                    #[cfg(not(unix))]
+                    std::future::pending::<()>().await;
+                } => {
+                    tracing::info!(target: "tui.input", "Received SIGTERM, exiting");
+                    self.should_quit = true;
+                    break;
+                }
+                _ = async {
+                    #[cfg(unix)]
+                    match sigint {
+                        Some(ref mut s) => { s.recv().await; }
+                        None => { std::future::pending::<()>().await; }
+                    }
+                    #[cfg(not(unix))]
+                    std::future::pending::<()>().await;
+                } => {
+                    tracing::info!(target: "tui.input", "Received SIGINT, exiting");
+                    self.should_quit = true;
+                    break;
+                }
+            }
+
+            // Periodic refreshes (only when no input pending).
+            //
+            // `needs_full_refresh` separately tracks whether anything other
+            // than a preview/post-key wake wants a refresh; on those flags the
+            // cool-down at the bottom of the loop is bypassed so deterministic
+            // signals (status updates, dialog ticks) get painted right away.
+            let mut refresh_needed = false;
+            let mut needs_full_refresh = false;
+
+            // Continuous edge auto-scroll for a preview drag-select. The
+            // mouse-event arm `continue`s above, so this runs on the
+            // ~33ms ticker (and other wakes): while the cursor is held at
+            // the pane edge, scroll one line and extend the selection so a
+            // single drag can grab more than a page without depending on
+            // mouse movement to fire events. No-op unless a drag is live
+            // and the pointer sits at the edge.
+            //
+            // Request a normal (diffed) redraw via `refresh_needed`, NOT
+            // `needs_redraw`: the latter forces a `clear_terminal` at the
+            // top of the loop, and clearing every ticker frame while the
+            // scroll runs strobes the screen blank-then-repaint. The diffed
+            // draw at the bottom of the loop repaints smoothly.
+            if self.home.tick_preview_autoscroll() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            // Dwell-to-read: a session kept selected (list in the foreground)
+            // for a few seconds counts as read and clears its unread marker.
+            if self.home.tick_unread_dwell(std::time::Instant::now()) {
+                refresh_needed = true;
+            }
+
+            // Update-check / install-status polls can flip the
+            // bottom-of-screen update bar (banner or transient toast)
+            // on or off, which shifts the home view's layout. If a
+            // live-send wake fires on the same iteration, the
+            // preview-only fast path would paint a stale snapshot
+            // whose preview rect no longer lines up with the new
+            // layout. Treat any banner state change as full-refresh
+            // work so the slow path rebuilds the layout AND the
+            // snapshot.
+            if self.poll_update_check() {
+                self.needs_redraw = true;
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+            if self.poll_update_status() {
+                self.needs_redraw = true;
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+            // The sandbox-image banner and its pull toast share the same
+            // bottom-row layout slot, so treat their changes as full-refresh
+            // work too.
+            if self.poll_image_update_check() {
+                self.needs_redraw = true;
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+            if self.poll_image_pull_status() {
+                self.needs_redraw = true;
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if last_status_refresh.elapsed() >= STATUS_REFRESH_INTERVAL {
+                self.home.request_status_refresh();
+                self.home.repair_session_id_pollers();
+                last_status_refresh = std::time::Instant::now();
+            }
+
+            if self.home.apply_status_updates() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if last_metrics_sample.elapsed() >= METRICS_SAMPLE_INTERVAL {
+                self.home.request_metrics_refresh();
+                last_metrics_sample = std::time::Instant::now();
+            }
+
+            // A new sample only repaints the strip, so a diffed redraw is
+            // enough; no full clear.
+            if self.home.apply_metrics_updates() {
+                refresh_needed = true;
+            }
+
+            #[cfg(feature = "serve")]
+            {
+                if last_daemon_status_refresh.elapsed() >= DAEMON_STATUS_REFRESH_INTERVAL {
+                    self.home.request_daemon_status_refresh();
+                    last_daemon_status_refresh = std::time::Instant::now();
+                }
+                if self.home.apply_daemon_status_updates() {
+                    refresh_needed = true;
+                    needs_full_refresh = true;
+                }
+            }
+
+            if self.home.apply_deletion_results() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if self.home.apply_stop_results() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if self.home.apply_trash_results() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if last_session_idle_reap.elapsed() >= SESSION_IDLE_REAP_INTERVAL {
+                last_session_idle_reap = std::time::Instant::now();
+                if self.reap_idle_sessions() {
+                    refresh_needed = true;
+                    needs_full_refresh = true;
+                }
+            }
+
+            if self.home.apply_session_id_updates() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if self.home.apply_recovery_updates() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if self.home.apply_restart_results() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if self.home.apply_attach_project_results() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if self.home.apply_memory_results() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if self.home.apply_fleet_results() {
+                refresh_needed = true;
+            }
+
+            if self.home.apply_attention_ack_results() {
+                refresh_needed = true;
+            }
+
+            if self.home.apply_checkpoint_results() {
+                refresh_needed = true;
+            }
+
+            if self.home.apply_trial_results() {
+                refresh_needed = true;
+            }
+
+            if self.home.apply_campaign_results() {
+                refresh_needed = true;
+            }
+
+            if let Some(session_id) = self.home.apply_creation_results() {
+                self.dispatch_new_session_attach(&session_id, terminal)?;
+                // A structured session routes the post-create attach into
+                // `pending_structured_view_open`; drain it here (this tick
+                // path sits outside the key/click drains).
+                #[cfg(feature = "serve")]
+                if let Some(sid) = self.pending_structured_view_open.take() {
+                    self.open_structured_view(&sid).await?;
+                }
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if self.home.tick_trials() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if self.home.tick_dialog() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            // Fade the settings "Settings saved" toast once its window passes,
+            // even if the user has stopped typing. Fires at most once per save,
+            // so a full refresh here is free.
+            if self.home.tick_settings_status() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            // Disk reload: heartbeat (defense-in-depth) plus the
+            // file-watch-driven kick. Both gate on `live_send.is_none()`
+            // so reloads never interrupt a paste-in-progress; the dirty
+            // flag stays latched (Acquire pairs with the forwarder/adapter
+            // Release) until the next eligible tick. The watcher is scoped
+            // to `sessions.json` / `groups.json`, so the watcher path calls
+            // `reload_storage_only` (storage + profile rediscovery only);
+            // the heartbeat path calls full `reload()` to refresh the
+            // status-hook config cache and mouse-capture toggle.
+            //
+            // Config kick runs before the storage-mirror block:
+            // `refresh_from_config` invalidates profile-derived state that
+            // the block reads. Same `live_idle` gate; recomputing
+            // `tool_hotkey_cache` mid live-send disrupts input.
+            let live_idle = self.home.live_send.is_none();
+            let config_kick = take_config_refresh_kick(live_idle, &self.home.config_watch.dirty);
+            if config_kick {
+                let result = self.home.try_refresh_from_config_watcher();
+                handle_tick_reload_config(result, &mut self.home.reload_failure_state);
+                if let Some(theme_name) = self.home.take_pending_watcher_theme() {
+                    self.set_theme(&theme_name);
+                }
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            let heartbeat_due = last_disk_refresh.elapsed() >= DISK_REFRESH_INTERVAL;
+            // Only consume the dirty latch when we're eligible to act on
+            // it (`live_idle`). When live-send is on, the latch must
+            // persist for the next eligible tick so a watcher kick that
+            // arrived during live-send is not silently lost.
+            let dirty = if live_idle {
+                self.home
+                    .disk_watch
+                    .dirty
+                    .swap(false, std::sync::atomic::Ordering::Acquire)
+            } else {
+                false
+            };
+            let refresh_decision = decide_disk_refresh(live_idle, heartbeat_due, dirty);
+
+            match refresh_decision {
+                DiskRefreshDecision::Heartbeat => {
+                    let reload_result = self.home.reload();
+                    let reload_ok = reload_result.is_ok();
+                    handle_tick_reload_storage(reload_result, &mut self.home.reload_failure_state);
+                    if reload_ok {
+                        let profile = self.home.active_profile.as_deref().unwrap_or("default");
+                        let mouse_capture_allowed = crate::session::resolve_config(profile)
+                            .map(|c| crate::tui::mouse_capture_requested(&c.session))
+                            .unwrap_or(self.mouse_capture_allowed);
+                        if mouse_capture_allowed != self.mouse_capture_allowed {
+                            self.mouse_capture_allowed = mouse_capture_allowed;
+                            self.sync_mouse_capture(terminal)?;
+                        }
+                    }
+                    last_disk_refresh = std::time::Instant::now();
+                    refresh_needed = true;
+                    needs_full_refresh = true;
+                }
+                DiskRefreshDecision::Watcher => {
+                    let reload_result = self.home.reload_storage_only();
+                    handle_tick_reload_storage(reload_result, &mut self.home.reload_failure_state);
+                    refresh_needed = true;
+                    needs_full_refresh = true;
+                }
+                DiskRefreshDecision::None => {}
+            }
+
+            if self.home.try_present_reload_failure_dialog() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if self.home.try_clear_recovered_reload_dialog() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            // Another surface (web live view, another TUI) took the
+            // size-owner lock: exit live mode and let its grid stand,
+            // instead of the old silent fight where the next keystroke or
+            // preview-rect jitter stole the lock back.
+            if self.home.poll_live_send_takeover() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                crate::session::write_tui_heartbeat();
+                last_heartbeat = std::time::Instant::now();
+            }
+
+            if last_telemetry_snapshot.elapsed() >= telemetry_snapshot_interval {
+                last_telemetry_snapshot = std::time::Instant::now();
+                self.emit_telemetry_snapshot();
+            }
+
+            if last_presence_refresh.elapsed() >= PRESENCE_REFRESH_INTERVAL {
+                last_presence_refresh = std::time::Instant::now();
+                let count = crate::session::count_active_tuis(PRESENCE_FRESH_WINDOW);
+                if count != self.home.active_tui_count {
+                    self.home.active_tui_count = count;
+                    refresh_needed = true;
+                }
+            }
+
+            // Periodic update re-check (#1471). The startup spawn only fires
+            // once per process; long-running TUI sessions would otherwise
+            // silently miss releases that ship after the user attached. The
+            // throttle gap keeps the per-iteration `get_update_settings()`
+            // config-file read off the 20Hz hot path.
+            if last_update_eval.elapsed() >= UPDATE_CHECK_THROTTLE_GAP {
+                last_update_eval = std::time::Instant::now();
+                let settings = get_update_settings();
+                if should_spawn_periodic_update_check(
+                    last_update_check.map(|t| t.elapsed()),
+                    PERIODIC_RECHECK_INTERVAL,
+                    self.update_rx.is_some(),
+                    settings.update_check_mode.is_enabled(),
+                ) {
+                    self.spawn_update_check();
+                    last_update_check = Some(std::time::Instant::now());
+                }
+            }
+
+            // Animated spinners (rattles) need periodic redraws, but only
+            // at the spinner frame rate to avoid unnecessary widget tree
+            // rebuilds. Skip in live-send: the spinner lives in the
+            // sidebar (which the user isn't looking at) and forcing a
+            // full HomeView render every 120ms inside live mode wakes
+            // the loop eight times a second to repaint a region the
+            // user can't see, which only adds load on top of the
+            // already-busy preview refresh.
+            if last_spinner_redraw.elapsed() >= SPINNER_REDRAW_INTERVAL
+                && self.home.has_animated_sessions()
+                && self.home.live_send.is_none()
+            {
+                last_spinner_redraw = std::time::Instant::now();
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            // Preview-on-select: mount/drop the streaming transcript
+            // preview to track the selected structured session (debounced).
+            #[cfg(feature = "serve")]
+            if self.reconcile_structured_preview().await {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            // Embedded structured view: expire its toast, surface queued
+            // plugin notifications, and repaint on the same 120ms cadence
+            // the full-screen view used so the composer caret blinks.
+            #[cfg(feature = "serve")]
+            if let Some(view) = self.home.structured_preview.as_mut() {
+                let toast_changed = view.tick();
+                if toast_changed || last_spinner_redraw.elapsed() >= SPINNER_REDRAW_INTERVAL {
+                    last_spinner_redraw = std::time::Instant::now();
+                    refresh_needed = true;
+                    needs_full_refresh = true;
+                }
+            }
+
+            // Pane content and cursor changes repaint through the capture-worker
+            // wake. The post-key wake is a deterministic ~15ms fallback for
+            // typed echo. While the preview is frozen for scrollback or text
+            // selection, neither signal repaints: the held snapshot is
+            // intentionally unchanged, and redrawing it under a selection
+            // exposes terminal cursor/blink behavior without new information.
+            if preview_signals_need_refresh(
+                woke_via_post_key,
+                woke_via_preview,
+                self.home.preview_is_frozen(),
+            ) {
+                refresh_needed = true;
+            }
+
+            // Cool-down guard against a redundant periodic paint immediately
+            // after a live frame. Deterministic status work and the two preview
+            // signals bypass it; the capture worker deduplicates its frames, so
+            // its wake always carries new content or a changed cursor.
+            if refresh_needed
+                && self.home.live_send.is_some()
+                && !woke_via_post_key
+                && !woke_via_preview
+                && !needs_full_refresh
+                && last_refresh_at
+                    .map(|t| t.elapsed() < REFRESH_COOLDOWN)
+                    .unwrap_or(false)
+            {
+                refresh_needed = false;
+            }
+
+            if refresh_needed {
+                // Always do a full draw in live-send. The
+                // `draw_preview_only` snapshot-painting fast path was
+                // landed in #1495 to cheapen `%output` wakes, but
+                // (a) `%output` wakes no longer exist (control-mode
+                // is gone), and (b) on terminals that don't support
+                // synchronized-update escapes (Apple Terminal.app,
+                // Mosh-with-prediction), the snapshot-then-overlay
+                // pattern produced visible "drag" (the previous
+                // frame's preview cells stayed on screen for a beat
+                // while ratatui's diff caught up). Always-full-draw is
+                // ~2-3ms more CPU per frame (rebuilding the sidebar
+                // widget tree) but is uniformly clean across
+                // terminals. Outside live-send the same path runs
+                // when `refresh_needed`, so this is just collapsing
+                // the conditional branch.
+                self.draw(terminal)?;
+                last_refresh_at = Some(std::time::Instant::now());
+            }
+
+            if self.should_quit {
+                break;
+            }
+        }
+
+        self.home.apply_session_id_updates();
+        // Drain any restart result that completed since the last tick so the
+        // post-cascade snapshot (cleared stale sid, container id, final status)
+        // is persisted instead of the stale `Starting` row.
+        self.home.apply_restart_results();
+        self.home.cleanup_pending_creation();
+        self.home.shutdown_trials();
+        self.home.flush_trial_results_on_shutdown();
+
+        if let Err(e) = self.home.save() {
+            tracing::error!(target: "tui.input", "Failed to save on quit: {}", e);
+        }
+
+        // Best-effort final snapshot on graceful exit, bounded so a dead
+        // endpoint can't delay quit. Deduped against the boot/periodic snapshot
+        // so a launch-then-quit with unchanged sessions doesn't post the same
+        // counts twice within seconds.
+        if let Some(snapshot) = self.build_telemetry_snapshot() {
+            let reported = snapshot.session_creates_since_last_snapshot;
+            let outcome = crate::telemetry::flush_snapshot_if_changed(snapshot).await;
+            clear_reported_session_creates(reported, outcome);
+        }
+
+        Ok(())
+    }
+
+    /// Build a `usage_snapshot` from the current session list, or `None` when
+    /// telemetry is not opted in. The TUI never hosts the web dashboard, so the
+    /// `usage_seen` map is reported zeroed (a stable full key set), the
+    /// per-client form-factor maps stay empty (and so omitted), and the
+    /// structured-interaction counts are empty (the `aoe serve` daemon is the
+    /// surface that tracks all of those). The create-trend counter carries the
+    /// process-local `TUI_SESSION_CREATES` total, read *without reset* so a
+    /// failed send retains it; the value is consumed only after a confirmed send
+    /// (mirroring the serve deferred-clear).
+    fn build_telemetry_snapshot(&self) -> Option<crate::telemetry::UsageSnapshot> {
+        // Boundary snapshot: `build_usage_snapshot` takes `&[Instance]`
+        // (shared API with the daemon caller in `src/server/mod.rs`).
+        let instances: Vec<crate::session::Instance> = self.home.instances().cloned().collect();
+        crate::telemetry::build_usage_snapshot(
+            crate::telemetry::Surface::Tui,
+            &instances,
+            crate::telemetry::usage_signals::zeroed(),
+            reported_session_creates(),
+            // The TUI hosts no server, so it has no auth or exposure mode.
+            None,
+            None,
+            &crate::telemetry::StructuredInteractionCounts::default(),
+        )
+    }
+
+    /// Build and send a snapshot, detached. No-op when not opted in. The send is
+    /// awaited inside the spawned task only so the reported create count can be
+    /// cleared after a confirmed send (the same await-and-clear discipline the
+    /// serve periodic loop uses); the caller never blocks.
+    fn emit_telemetry_snapshot(&self) {
+        if let Some(snapshot) = self.build_telemetry_snapshot() {
+            let reported = snapshot.session_creates_since_last_snapshot;
+            tokio::spawn(async move {
+                let outcome = if crate::telemetry::send_snapshot(snapshot).await {
+                    crate::telemetry::SendOutcome::Sent
+                } else {
+                    crate::telemetry::SendOutcome::Failed
+                };
+                clear_reported_session_creates(reported, outcome);
+            });
+        }
+    }
+
+    fn render(&mut self, frame: &mut Frame) {
+        let start = std::time::Instant::now();
+        if self.update_status.as_ref().is_some_and(|s| s.is_expired()) {
+            self.update_status = None;
+        }
+        let status_text = self.update_status.as_ref().map(|s| s.text.as_str());
+        // Only hand the renderer the image banner when it's actually the active
+        // one; while a pull is in flight `image_banner_active` is false, so the
+        // banner can't re-render under the "pulling…" toast and clobber itself
+        // (#2072).
+        let image_update = self
+            .image_banner_active()
+            .then_some(self.image_update.as_ref());
+        // Reset before the render so a frame that skips the preview path
+        // (dialog open, non-home view) reads as zero capture/parse rather
+        // than leaking the previous frame's durations.
+        self.home.preview_timings = Default::default();
+        self.home.render(
+            frame,
+            frame.area(),
+            &self.theme,
+            self.update_info.as_ref(),
+            status_text,
+            image_update.flatten(),
+        );
+        // Sampled trace for frame-budget diagnostics. A full-frame trace on
+        // every paint would dominate the log at `default_level = trace`, so
+        // we only emit for (a) frames that break the 16ms / 60fps budget and
+        // (b) live-send frames, where the per-frame `tmux capture-pane` fork
+        // is the latency we're profiling and individual frames usually stay
+        // under 16ms. `capture_us` / `parse_us` break the frame down into the
+        // capture fork vs. the `ansi-to-tui` parse; the remainder (frame_ms
+        // minus those two) is the widget build + ratatui diff.
+        let elapsed = start.elapsed();
+        let in_live = self.home.live_send.is_some();
+        if (elapsed.as_millis() > 16 || in_live)
+            && tracing::enabled!(target: "tui.render", tracing::Level::TRACE)
+        {
+            let timings = self.home.preview_timings;
+            tracing::trace!(
+                target: "tui.render",
+                frame_ms = elapsed.as_millis() as u64,
+                frame_us = elapsed.as_micros() as u64,
+                capture_us = timings.capture.as_micros() as u64,
+                parse_us = timings.parse.as_micros() as u64,
+                live = in_live,
+                width = frame.area().width,
+                height = frame.area().height,
+                "render frame sample",
+            );
+        }
+    }
+
+    /// Spawn an async update check, mirroring the brew-formula-lag
+    /// suppression done at startup. Stores the receiver on `self.update_rx`
+    /// so the main loop's `poll_update_check` picks up the result. Callers
+    /// are responsible for gating on `update_check_mode.is_enabled()` and
+    /// avoiding duplicate in-flight checks via `self.update_rx.is_none()`.
+    fn spawn_update_check(&mut self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.update_rx = Some(rx);
+        tokio::spawn(async move {
+            let version = env!("CARGO_PKG_VERSION");
+            let mut result = check_for_update(version, false).await;
+            // For Homebrew installs, suppress the "update available" banner
+            // until the formula has caught up to the GitHub release.
+            // Otherwise users see the prompt, press 'u', and hit a no-op
+            // `brew upgrade` while the formula lags. The brew probes are
+            // sync; offload to keep the runtime free.
+            if let Ok(info) = &mut result {
+                if info.available {
+                    let target = info.latest_version.clone();
+                    let actionable = tokio::task::spawn_blocking(move || {
+                        crate::update::install::install_method_supports_target(&target)
+                    })
+                    .await
+                    .unwrap_or(true);
+                    if !actionable {
+                        info.available = false;
+                    }
+                }
+            }
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Poll for update check result (non-blocking).
+    /// Returns true if an update is available, was just received, and is
+    /// not snoozed by a prior `dismissed_update_version`.
+    fn poll_update_check(&mut self) -> bool {
+        let (update_info, update_rx, received) =
+            poll_update_receiver(self.update_rx.take(), self.update_info.take());
+        self.update_info = update_info;
+        self.update_rx = update_rx;
+
+        if !received {
+            return false;
+        }
+
+        let Some(info) = self.update_info.as_ref() else {
+            return false;
+        };
+
+        // Already installed this version this session (auto or manual). The
+        // running binary's compile-time `CARGO_PKG_VERSION` is stale until
+        // the user restarts, so every periodic re-check (#1471) would
+        // otherwise rediscover the same release: auto mode would loop the
+        // installer, notify mode would re-show the banner. Skip both.
+        if self.last_installed_version_in_session.as_deref() == Some(info.latest_version.as_str()) {
+            tracing::info!(
+                target: "update.dedup",
+                version = %info.latest_version,
+                "skipping: already installed this version this session, restart aoe to use it"
+            );
+            self.update_info = None;
+            return false;
+        }
+
+        // Auto mode: install in the background and suppress the banner.
+        // The new binary is picked up on next launch; we do not restart
+        // the TUI mid-session (avoids racing tmux attaches and partial
+        // writes to the binary while it is running).
+        if crate::session::get_update_settings()
+            .update_check_mode
+            .auto_installs()
+        {
+            self.maybe_kick_off_auto_install(info.latest_version.clone());
+            self.update_info = None;
+            return false;
+        }
+
+        // Notify mode: honor the per-version snooze. A newer release
+        // clears the snooze automatically because the latest_version
+        // string no longer matches.
+        if self.dismissed_update_version.as_deref() == Some(info.latest_version.as_str()) {
+            self.update_info = None;
+            return false;
+        }
+
+        true
+    }
+
+    /// Whether the user runs sandboxed sessions, so a docker-image banner is
+    /// worth surfacing. True when sandbox is on by default or any current
+    /// session is sandboxed; otherwise we skip the registry check entirely.
+    fn sandbox_in_use(&self) -> bool {
+        if Config::load_or_warn().sandbox.enabled_by_default {
+            return true;
+        }
+        self.home.instances().any(|i| i.is_sandboxed())
+    }
+
+    /// Is the sandbox-image banner the one currently shown? It sits below the
+    /// app-update banner and transient toast, so it only owns the `u`/Ctrl+x
+    /// keys when neither of those is up, and it must stay hidden while a pull it
+    /// already started is still running (otherwise it re-arms `u` into the "pull
+    /// already in progress" no-op, #2072).
+    fn image_banner_active(&self) -> bool {
+        should_show_image_banner(
+            self.image_update.is_some(),
+            self.update_info.is_some(),
+            self.update_status.is_some(),
+            self.image_pull_rx.is_some(),
+        )
+    }
+
+    /// Spawn the background sandbox-image staleness check. Mirrors
+    /// `spawn_update_check`: the result lands on `image_update_rx` for the
+    /// main loop's `poll_image_update_check` to pick up.
+    fn spawn_image_update_check(&mut self) {
+        if self.image_update_rx.is_some() {
+            return;
+        }
+        let image = Config::load_or_warn().sandbox.default_image.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.image_update_rx = Some(rx);
+        tokio::spawn(async move {
+            let result = crate::containers::image_update::check_for_image_update(&image).await;
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Poll the image-update check (non-blocking). Returns true when a fresh,
+    /// non-snoozed update just arrived and the banner should show.
+    fn poll_image_update_check(&mut self) -> bool {
+        let Some(mut rx) = self.image_update_rx.take() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(Ok(Some(update))) => {
+                // Honor the per-digest snooze; a newer image clears it
+                // automatically because its digest no longer matches.
+                if self.dismissed_image_digest.as_deref() == Some(update.remote_digest.as_str()) {
+                    return false;
+                }
+                self.image_update = Some(update);
+                true
+            }
+            Ok(Ok(None)) => false,
+            Ok(Err(e)) => {
+                tracing::debug!(target: "containers.image_update", error = %e, "image update check failed");
+                false
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                self.image_update_rx = Some(rx);
+                false
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => false,
+        }
+    }
+
+    /// Kick off a `docker pull` of the sandbox image after the user accepts the
+    /// banner's confirm dialog. The blocking pull runs on a std thread (the
+    /// runtime call shells out); the result promotes into a transient toast.
+    fn spawn_image_pull(&mut self, image: String) {
+        if self.image_pull_rx.is_some() {
+            return;
+        }
+        // Persistent, not transient: a `docker pull` routinely runs longer than
+        // the 10s transient window, and if the toast expired mid-pull the status
+        // line went blank and the (still-`Some`) image banner re-rendered under
+        // it, clobbering itself; pressing `u` again then hit the "pull already in
+        // progress" guard (#2072). `poll_image_pull_status` replaces this with a
+        // transient success/failure toast once the pull resolves. Mirrors the
+        // app-update flow, which is also persistent while the install runs.
+        self.update_status = Some(UpdateStatus::persistent(format!("pulling {image}…")));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.image_pull_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = crate::containers::get_container_runtime()
+                .pull_image(&image)
+                .map_err(anyhow::Error::from);
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Poll the in-progress image pull. On success the banner clears (the local
+    /// copy now matches the registry) and a confirmation toast shows. Returns
+    /// true when the status line changed.
+    fn poll_image_pull_status(&mut self) -> bool {
+        let Some(mut rx) = self.image_pull_rx.take() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                self.image_update = None;
+                self.update_status = Some(UpdateStatus::transient(
+                    "sandbox image updated. New sessions will use it.".into(),
+                ));
+                true
+            }
+            Ok(Err(e)) => {
+                self.update_status =
+                    Some(UpdateStatus::transient(format!("image pull failed: {e}")));
+                true
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                self.image_pull_rx = Some(rx);
+                false
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.update_status = Some(UpdateStatus::transient(
+                    "image pull ended unexpectedly".into(),
+                ));
+                true
+            }
+        }
+    }
+
+    /// Kick off a background install when `update_check_mode = "auto"` and a
+    /// new release is detected. Tarball + writable parent is the only safe
+    /// auto path: Homebrew expects the user to run `brew upgrade`, and a
+    /// sudo-required tarball install can't prompt without a TTY. In every
+    /// other case we silently no-op so the user can still run `aoe update`
+    /// manually.
+    fn maybe_kick_off_auto_install(&mut self, version: String) {
+        use crate::update::install::{detect_install_method, perform_update, InstallMethod};
+
+        // Defensive: if a prior auto- or manual update is still running,
+        // do not start a second installer or overwrite `update_status_rx`.
+        // Mirrors the guard in `Action::SpawnUpdate`.
+        if self.update_status_rx.is_some() {
+            tracing::info!(
+                target: "update.auto",
+                "auto mode skipped: update already in progress"
+            );
+            return;
+        }
+
+        let method = match detect_install_method() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::info!(
+                    target: "update.auto",
+                    error = %e,
+                    "auto mode skipped: install method detection failed"
+                );
+                return;
+            }
+        };
+        let writable = match &method {
+            InstallMethod::Tarball { binary_path } => {
+                crate::update::install::parent_is_writable(binary_path)
+            }
+            _ => false,
+        };
+        if !writable {
+            tracing::info!(
+                target: "update.auto",
+                ?method,
+                "auto mode skipped: install method needs an interactive update"
+            );
+            return;
+        }
+
+        self.update_status = Some(UpdateStatus::transient(format!(
+            "auto-updating to v{version} in background…"
+        )));
+        // Stash for `poll_update_status` to promote into
+        // `last_installed_version_in_session` on confirmed success. Tracking
+        // only on success preserves the user's ability to retry after a
+        // failed install (transient network issue, disk full, etc.).
+        self.pending_install_version = Some(version.clone());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.update_status_rx = Some(rx);
+        let handle = tokio::runtime::Handle::current();
+        std::thread::spawn(move || {
+            let result = handle.block_on(perform_update(&method, &version, None));
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Poll the in-progress update task for completion.
+    /// Returns true when the status line changed and a redraw is needed.
+    fn poll_update_status(&mut self) -> bool {
+        let Some(mut rx) = self.update_status_rx.take() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                // Promote the pending version into the per-session record so
+                // the periodic re-check (#1471) stops surfacing this release.
+                self.last_installed_version_in_session = self.pending_install_version.take();
+                self.update_status = Some(UpdateStatus::persistent(
+                    "update complete. Restart aoe to use the new version.".into(),
+                ));
+                true
+            }
+            Ok(Err(e)) => {
+                // Clear pending so a retry is allowed.
+                self.pending_install_version = None;
+                self.update_status = Some(UpdateStatus::transient(format!("update failed: {e}")));
+                true
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                self.update_status_rx = Some(rx);
+                false
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.pending_install_version = None;
+                self.update_status = Some(UpdateStatus::transient(
+                    "update task ended unexpectedly".into(),
+                ));
+                true
+            }
+        }
+    }
+
+    /// Dispatch the confirmed update, choosing between a blocking suspend and a
+    /// background tokio task based on whether the method requires sudo.
+    fn spawn_update(
+        &mut self,
+        method: crate::update::install::InstallMethod,
+        version: String,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
+        use crate::update::install::InstallMethod;
+
+        let needs_sudo = matches!(
+            &method,
+            InstallMethod::Tarball { binary_path }
+                if !crate::update::install::parent_is_writable(binary_path)
+        );
+
+        if matches!(method, InstallMethod::Homebrew) || needs_sudo {
+            // Suspend the TUI so sudo's password prompt can use the terminal.
+            self.update_status = Some(UpdateStatus::transient(format!("updating to v{version}…")));
+            let method_clone = method.clone();
+            let version_clone = version.clone();
+            let result = self.with_raw_mode_disabled(terminal, move || {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        crate::update::install::perform_update(&method_clone, &version_clone, None)
+                            .await
+                    })
+                })
+            })?;
+            match result {
+                Ok(()) => {
+                    // Record the successful manual install so the periodic
+                    // re-check (#1471) stops re-surfacing this release.
+                    self.last_installed_version_in_session = Some(version.clone());
+                    self.update_status = Some(UpdateStatus::persistent(
+                        "update complete. Restart aoe to use the new version.".into(),
+                    ));
+                }
+                Err(e) => {
+                    self.update_status =
+                        Some(UpdateStatus::transient(format!("update failed: {e}")));
+                }
+            }
+        } else {
+            // Background task for writable tarball installs.
+            // `perform_update`'s future is !Send because its `on_progress` parameter is
+            // `Option<&mut dyn FnMut(...)>` (no Send bound on the trait object), so
+            // `tokio::spawn` won't accept it. A std::thread + Handle::block_on lets the
+            // async I/O still use the existing tokio runtime while sidestepping the
+            // Send constraint.
+            self.update_status = Some(UpdateStatus::transient(format!("updating to v{version}…")));
+            // Stash for `poll_update_status` to promote on confirmed success
+            // (#1471). Mirrors the auto-install path.
+            self.pending_install_version = Some(version.clone());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.update_status_rx = Some(rx);
+            let handle = tokio::runtime::Handle::current();
+            std::thread::spawn(move || {
+                let result = handle.block_on(crate::update::install::perform_update(
+                    &method, &version, None,
+                ));
+                let _ = tx.send(result);
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Persist `app_state.dismissed_update_version` so the snooze (Ctrl+x on the
+/// update banner) survives restarts. Errors are logged but never surfaced,
+/// because losing the snooze is not worth pausing the event loop over.
+fn persist_dismissed_update_version(version: Option<String>) {
+    let result = update_app_state(|state| {
+        state.dismissed_update_version = version;
+    });
+    if let Err(e) = result {
+        tracing::warn!(
+            target: "update.snooze",
+            error = %e,
+            "failed to persist dismissed_update_version"
+        );
+    }
+}
+
+/// Persist `app_state.dismissed_image_digest` so dismissing the sandbox-image
+/// banner (Ctrl+x) survives restarts. Like the update snooze, failures are
+/// logged but never surfaced.
+fn persist_dismissed_image_digest(digest: Option<String>) {
+    let result = update_app_state(|state| {
+        state.dismissed_image_digest = digest;
+    });
+    if let Err(e) = result {
+        tracing::warn!(
+            target: "containers.image_update",
+            error = %e,
+            "failed to persist dismissed_image_digest"
+        );
+    }
+}
+
+/// Decide whether the main loop should spawn a fresh periodic update check.
+/// Pulled out as a pure function so the throttle/in-flight/mode guards are
+/// testable without driving the tokio runtime, the config file, or the
+/// network. `elapsed = None` means no check has run yet this process, which
+/// makes the first tick after the user enables update_check_mode mid-session
+/// fire immediately rather than waiting up to `PERIODIC_RECHECK_INTERVAL`
+/// from process launch.
+fn should_spawn_periodic_update_check(
+    elapsed: Option<Duration>,
+    interval: Duration,
+    rx_in_flight: bool,
+    mode_enabled: bool,
+) -> bool {
+    if rx_in_flight || !mode_enabled {
+        return false;
+    }
+    match elapsed {
+        None => true,
+        Some(e) => e >= interval,
+    }
+}
+
+/// Polls the update receiver and returns the new state.
+/// Returns (update_info, update_rx, was_update_received).
+fn poll_update_receiver(
+    rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<UpdateInfo>>>,
+    current_info: Option<UpdateInfo>,
+) -> (
+    Option<UpdateInfo>,
+    Option<tokio::sync::oneshot::Receiver<anyhow::Result<UpdateInfo>>>,
+    bool,
+) {
+    if let Some(mut rx) = rx {
+        match rx.try_recv() {
+            Ok(result) => {
+                if let Ok(info) = result {
+                    if info.available {
+                        return (Some(info), None, true);
+                    }
+                }
+                (current_info, None, false)
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                (current_info, Some(rx), false)
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => (current_info, None, false),
+        }
+    } else {
+        (current_info, None, false)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskRefreshDecision {
+    Heartbeat,
+    Watcher,
+    None,
+}
+
+fn take_config_refresh_kick(live_idle: bool, config_dirty: &std::sync::atomic::AtomicBool) -> bool {
+    live_idle && config_dirty.swap(false, std::sync::atomic::Ordering::Acquire)
+}
+
+/// Pure refresh-policy decision. Inputs are plain values so this helper
+/// is side-effect free; callers are responsible for actually consuming
+/// the watcher latch (`AtomicBool::swap`) before invoking it. Keeping
+/// decision and mutation separate lets the unit tests below be
+/// table-driven without owning an atomic.
+fn decide_disk_refresh(live_idle: bool, heartbeat_due: bool, dirty: bool) -> DiskRefreshDecision {
+    if !live_idle {
+        return DiskRefreshDecision::None;
+    }
+    if heartbeat_due {
+        DiskRefreshDecision::Heartbeat
+    } else if dirty {
+        DiskRefreshDecision::Watcher
+    } else {
+        DiskRefreshDecision::None
+    }
+}
+
+/// Whether the sandbox-image banner should own the bottom row right now. It is
+/// the lowest-priority banner, so it yields to the app-update banner and any
+/// transient toast, and it stays hidden while a pull it kicked off is still
+/// running. That last clause is the #2072 fix: without it the banner reappeared
+/// the moment the "pulling…" toast cleared, redrawing itself on top of an
+/// in-flight pull and re-arming `u` into the "pull already in progress" no-op.
+/// Factored out of `App::image_banner_active` so the policy is unit-testable.
+fn should_show_image_banner(
+    has_image_update: bool,
+    has_app_update: bool,
+    has_status: bool,
+    pull_in_flight: bool,
+) -> bool {
+    has_image_update && !has_app_update && !has_status && !pull_in_flight
+}
+
+/// Catches reload errors so the tick loop never propagates them. A
+/// malformed `sessions.json` or `groups.json` written by a peer process
+/// is logged, recorded in `ReloadFailureState` for one-shot dialog
+/// surfacing, and the tick loop continues with the previous in-memory
+/// state. The next successful reload clears the recorded failure.
+fn handle_tick_reload_storage(
+    result: anyhow::Result<()>,
+    state: &mut crate::tui::home::ReloadFailureState,
+) {
+    if let Err(ref e) = result {
+        tracing::warn!(
+            target: "tui.file_watch",
+            error = %e,
+            "tick storage reload failed; preserving in-memory state, will retry on next tick"
+        );
+    }
+    if state.record_storage(&result) {
+        tracing::info!(
+            target: "tui.file_watch",
+            "storage reload recovered"
+        );
+    }
+}
+
+/// Tick-driven config reload errors must never propagate out of the
+/// main loop AND must never silently flip safety-affecting settings to
+/// defaults. A malformed `config.toml` written by a peer process would
+/// otherwise either crash the TUI (if propagated) or silently disable
+/// settings like `confirm_before_quit` (if applied as default). This
+/// helper records the failure for one-shot dialog surfacing while
+/// keeping the previous in-memory config intact.
+fn handle_tick_reload_config(
+    result: anyhow::Result<()>,
+    state: &mut crate::tui::home::ReloadFailureState,
+) {
+    if let Err(ref e) = result {
+        tracing::warn!(
+            target: "tui.file_watch",
+            error = %e,
+            "tick config reload failed; preserving in-memory config, will retry on next tick"
+        );
+    }
+    if state.record_config(&result) {
+        tracing::info!(
+            target: "tui.file_watch",
+            "config reload recovered"
+        );
+    }
+}
+
+/// What a `q` key press at the home screen should do. Factored out of the
+/// key handler so the quit policy is unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+enum QuitIntent {
+    /// Don't quit. Ctrl+Q lands here: it's reserved for exiting live-send
+    /// mode and must never close aoe from the home view (#1569).
+    Ignore,
+    /// A session is mid-creation; confirm before cancelling it.
+    ConfirmDuringCreation,
+    /// Confirm-before-quit is enabled; show the quit confirmation.
+    Confirm,
+    /// Quit immediately.
+    Quit,
+}
+
+fn quit_intent(
+    modifiers: KeyModifiers,
+    creation_pending: bool,
+    confirm_before_quit: bool,
+) -> QuitIntent {
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        return QuitIntent::Ignore;
+    }
+    if creation_pending {
+        return QuitIntent::ConfirmDuringCreation;
+    }
+    if confirm_before_quit {
+        return QuitIntent::Confirm;
+    }
+    QuitIntent::Quit
+}
+
+impl App {
+    async fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
+        // An ACTIVE embedded structured view owns the keyboard, just as
+        // the full-screen view owned the whole event stream: letters must
+        // reach the composer, not home-view shortcuts (q, n, d…). A merely
+        // previewed view (mounted but not entered) does NOT capture: list
+        // navigation keeps working, and Enter enters it. Ctrl+Q leaves
+        // interactive mode back to the read-only preview.
+        #[cfg(feature = "serve")]
+        if self
+            .home
+            .structured_preview
+            .as_ref()
+            .is_some_and(|v| v.is_active())
+        {
+            let result = self
+                .home
+                .structured_preview
+                .as_mut()
+                .expect("checked is_some above")
+                .handle_event(crossterm::event::Event::Key(key))
+                .await;
+            match result {
+                Ok(true) => {
+                    if let Some(v) = self.home.structured_preview.as_mut() {
+                        v.deactivate();
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    self.close_embedded_structured();
+                    self.update_status =
+                        Some(UpdateStatus::transient(format!("structured view: {e}")));
+                }
+            }
+            return Ok(());
+        }
+        // Global keybindings
+        match (key.code, key.modifiers) {
+            // In live-send mode Ctrl+C belongs to the agent (interrupt), not
+            // aoe: defer to `home.handle_key` below, which forwards it to the
+            // pane. Without this guard the global quit path swallowed it and
+            // exited aoe, the exact surprise #2894 reported. The `q` arm is
+            // already covered because `has_dialog()` includes live-send.
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) if !self.home.is_live_send_capturing() => {
+                if self.home.is_creating_stub_selected() {
+                    self.home.cancel_creation();
+                    return Ok(());
+                }
+                if self.home.is_creation_pending() && !self.home.has_dialog() {
+                    self.home.show_quit_during_creation_confirm();
+                    return Ok(());
+                }
+                self.should_quit = true;
+                return Ok(());
+            }
+            (KeyCode::Char('q'), modifiers) if !self.home.has_dialog() => {
+                match quit_intent(
+                    modifiers,
+                    self.home.is_creation_pending(),
+                    self.home.confirm_before_quit(),
+                ) {
+                    QuitIntent::Ignore => {}
+                    QuitIntent::ConfirmDuringCreation => {
+                        self.home.show_quit_during_creation_confirm();
+                    }
+                    QuitIntent::Confirm => {
+                        self.home.show_quit_confirm();
+                    }
+                    QuitIntent::Quit => {
+                        self.should_quit = true;
+                    }
+                }
+                return Ok(());
+            }
+            // Ctrl+x dismisses the update bar / status toast. Gated on
+            // something being visible AND no dialog open so it doesn't fire
+            // during dialog input. The dismissed version is persisted to
+            // `app_state.dismissed_update_version` so the snooze survives
+            // restarts; the banner returns automatically when a newer
+            // release ships (per #1140).
+            //
+            // No `needs_redraw = true` here: that forces a `clear_terminal`
+            // before the next event arrives, so the whole screen blanks for
+            // a beat (visible flash). Ratatui's diff renderer handles the
+            // 1-row layout shrink on the next normal draw.
+            (KeyCode::Char('x'), KeyModifiers::CONTROL)
+                if (self.update_info.is_some()
+                    || self.update_status.is_some()
+                    || self.image_update.is_some())
+                    && !self.home.has_dialog() =>
+            {
+                // The image banner is lowest priority, so Ctrl+x only dismisses
+                // it when it's the one actually showing. Otherwise it targets
+                // the app update / toast as before, leaving any pending image
+                // update to surface once those clear.
+                if self.image_banner_active() {
+                    if let Some(update) = self.image_update.as_ref() {
+                        let digest = update.remote_digest.clone();
+                        self.dismissed_image_digest = Some(digest.clone());
+                        persist_dismissed_image_digest(Some(digest));
+                    }
+                    self.image_update = None;
+                    return Ok(());
+                }
+                if let Some(info) = self.update_info.as_ref() {
+                    let v = info.latest_version.clone();
+                    self.dismissed_update_version = Some(v.clone());
+                    persist_dismissed_update_version(Some(v));
+                }
+                self.update_info = None;
+                self.update_status = None;
+                return Ok(());
+            }
+            // `u` on the sandbox-image banner opens the pull confirm. The app
+            // update owns `u` via the home bindings, but the image banner only
+            // shows when no app update is up (see `image_banner_active`), so
+            // there's no collision.
+            (KeyCode::Char('u'), KeyModifiers::NONE)
+                if self.image_banner_active() && !self.home.has_dialog() =>
+            {
+                if let Some(update) = self.image_update.as_ref() {
+                    let image = update.image.clone();
+                    self.home.prompt_pull_sandbox_image(image);
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        if let Some(action) = self.home.handle_key(key, self.update_info.as_ref()) {
+            self.execute_action(action, terminal)?;
+        }
+
+        // Drain AFTER the key was handled: a keyboard-confirmed switch
+        // ('y' / Enter on the switch-view confirm) stashes the id during
+        // `execute_action` above, and draining before `handle_key` would
+        // sit on it until the next keypress (#2925).
+        #[cfg(feature = "serve")]
+        if let Some(session_id) = self.pending_view_switch.take() {
+            self.perform_view_switch(&session_id, terminal).await;
+        }
+
+        #[cfg(feature = "serve")]
+        if let Some(session_id) = self.pending_daemon_start_open.take() {
+            self.start_daemon_then_open(&session_id, terminal).await;
+        }
+
+        #[cfg(feature = "serve")]
+        if let Some(session_id) = self.pending_structured_view_open.take() {
+            self.open_structured_view(&session_id).await?;
+        }
+
+        #[cfg(feature = "serve")]
+        if let Some(session_id) = self.pending_smart_rename.take() {
+            self.perform_smart_rename(&session_id).await;
+        }
+
+        Ok(())
+    }
+
+    /// Run a stashed on-demand "Auto-name now" for a structured session: resolve
+    /// the daemon and POST `/smart-rename`. The daemon forces past the disabled
+    /// setting and runs the one-shot detached; the new title arrives over the
+    /// structured-view WS and the file watcher refreshes the row, so the TUI
+    /// mutates no session state itself. A no-daemon state surfaces as a
+    /// transient status rather than failing the loop (#3039).
+    #[cfg(feature = "serve")]
+    async fn perform_smart_rename(&mut self, session_id: &str) {
+        use crate::acp::client::{require_daemon, HttpClient, ManagerError};
+
+        let title = self
+            .home
+            .get_instance(session_id)
+            .map(|i| i.title.clone())
+            .unwrap_or_default();
+
+        let endpoint = match require_daemon().await {
+            Ok(e) => e,
+            Err(ManagerError::NoDaemonRunning(_)) => {
+                self.update_status = Some(UpdateStatus::transient(
+                    "Auto-name needs a running daemon; open the structured view first.".into(),
+                ));
+                return;
+            }
+            Err(e) => {
+                self.update_status =
+                    Some(UpdateStatus::transient(format!("daemon unreachable: {e}")));
+                return;
+            }
+        };
+        let http = match HttpClient::new(endpoint) {
+            Ok(h) => h,
+            Err(e) => {
+                self.update_status =
+                    Some(UpdateStatus::transient(format!("auto-name failed: {e}")));
+                return;
+            }
+        };
+        self.update_status = Some(UpdateStatus::transient(
+            match http.smart_rename(session_id).await {
+                Ok(()) => format!("auto-naming \"{title}\"…"),
+                Err(e) => format!("auto-name failed: {e}"),
+            },
+        ));
+    }
+
+    /// Run a stashed view switch: resolve the daemon, POST the matching
+    /// switch endpoint, and surface the outcome as a transient status.
+    /// The daemon persists the flipped view and (re)spawns the worker /
+    /// tears down the pane; the file watcher refreshes the row, so the
+    /// TUI mutates no session state itself. Errors surface as status
+    /// text rather than failing the app loop.
+    ///
+    /// When no daemon is running, a localhost one is started first: the
+    /// user just confirmed a dialog that says the agent restarts under
+    /// `aoe serve`, so the spawn is part of the consented action rather
+    /// than a hidden side effect. `terminal` is borrowed to paint the
+    /// "Starting…" status before the (up to several seconds) wait.
+    #[cfg(feature = "serve")]
+    async fn perform_view_switch(
+        &mut self,
+        session_id: &str,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) {
+        use crate::acp::client::{require_daemon, HttpClient, ManagerError};
+
+        let Some(inst) = self.home.get_instance(session_id) else {
+            return;
+        };
+        let to_structured = !inst.is_structured();
+        let title = inst.title.clone();
+
+        let endpoint = match require_daemon().await {
+            Ok(e) => e,
+            Err(ManagerError::NoDaemonRunning(_)) => {
+                self.update_status = Some(UpdateStatus::transient(
+                    "Starting local daemon for the view switch…".into(),
+                ));
+                let _ = self.draw(terminal);
+                match crate::tui::dialogs::start_local_daemon_and_wait().await {
+                    Ok(e) => e,
+                    Err(e) => {
+                        // Take the first line only: the log-tail hint is
+                        // multi-line and a transient status is one row.
+                        let first = e.lines().next().unwrap_or("unknown error");
+                        self.update_status = Some(UpdateStatus::transient(format!(
+                            "view switch failed: {first}"
+                        )));
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                self.update_status =
+                    Some(UpdateStatus::transient(format!("daemon unreachable: {e}")));
+                return;
+            }
+        };
+        let http = match HttpClient::new(endpoint) {
+            Ok(h) => h,
+            Err(e) => {
+                self.update_status =
+                    Some(UpdateStatus::transient(format!("view switch failed: {e}")));
+                return;
+            }
+        };
+        let result = if to_structured {
+            http.acp_enable(session_id).await
+        } else {
+            http.acp_disable(session_id).await
+        };
+        self.update_status = Some(UpdateStatus::transient(match result {
+            Ok(()) if to_structured => format!("\"{title}\" switched to the structured view"),
+            Ok(()) => format!("\"{title}\" switched to the terminal view"),
+            Err(e) => format!("view switch failed: {e}"),
+        }));
+    }
+
+    /// Enter (activate) the structured view for `session_id`: it takes
+    /// the keyboard so the composer works. Usually the view is already
+    /// mounted as a preview (selecting the row mounts it), so this just
+    /// flips it active. If it isn't mounted (e.g. the daemon was down
+    /// when selected), connect now; and with no daemon at all, offer to
+    /// start a localhost one (the Yes path resumes through
+    /// `start_daemon_then_open`).
+    #[cfg(feature = "serve")]
+    async fn open_structured_view(&mut self, session_id: &str) -> Result<()> {
+        use crate::acp::client::{require_daemon, ManagerError};
+
+        // An archived / trashed row renders its own placeholder page, so
+        // an activated view here would capture the keyboard invisibly.
+        // Restoring stays explicit (`z` / the trash menu), matching the
+        // archive contract for terminal sessions.
+        if self
+            .home
+            .get_instance(session_id)
+            .is_some_and(|inst| inst.is_archived() || inst.is_trashed())
+        {
+            self.update_status = Some(UpdateStatus::transient(
+                "This session is archived; restore it first to open the structured view".into(),
+            ));
+            return Ok(());
+        }
+        if self
+            .home
+            .structured_preview
+            .as_ref()
+            .is_some_and(|v| v.session_id() == session_id)
+        {
+            self.activate_embedded();
+            self.drain_pending_paste_for_structured_view(session_id)
+                .await;
+            return Ok(());
+        }
+        match require_daemon().await {
+            Ok(endpoint) => {
+                self.connect_embedded_structured(endpoint, session_id).await;
+                self.activate_embedded();
+                self.drain_pending_paste_for_structured_view(session_id)
+                    .await;
+            }
+            Err(ManagerError::NoDaemonRunning(_)) => {
+                self.home.prompt_start_daemon_for_structured(session_id);
+            }
+            Err(e) => {
+                self.update_status = Some(UpdateStatus::transient(format!("structured view: {e}")));
+            }
+        }
+        Ok(())
+    }
+
+    /// Flip the mounted embedded view to interactive mode (exiting
+    /// live-send first, since both own the preview pane and keyboard).
+    #[cfg(feature = "serve")]
+    fn activate_embedded(&mut self) {
+        self.home.exit_live_send_if_active();
+        if let Some(v) = self.home.structured_preview.as_mut() {
+            v.activate();
+        }
+    }
+
+    /// Consume the requested session's draft only if that session mounted.
+    #[cfg(feature = "serve")]
+    async fn drain_pending_paste_for_structured_view(&mut self, session_id: &str) {
+        let Some(view) = self
+            .home
+            .structured_preview
+            .as_mut()
+            .filter(|view| view.session_id() == session_id)
+        else {
+            return;
+        };
+        if let Some(buf) = self
+            .home
+            .pending_paste_for_structured_view
+            .remove(session_id)
+        {
+            view.paste_text_with_file_load(&buf).await;
+        }
+    }
+
+    /// Mount the embedded view against a located daemon in preview
+    /// (read-only) state. The caller activates it if the user is
+    /// entering rather than just previewing.
+    #[cfg(feature = "serve")]
+    async fn connect_embedded_structured(
+        &mut self,
+        endpoint: crate::acp::client::DaemonEndpoint,
+        session_id: &str,
+    ) {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+
+        match EmbeddedView::connect(endpoint, session_id).await {
+            Ok(view) => {
+                self.home.structured_preview = Some(view);
+                self.preview_mount_pending = None;
+            }
+            Err(e) => {
+                self.update_status = Some(UpdateStatus::transient(format!("structured view: {e}")));
+            }
+        }
+    }
+
+    /// Drop the embedded structured view and hand the preview pane
+    /// back to the home screen. Dropping the view closes its WebSocket
+    /// and ends the side-channel tasks (their senders error out).
+    ///
+    /// No `needs_redraw`: that forces a full `clear_terminal` on the next
+    /// loop iteration, which blanks the whole screen for a frame (the
+    /// reported Ctrl+Q flash). The home view repaints the same preview
+    /// rect the structured view drew into, so the ordinary diffed draw
+    /// covers it cleanly, the same way exiting live-send does.
+    #[cfg(feature = "serve")]
+    fn close_embedded_structured(&mut self) {
+        self.home.structured_preview = None;
+    }
+
+    /// The Yes path of the "start a local daemon?" confirm: spawn a
+    /// localhost daemon with visible feedback, wait for it to become
+    /// healthy, then mount + enter the embedded structured view.
+    #[cfg(feature = "serve")]
+    async fn start_daemon_then_open(
+        &mut self,
+        session_id: &str,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) {
+        self.update_status = Some(UpdateStatus::transient("Starting local daemon…".into()));
+        let _ = self.draw(terminal);
+        match crate::tui::dialogs::start_local_daemon_and_wait().await {
+            Ok(endpoint) => {
+                self.update_status = None;
+                self.connect_embedded_structured(endpoint, session_id).await;
+                self.activate_embedded();
+                // Preserve the captured draft until its requested view mounts.
+                self.drain_pending_paste_for_structured_view(session_id)
+                    .await;
+            }
+            Err(e) => {
+                let first = e.lines().next().unwrap_or("unknown error");
+                self.update_status = Some(UpdateStatus::transient(format!(
+                    "daemon start failed: {first}"
+                )));
+            }
+        }
+    }
+
+    /// Preview-on-select: keep a streaming structured-transcript preview
+    /// mounted for the selected structured session. Debounced so rapid
+    /// list navigation doesn't connect a socket per keystroke, and only
+    /// while a daemon is already reachable (a down daemon leaves the
+    /// "press Enter" placeholder). An active (entered) view is never
+    /// disturbed. Returns true if the mount set changed (needs redraw).
+    #[cfg(feature = "serve")]
+    async fn reconcile_structured_preview(&mut self) -> bool {
+        // An entered view owns the selection and keyboard; leave it be,
+        // but only while its session is still a live structured row AND
+        // still the selected one. A peer (web, another aoe) can delete
+        // the session, flip it to a terminal view, or archive it out
+        // from under us, and a storage reload can move the selection;
+        // an active view that no longer matches what the pane renders
+        // would keep capturing every keystroke invisibly.
+        if self
+            .home
+            .structured_preview
+            .as_ref()
+            .is_some_and(|v| v.is_active())
+        {
+            let mounted_id = self
+                .home
+                .structured_preview
+                .as_ref()
+                .map(|v| v.session_id().to_string());
+            let still_valid = mounted_id
+                .as_deref()
+                .is_some_and(|id| self.home.selected_structured_session().as_deref() == Some(id));
+            if !still_valid {
+                self.close_embedded_structured();
+                self.preview_mount_pending = None;
+                self.home.structured_preview_pending = false;
+                return true;
+            }
+            self.preview_mount_pending = None;
+            self.home.structured_preview_pending = false;
+            return false;
+        }
+        let desired = self.home.selected_structured_session();
+        let mounted = self
+            .home
+            .structured_preview
+            .as_ref()
+            .map(|v| v.session_id().to_string());
+        if desired.as_deref() == mounted.as_deref() {
+            self.preview_mount_pending = None;
+            self.home.structured_preview_pending = false;
+            return false;
+        }
+        // Selection moved off the previewed session: drop the old preview
+        // right away so the pane doesn't show a stale transcript.
+        let Some(sid) = desired else {
+            self.preview_mount_pending = None;
+            self.home.structured_preview_pending = false;
+            if self.home.structured_preview.is_some() {
+                self.home.structured_preview = None;
+                return true;
+            }
+            return false;
+        };
+        // Only preview when a daemon is already up (cheap discovery, no
+        // health round-trip): a down daemon keeps the actionable "press
+        // Enter" placeholder rather than auto-spawning on hover. Any
+        // stale mount for a different session is dropped here too, so a
+        // daemon that died mid-browse can't leave an orphaned view
+        // pumping a dead socket behind the placeholder.
+        let Ok(endpoint) = crate::acp::client::discover() else {
+            self.preview_mount_pending = None;
+            self.home.structured_preview_pending = false;
+            return self.home.structured_preview.take().is_some();
+        };
+        // A mount is coming: the renderer shows a quiet beat instead of
+        // the wordy placeholder while we debounce + connect.
+        self.home.structured_preview_pending = true;
+        // Debounce: wait for the cursor to settle on this row so rapid
+        // list navigation doesn't open a WebSocket per keystroke.
+        const PREVIEW_MOUNT_DEBOUNCE: Duration = Duration::from_millis(120);
+        let now = std::time::Instant::now();
+        match &self.preview_mount_pending {
+            Some((pending, _)) if *pending == sid => {}
+            _ => {
+                self.preview_mount_pending = Some((sid, now));
+                return self.home.structured_preview.take().is_some();
+            }
+        }
+        let settled = self
+            .preview_mount_pending
+            .as_ref()
+            .is_some_and(|(_, at)| now.duration_since(*at) >= PREVIEW_MOUNT_DEBOUNCE);
+        if !settled {
+            return false;
+        }
+        let sid = self.preview_mount_pending.take().unwrap().0;
+        self.connect_embedded_structured(endpoint, &sid).await;
+        self.home.structured_preview_pending = false;
+        true
+    }
+
+    /// Auto-stop plain tmux sessions idle past `session.auto_stop_idle_secs`
+    /// (#1690). Runs on a 60s gate from the main loop. Each candidate is
+    /// claimed under the per-profile storage lock (so a co-running `aoe serve`
+    /// cannot double-stop it), marked `Stopped` in memory, then handed to the
+    /// background `StopPoller`; the result is reconciled by `apply_stop_results`
+    /// like a manual stop. Returns true if any session was reaped.
+    fn reap_idle_sessions(&mut self) -> bool {
+        // Live attach state; on a tmux query failure skip this pass rather
+        // than risk reaping a session the user is attached to.
+        let Ok(attached) = crate::tmux::attached_session_names() else {
+            return false;
+        };
+        let now = chrono::Utc::now();
+        // Boundary snapshot: `idle_reap_candidates` takes `&[Instance]`
+        // (shared API with the daemon caller in `src/server/mod.rs`).
+        let instances: Vec<crate::session::Instance> = self.home.instances().cloned().collect();
+        let candidates = crate::session::idle_reap::idle_reap_candidates(
+            &instances,
+            now,
+            &attached,
+            |profile| {
+                crate::session::profile_config::resolve_config_or_warn(profile)
+                    .session
+                    .auto_stop_idle_secs
+            },
+        );
+        let mut reaped = false;
+        for cand in candidates {
+            match crate::session::idle_reap::claim_idle_stop(
+                &cand.profile,
+                self.home.file_watch.clone(),
+                &cand.session_id,
+                now,
+                cand.threshold_secs,
+            ) {
+                Ok(Some(instance)) => {
+                    // Mirror Action::StopSession: the claim already persisted
+                    // `Stopped`; reassert it in memory and run the kill off the
+                    // UI thread so a sandbox `docker stop` cannot freeze the TUI.
+                    self.home
+                        .set_instance_status(&cand.session_id, crate::session::Status::Stopped);
+                    self.home
+                        .stop_poller
+                        .request_stop(crate::tui::stop_poller::StopRequest {
+                            session_id: cand.session_id.clone(),
+                            instance,
+                        });
+                    tracing::info!(
+                        target: "tui.idle_reap",
+                        session = %cand.session_id,
+                        profile = %cand.profile,
+                        threshold_secs = cand.threshold_secs,
+                        "auto-stopped idle tmux session",
+                    );
+                    reaped = true;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        target: "tui.idle_reap",
+                        session = %cand.session_id,
+                        error = %e,
+                        "idle auto-stop claim failed",
+                    );
+                }
+            }
+        }
+        if reaped {
+            if let Err(e) = self.home.save() {
+                tracing::error!(target: "tui.idle_reap", "failed to save after idle reap: {e}");
+            }
+        }
+        reaped
+    }
+
+    fn execute_action(
+        &mut self,
+        action: Action,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
+        match action {
+            Action::Quit => self.should_quit = true,
+            Action::AttachSession(id) => {
+                self.attach_session(&id, terminal)?;
+            }
+            Action::AttachAfterCreate(id) => {
+                self.dispatch_new_session_attach(&id, terminal)?;
+            }
+            Action::AttachTerminal(id, mode) => {
+                self.attach_terminal(&id, mode, terminal)?;
+            }
+            Action::EditFile(path) => {
+                self.edit_file(&path, terminal)?;
+            }
+            Action::StopSession(id) => {
+                if let Some(inst) = self.home.get_instance(&id) {
+                    // Run the stop on a background thread: `inst.stop()` calls
+                    // `docker stop` for sandboxed sessions, which can block for
+                    // the container's grace period (~10s) and would otherwise
+                    // freeze the TUI (issue #1496). Set Stopped immediately so
+                    // the status poller won't override to Error while the stop
+                    // is in flight; the result is applied in the main loop via
+                    // `apply_stop_results`.
+                    let request = crate::tui::stop_poller::StopRequest {
+                        session_id: id.clone(),
+                        instance: inst.clone(),
+                    };
+                    self.home
+                        .set_instance_status(&id, crate::session::Status::Stopped);
+                    self.home.save()?;
+                    self.home.stop_poller.request_stop(request);
+                }
+            }
+            Action::SetTheme(name) => {
+                self.set_theme(&name);
+            }
+            Action::SpawnUpdate(method, version) => {
+                if self.update_status_rx.is_some() {
+                    self.update_status =
+                        Some(UpdateStatus::transient("update already in progress".into()));
+                    return Ok(());
+                }
+                self.spawn_update(method, version, terminal)?;
+            }
+            Action::SetTransientStatus(text) => {
+                self.update_status = Some(UpdateStatus::transient(text));
+            }
+            Action::SpawnImagePull(image) => {
+                if self.image_pull_rx.is_some() {
+                    self.update_status = Some(UpdateStatus::transient(
+                        "image pull already in progress".into(),
+                    ));
+                    return Ok(());
+                }
+                self.spawn_image_pull(image);
+            }
+            Action::SendMessage(id, message) => {
+                // Flip the row to Starting and show a toast so the user has
+                // visible feedback during ensure_pane_ready, which can take
+                // several seconds on a cold-start sandboxed session (Docker
+                // pull) or while the readiness loop waits for an agent
+                // splash to clear. The status poller will correct the row
+                // back to the real state after we return.
+                //
+                // Warm sessions skip the toast frame for the same reason
+                // EnterLiveSend does: its bottom bar row shifts the
+                // bottom-anchored preview paint up a row for the frame's
+                // lifetime, and a warm send is too fast for the toast to
+                // inform anyone.
+                let warm = self.home.send_entry_is_warm(&id);
+                if !warm {
+                    self.home
+                        .set_instance_status(&id, crate::session::Status::Starting);
+                    self.update_status =
+                        Some(UpdateStatus::transient("Reviving session...".into()));
+                    self.draw(terminal)?;
+                }
+                self.home.execute_send_message(&id, &message);
+                if !warm {
+                    self.update_status = None;
+                }
+            }
+            Action::EnterLiveSend(id) => {
+                // Same revive flow as SendMessage so cold-start (Docker,
+                // agent splash) gives the user "Reviving..." feedback.
+                // After the pane is ready, install the live-send state on
+                // HomeView so the next key event routes through the live
+                // handler instead of the normal action dispatch.
+                //
+                // The toast frame is skipped entirely for a warm target:
+                // its bottom bar row shifts the bottom-anchored preview
+                // paint up a row for as long as the frame is on screen,
+                // which on a warm entry is the only visible effect the
+                // toast has (the entry itself is near-instant). See
+                // `live_entry_is_warm`.
+                let warm = self.home.live_entry_is_warm(&id);
+                if !warm {
+                    self.home
+                        .set_instance_status(&id, crate::session::Status::Starting);
+                    self.update_status =
+                        Some(UpdateStatus::transient("Reviving session...".into()));
+                    self.draw(terminal)?;
+                }
+                let outcome = self.home.prepare_live_send(&id);
+                // Settle the toast to its final state BEFORE the sync resize
+                // and redraw, so HomeView's cached `preview_pane_area`
+                // matches the geometry the user will see for the next
+                // several frames. Otherwise the toast row that was on screen
+                // during `prepare_live_send` would make the preview pane one
+                // row shorter than post-toast, the sync resize would target
+                // the smaller pane, and the first capture would render
+                // shifted up.
+                if !warm {
+                    self.update_status = match &outcome {
+                        // On clean ready, drop the toast entirely. On Err the
+                        // info_dialog already carries the failure detail, so the
+                        // transient toast just gets in the way.
+                        Ok(()) | Err(()) => None,
+                    };
+                }
+                if outcome.is_ok() {
+                    self.draw(terminal)?;
+                    self.home.finalize_live_send_resize();
+                }
+            }
+            Action::AttachToolSession(id, tool_name) => {
+                self.attach_tool_session(&id, &tool_name, terminal)?;
+            }
+            Action::RunBackgroundToolSession(id, tool_name) => {
+                self.run_background_tool_session(&id, &tool_name);
+            }
+            #[cfg(feature = "serve")]
+            Action::OpenStructuredView(id) => {
+                // Stash for the async main loop. The acp view needs
+                // `event_stream` access that this sync handler can't
+                // lend; the loop picks `pending_structured_view_open` up after
+                // we return.
+                self.pending_structured_view_open = Some(id);
+            }
+            #[cfg(feature = "serve")]
+            Action::SwitchSessionView(id) => {
+                // Same stash-for-the-async-loop pattern: the daemon POST
+                // must be awaited, which this sync handler can't do.
+                self.pending_view_switch = Some(id);
+            }
+            #[cfg(feature = "serve")]
+            Action::StartDaemonThenOpenStructured(id) => {
+                // Same stash pattern: spawning the daemon and waiting for
+                // its health check must be awaited.
+                self.pending_daemon_start_open = Some(id);
+            }
+            #[cfg(feature = "serve")]
+            Action::SmartRenameNow(id) => {
+                // Same stash pattern: the daemon POST must be awaited.
+                self.pending_smart_rename = Some(id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Route a freshly-created session through the user's
+    /// `default_attach_mode` setting. Shared by both creation paths
+    /// (synchronous `Action::AttachAfterCreate` and the async branch in
+    /// the main loop's `apply_creation_results` handler) so the setting
+    /// applies regardless of which one fired.
+    ///
+    /// A structured session skips the tmux modes entirely and opens its
+    /// structured view (#2926): the wizard's Structured toggle is an
+    /// explicit "drive this session in the structured view" ask, and
+    /// both callers drain `pending_structured_view_open` right after
+    /// this returns. Missing-instance race conditions fall through to
+    /// `attach_session`: better the tmux-attach fallback than silently
+    /// swallowing the new session.
+    fn dispatch_new_session_attach(
+        &mut self,
+        session_id: &str,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
+        #[cfg(feature = "serve")]
+        if self
+            .home
+            .get_instance(session_id)
+            .is_some_and(|inst| inst.is_structured())
+        {
+            self.pending_structured_view_open = Some(session_id.to_string());
+            return Ok(());
+        }
+        let mode = self.home.default_attach_mode(session_id);
+        tracing::debug!(target: "tui.input",
+            session_id = %session_id,
+            mode = ?mode,
+            "new session created; dispatching attach mode"
+        );
+        match mode {
+            Some(crate::session::AttachMode::LiveSend) => {
+                self.execute_action(Action::EnterLiveSend(session_id.to_string()), terminal)
+            }
+            Some(crate::session::AttachMode::Tmux) | None => {
+                self.attach_session(session_id, terminal)
+            }
+        }
+    }
+
+    fn attach_session(
+        &mut self,
+        session_id: &str,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
+        let instance = match self.home.get_instance(session_id) {
+            Some(inst) => inst.clone(),
+            None => return Ok(()),
+        };
+
+        // Acp-mode sessions are not backed by tmux. The Enter handler
+        // in `home::input` routes them to `OpenStructuredView`, and
+        // `dispatch_new_session_attach` opens the structured view for
+        // fresh creates, but this function is still reachable for a
+        // structured row through older call sites, so guard here too.
+        // Falling through would attempt a tmux attach against a
+        // non-existent pane.
+        if instance.is_structured() {
+            let _ = terminal;
+            return Ok(());
+        }
+
+        let tmux_session = instance.tmux_session()?;
+
+        // Decide whether to restart: if hook status is available or the instance
+        // uses a custom command, trust that over shell detection. Wrapper scripts
+        // (Devbox, version managers, custom command overrides) run agents via a
+        // shell process, so is_pane_running_shell() returns true even when the
+        // agent is healthy.
+        let exists = tmux_session.exists();
+        let pane_dead = if exists {
+            tmux_session.is_pane_dead()
+        } else {
+            false
+        };
+        let needs_restart = if !exists || pane_dead {
+            true
+        } else if crate::hooks::read_hook_status(&instance.id).is_some() {
+            // Hook status is tracking this session; shell detection is unreliable
+            false
+        } else if instance.has_command_override() {
+            // Custom command overrides run agents through wrapper scripts that
+            // appear as shell processes to tmux. Don't restart based on shell
+            // detection. (extra_args alone should not suppress this check.)
+            false
+        } else {
+            !instance.expects_shell() && tmux_session.is_pane_running_shell()
+        };
+        tracing::debug!(target: "tui.input",
+            session_id,
+            exists,
+            pane_dead,
+            needs_restart,
+            "attach_session: restart decision"
+        );
+        if needs_restart {
+            // Show warning (once) if custom instruction is configured for an unsupported agent
+            if instance.is_sandboxed() {
+                let has_instruction = instance
+                    .sandbox_info
+                    .as_ref()
+                    .and_then(|s| s.custom_instruction.as_ref())
+                    .is_some_and(|i| !i.is_empty());
+
+                if has_instruction
+                    && crate::agents::get_agent(&instance.tool)
+                        .is_none_or(|a| a.instruction_flag.is_none())
+                {
+                    let config = Config::load_or_warn();
+                    if !config.app_state.has_seen_custom_instruction_warning {
+                        self.home.info_dialog = Some(
+                            crate::tui::dialogs::InfoDialog::new(
+                                "Custom Instruction Not Supported",
+                                &format!(
+                                    "'{}' does not support custom instruction injection. The session will launch without the custom instruction.",
+                                    instance.tool
+                                ),
+                            ),
+                        );
+                        self.home.pending_attach_after_warning = Some(session_id.to_string());
+
+                        // Persist the "seen" flag so it only shows once. A
+                        // failed write should not kill the interactive
+                        // session; the dialog still shows this run either way.
+                        if let Err(e) = update_app_state(|state| {
+                            state.has_seen_custom_instruction_warning = true;
+                        }) {
+                            tracing::warn!(
+                                target: "tui.input",
+                                error = %e,
+                                "failed to persist has_seen_custom_instruction_warning"
+                            );
+                        }
+
+                        return Ok(());
+                    }
+                }
+            }
+
+            // Get terminal size to pass to tmux session creation
+            // This ensures the session starts at the correct size instead of 80x24 default
+            let size = crate::terminal::get_size();
+
+            // Skip on_launch hooks if they already ran in the background creation poller
+            let skip_on_launch = self.home.take_on_launch_hooks_ran(session_id);
+
+            self.home
+                .set_instance_status(session_id, crate::session::Status::Starting);
+            match self
+                .home
+                .restart_instance_with_size_opts(session_id, size, skip_on_launch)
+            {
+                Err(e) => {
+                    let err_str = e.to_string();
+                    self.home
+                        .set_instance_error(session_id, Some(err_str.clone()));
+                    self.home
+                        .set_instance_status(session_id, crate::session::Status::Error);
+                    // Without a toast, set_instance_error + Status::Error are
+                    // invisible to the user: the TUI redraws on home as if Enter
+                    // did nothing. Toast text is single-line; the bar truncates
+                    // at terminal width without us needing to pre-clip.
+                    self.update_status = Some(UpdateStatus::transient(format!(
+                        "restart failed: {err_str}"
+                    )));
+                    return Ok(());
+                }
+                Ok(crate::session::StartOutcome::ResumeFailed { sid }) => {
+                    self.update_status = Some(UpdateStatus::transient(format!(
+                        "Resume failed for sid {sid}; preserved for retry"
+                    )));
+                    return Ok(());
+                }
+                Ok(crate::session::StartOutcome::FreshAfterFailedResume { sid }) => {
+                    self.update_status = Some(UpdateStatus::transient(format!(
+                        "Started fresh; resume previously failed for sid {sid}"
+                    )));
+                }
+                Ok(_) => {}
+            }
+            self.home.set_instance_error(session_id, None);
+        }
+
+        let tmux_session = match self.home.get_instance(session_id) {
+            Some(inst) => inst.tmux_session()?,
+            None => return Ok(()),
+        };
+        // The non-live preview may have left the window pinned to manual
+        // sizing at the (smaller) preview dimensions. Restore `window-size
+        // latest` so the attaching client resizes it to the full terminal,
+        // and drop the preview-resize dedup so the next render re-asserts the
+        // preview geometry against the now-grown window instead of leaving the
+        // top clipped.
+        tmux_session.reset_size_to_latest_client();
+        self.home.clear_preview_pane_sync();
+        let (attach_result, attached_status_updates) =
+            self.with_attached_status_hooks(terminal, || tmux_session.attach())?;
+
+        self.needs_redraw = true;
+        crate::tmux::refresh_session_cache();
+        self.home.reload()?;
+        self.home
+            .apply_status_updates_without_hooks(attached_status_updates);
+        // The user just viewed this session (and any turn that finished
+        // during the attach was applied above without the live-send
+        // exemption). Clear its unread marker on return so the round-trip
+        // nets to read.
+        self.home.clear_unread_on_view(session_id);
+        self.home.stamp_last_accessed(session_id);
+        // Persist so the attach-return bump survives aoe restart. Same
+        // reasoning as the send-message path in home/input.rs: without a
+        // save() here the aging signal collapses back to startup timestamps
+        // on next launch.
+        if let Err(e) = self.home.save() {
+            tracing::error!("Failed to save after attach-return: {}", e);
+        }
+        // In Attention sort, jump cursor to the top-attention row instead of
+        // pinning it to the session we just came from; that session has
+        // typically been bumped down a tier (Waiting → Running) and the next
+        // item needing attention is now at row 0.
+        if self.home.sort_order() == crate::session::config::SortOrder::Attention {
+            self.home.select_top_attention(Some(session_id));
+        } else {
+            self.home.select_session_by_id(session_id);
+        }
+
+        if let Err(e) = attach_result {
+            tracing::warn!(target: "tui.input", "tmux attach returned error: {}", e);
+        }
+
+        Ok(())
+    }
+
+    fn attach_terminal(
+        &mut self,
+        session_id: &str,
+        mode: TerminalMode,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
+        let instance = match self.home.get_instance(session_id) {
+            Some(inst) => inst.clone(),
+            None => return Ok(()),
+        };
+
+        // Get terminal size to pass to tmux session creation
+        let size = crate::terminal::get_size();
+
+        // Prepare the tmux session before leaving TUI mode
+        let attach_fn: Box<dyn FnOnce() -> Result<()>> = match mode {
+            TerminalMode::Container if instance.is_sandboxed() => {
+                let container_session = instance.container_terminal_tmux_session()?;
+                if !container_session.exists() || container_session.is_pane_dead() {
+                    if container_session.exists() {
+                        let _ = container_session.kill();
+                    }
+                    if let Err(e) = self
+                        .home
+                        .start_container_terminal_for_instance_with_size(session_id, size)
+                    {
+                        self.home
+                            .set_instance_error(session_id, Some(e.to_string()));
+                        return Ok(());
+                    }
+                }
+                Box::new(move || container_session.attach())
+            }
+            _ => {
+                let terminal_session = instance.terminal_tmux_session()?;
+                if !terminal_session.exists() || terminal_session.is_pane_dead() {
+                    if terminal_session.exists() {
+                        let _ = terminal_session.kill();
+                    }
+                    if let Err(e) = self
+                        .home
+                        .start_terminal_for_instance_with_size(session_id, size)
+                    {
+                        self.home
+                            .set_instance_error(session_id, Some(e.to_string()));
+                        return Ok(());
+                    }
+                }
+                Box::new(move || terminal_session.attach())
+            }
+        };
+
+        let (attach_result, attached_status_updates) =
+            self.with_attached_status_hooks(terminal, attach_fn)?;
+
+        self.needs_redraw = true;
+        crate::tmux::refresh_session_cache();
+        self.home.reload()?;
+        self.home
+            .apply_status_updates_without_hooks(attached_status_updates);
+        if self.home.sort_order() == crate::session::config::SortOrder::Attention {
+            self.home.select_top_attention(Some(session_id));
+        } else {
+            self.home.select_session_by_id(session_id);
+        }
+
+        if let Err(e) = attach_result {
+            tracing::warn!(target: "tui.input", "tmux terminal attach returned error: {}", e);
+        }
+
+        Ok(())
+    }
+
+    fn attach_tool_session(
+        &mut self,
+        session_id: &str,
+        tool_name: &str,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
+        let instance = match self.home.get_instance(session_id) {
+            Some(inst) => inst.clone(),
+            None => return Ok(()),
+        };
+
+        let tool_config = match self.home.tool_configs.get(tool_name) {
+            Some(tc) => tc.clone(),
+            None => return Ok(()),
+        };
+
+        if tool_config.command.is_empty() {
+            self.home.set_instance_error(
+                session_id,
+                Some(format!("Tool '{}' has no command configured", tool_name)),
+            );
+            return Ok(());
+        }
+
+        let size = crate::terminal::get_size();
+        let tool_session = crate::tmux::ToolSession::new(&instance.id, &instance.title, tool_name);
+
+        if !tool_session.exists() || tool_session.is_pane_dead() {
+            if tool_session.exists() {
+                let _ = tool_session.kill();
+            }
+            if let Err(e) = tool_session.create_with_size(
+                &instance.project_path,
+                &tool_config.command,
+                size,
+                &instance.effective_profile(),
+            ) {
+                self.home
+                    .set_instance_error(session_id, Some(e.to_string()));
+                return Ok(());
+            }
+            // A misconfigured tool command (bad flag, missing binary) can
+            // exit near-instantly, leaving a `remain-on-exit`-held dead
+            // pane. Catch that here instead of handing a dead pane to
+            // `attach()`: without the SIGINT guard around the attach, the
+            // user's only way out (Ctrl+C) would kill aoe itself.
+            if let Err(e) = tool_session.wait_until_ready() {
+                self.home
+                    .set_instance_error(session_id, Some(e.to_string()));
+                return Ok(());
+            }
+        }
+
+        let branch = instance
+            .worktree_info
+            .as_ref()
+            .map(|w| w.branch.as_str())
+            .or_else(|| instance.workspace_info.as_ref().map(|w| w.branch.as_str()));
+        crate::tmux::status_bar::apply_all_tmux_options(
+            tool_session.session_name(),
+            &format!("{} ({})", instance.title, tool_name),
+            branch,
+            None,
+            &instance.effective_profile(),
+        );
+
+        let attach_fn: Box<dyn FnOnce() -> Result<()>> = Box::new(move || tool_session.attach());
+        let (attach_result, attached_status_updates) =
+            self.with_attached_status_hooks(terminal, attach_fn)?;
+
+        self.needs_redraw = true;
+        crate::tmux::refresh_session_cache();
+        self.home.reload()?;
+        self.home
+            .apply_status_updates_without_hooks(attached_status_updates);
+        self.home.select_session_by_id(session_id);
+
+        if let Err(e) = attach_result {
+            tracing::warn!(
+                "tmux tool session '{}' attach returned error: {}",
+                tool_name,
+                e
+            );
+        }
+
+        Ok(())
+    }
+
+    fn run_background_tool_session(&mut self, session_id: &str, tool_name: &str) {
+        let instance = match self.home.get_instance(session_id) {
+            Some(inst) => inst.clone(),
+            None => {
+                self.update_status = Some(UpdateStatus::transient(format!(
+                    "Tool '{}' failed: session not found",
+                    tool_name
+                )));
+                return;
+            }
+        };
+
+        let tool_config = match self.home.tool_configs.get(tool_name) {
+            Some(tc) => tc.clone(),
+            None => {
+                self.update_status = Some(UpdateStatus::transient(format!(
+                    "Tool '{}' is not configured",
+                    tool_name
+                )));
+                return;
+            }
+        };
+
+        match spawn_background_tool(
+            session_id,
+            tool_name,
+            &instance.project_path,
+            &tool_config.command,
+        ) {
+            Ok(()) => {
+                self.update_status = Some(UpdateStatus::transient(format!(
+                    "Started background tool: {}",
+                    tool_name
+                )));
+            }
+            Err(e) => {
+                self.update_status = Some(UpdateStatus::transient(format!(
+                    "Failed to start background tool '{}': {}",
+                    tool_name, e
+                )));
+            }
+        }
+    }
+
+    fn edit_file(
+        &mut self,
+        path: &std::path::Path,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
+        // Determine which editor to use (prefer vim, fall back to nano)
+        let editor = std::env::var("EDITOR")
+            .ok()
+            .or_else(|| {
+                // Check if vim is available
+                if std::process::Command::new("vim")
+                    .arg("--version")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok()
+                {
+                    Some("vim".to_string())
+                } else if std::process::Command::new("nano")
+                    .arg("--version")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok()
+                {
+                    Some("nano".to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "vim".to_string());
+
+        let path = path.to_owned();
+        let editor_clone = editor.clone();
+        let status = self.with_raw_mode_disabled(terminal, move || {
+            let mut cmd = std::process::Command::new(&editor_clone);
+            cmd.arg(&path);
+            // The editor runs inside `IgnoreSignalsGuard`'s window; reset
+            // SIGINT/SIGQUIT before exec so it doesn't inherit the ignore
+            // (SIG_IGN survives exec, unlike a caught handler).
+            #[cfg(unix)]
+            crate::process::reset_signals_on_exec(&mut cmd);
+            cmd.status()
+        })?;
+
+        self.needs_redraw = true;
+
+        // Refresh diff view if it's open (file may have changed)
+        if let Some(ref mut diff_view) = self.home.diff_view {
+            if let Err(e) = diff_view.refresh_files() {
+                tracing::warn!(target: "tui.input", "Failed to refresh diff after edit: {}", e);
+            }
+        }
+
+        // Log any editor errors but don't fail
+        if let Err(e) = status {
+            tracing::warn!(target: "tui.input", "Editor '{}' returned error: {}", editor, e);
+        }
+
+        Ok(())
+    }
+}
+
+fn spawn_background_tool(
+    session_id: &str,
+    tool_name: &str,
+    working_dir: &str,
+    command: &str,
+) -> Result<()> {
+    if command.trim().is_empty() {
+        anyhow::bail!("Tool '{}' has no command configured", tool_name);
+    }
+
+    let shell = crate::session::environment::user_shell();
+    let mut child_command = std::process::Command::new(&shell);
+    child_command
+        .arg("-c")
+        .arg(command)
+        .current_dir(working_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        child_command.process_group(0);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+        child_command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    let child = child_command.spawn().with_context(|| {
+        format!(
+            "spawn background tool '{}' with shell '{}'",
+            tool_name, shell
+        )
+    })?;
+    wait_for_background_tool(session_id, tool_name, child);
+    Ok(())
+}
+
+fn wait_for_background_tool(session_id: &str, tool_name: &str, mut child: std::process::Child) {
+    let session_id = session_id.to_string();
+    let tool_name = tool_name.to_string();
+    std::thread::spawn(move || match child.wait() {
+        Ok(status) if status.success() => {
+            tracing::debug!(
+                target: "tui.tools",
+                session_id = %session_id,
+                tool = %tool_name,
+                status = %status,
+                "background tool exited"
+            );
+        }
+        Ok(status) => {
+            tracing::warn!(
+                target: "tui.tools",
+                session_id = %session_id,
+                tool = %tool_name,
+                status = %status,
+                "background tool exited unsuccessfully"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "tui.tools",
+                session_id = %session_id,
+                tool = %tool_name,
+                error = %e,
+                "failed waiting for background tool"
+            );
+        }
+    });
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    Quit,
+    AttachSession(String),
+    AttachTerminal(String, TerminalMode),
+    EditFile(PathBuf),
+    StopSession(String),
+    SetTheme(String),
+    SpawnUpdate(crate::update::install::InstallMethod, String),
+    SetTransientStatus(String),
+    /// Pull the sandbox image after the user accepts the "image update
+    /// available" banner's confirm. Deferred to `execute_action` so the loop
+    /// can show a "pulling…" status before the blocking pull starts.
+    SpawnImagePull(String),
+    /// Send a message to a session. Deferred to `execute_action` (rather
+    /// than handled inline in the dialog Submit branch) so the app loop
+    /// can render a "Reviving..." status before the potentially-slow
+    /// ensure_pane_ready call.
+    SendMessage(String, String),
+    /// Enter live-send mode on a session. Same revive-and-stage pattern
+    /// as `SendMessage`: the deferred action lets the app loop render the
+    /// "Reviving..." toast before `ensure_pane_ready` runs, then the home
+    /// view flips into the live-send capture state for subsequent keys.
+    EnterLiveSend(String),
+    /// Attach to a session that was just created via the synchronous
+    /// create path (no sandbox, no hooks, no worktree). Routes through
+    /// the same `default_attach_mode` dispatch as the async path's
+    /// `apply_creation_results` so the user's "live mode by default"
+    /// setting applies in both cases. `AttachSession` deliberately
+    /// bypasses the setting because pressing Enter on a session row is
+    /// the user's explicit ask for a tmux attach.
+    AttachAfterCreate(String),
+    /// Attach to a tool session (lazygit, yazi, etc.) for the given agent
+    /// session. The tool_name indexes into Config.tools.
+    AttachToolSession(String, String),
+    /// Run a configured tool command without creating or attaching a tmux tool
+    /// session. The command runs in the selected agent session's workdir.
+    RunBackgroundToolSession(String, String),
+    /// Open the native acp view for `session_id`. The action handler
+    /// stashes the id in `pending_structured_view_open`; the main loop drains it
+    /// after `execute_action` returns and runs the async acp loop
+    /// against the borrowed terminal + event stream.
+    #[cfg(feature = "serve")]
+    OpenStructuredView(String),
+    /// Flip a session's persisted view (structured ↔ terminal) through the
+    /// daemon's switch endpoints. Stashed in `pending_view_switch` (the
+    /// POST needs the async loop) and drained alongside
+    /// `pending_structured_view_open`; the daemon persists the change and
+    /// the file watcher refreshes the row.
+    #[cfg(feature = "serve")]
+    SwitchSessionView(String),
+    /// The Yes on the "no daemon running, start a local one?" confirm
+    /// shown when opening a structured view. Stashed in
+    /// `pending_daemon_start_open` (spawn + health wait must be
+    /// awaited) and drained alongside the other structured stashes.
+    #[cfg(feature = "serve")]
+    StartDaemonThenOpenStructured(String),
+    /// On-demand "Auto-name now" for a structured session. Stashed in
+    /// `pending_smart_rename` (the daemon POST needs the async loop) and
+    /// drained alongside the other structured stashes (#3039).
+    #[cfg(feature = "serve")]
+    SmartRenameNow(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telemetry::SendOutcome;
+    use std::sync::atomic::Ordering;
+
+    /// Query a signal's current disposition without leaving it changed:
+    /// `sigaction` always both sets and returns the previous value, so we
+    /// immediately set it back to what we just read.
+    #[cfg(unix)]
+    fn current_disposition(signal: nix::sys::signal::Signal) -> nix::sys::signal::SigHandler {
+        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet};
+
+        let probe = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+        // SAFETY: test-only probe; SIG_DFL is async-signal-safe per POSIX,
+        // the only requirement for sigaction calls outside a signal handler.
+        let prev = unsafe { sigaction(signal, &probe) }.expect("sigaction query");
+        // SAFETY: see above; restoring what was just read is likewise safe.
+        unsafe { sigaction(signal, &prev) }.expect("sigaction restore");
+        prev.handler()
+    }
+
+    #[cfg(unix)]
+    fn same_disposition(a: nix::sys::signal::SigHandler, b: nix::sys::signal::SigHandler) -> bool {
+        use nix::sys::signal::SigHandler;
+        match (a, b) {
+            (SigHandler::SigDfl, SigHandler::SigDfl) => true,
+            (SigHandler::SigIgn, SigHandler::SigIgn) => true,
+            (SigHandler::Handler(f1), SigHandler::Handler(f2)) => f1 as usize == f2 as usize,
+            _ => false,
+        }
+    }
+
+    /// A failed replacement must not consume the previous view's draft.
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(feature = "serve")]
+    async fn drain_paste_forwards_to_the_mounted_view_and_keeps_other_targets() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let mut app = App::new(
+            "test",
+            crate::tmux::AvailableTools::with_tools(&["claude"]),
+            true,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .expect("app");
+        app.home
+            .pending_paste_for_structured_view
+            .insert("s-1".into(), "buffered draft".into());
+        app.home
+            .pending_paste_for_structured_view
+            .insert("s-2".into(), "other target".into());
+        app.home.structured_preview =
+            Some(crate::tui::structured_view::embedded::EmbeddedView::for_test("s-1"));
+
+        // A failed attempt to mount s-2 can leave s-1 mounted.
+        app.drain_pending_paste_for_structured_view("s-2").await;
+        assert_eq!(
+            app.home
+                .structured_preview
+                .as_ref()
+                .unwrap()
+                .composer_text(),
+            ""
+        );
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get("s-1")
+                .map(String::as_str),
+            Some("buffered draft"),
+        );
+
+        app.drain_pending_paste_for_structured_view("s-1").await;
+        app.drain_pending_paste_for_structured_view("s-1").await;
+
+        let preview = app.home.structured_preview.as_ref().expect("mounted");
+        assert_eq!(
+            preview.composer_text(),
+            "buffered draft",
+            "the captured buffer must land in the mounted composer"
+        );
+        assert_eq!(
+            app.home.pending_paste_for_structured_view.get("s-1"),
+            None,
+            "a forwarded buffer must be consumed"
+        );
+        assert_eq!(
+            app.home.pending_paste_for_structured_view.get("s-2"),
+            Some(&"other target".to_string()),
+            "another target's unsent draft must survive the drain"
+        );
+    }
+
+    // Signal disposition is process-global state, so this must not run
+    // concurrently with any other test that installs a handler for
+    // SIGINT/SIGQUIT.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn ignore_signals_guard_installs_sig_ign_and_restores_prior_disposition() {
+        use nix::sys::signal::{SigHandler, Signal};
+
+        let baseline_sigint = current_disposition(Signal::SIGINT);
+        let baseline_sigquit = current_disposition(Signal::SIGQUIT);
+
+        let guard = IgnoreSignalsGuard::new();
+        assert!(
+            same_disposition(current_disposition(Signal::SIGINT), SigHandler::SigIgn),
+            "SIGINT should be ignored while the guard is alive"
+        );
+        assert!(
+            same_disposition(current_disposition(Signal::SIGQUIT), SigHandler::SigIgn),
+            "SIGQUIT should be ignored while the guard is alive"
+        );
+
+        drop(guard);
+
+        assert!(
+            same_disposition(current_disposition(Signal::SIGINT), baseline_sigint),
+            "SIGINT disposition should be restored after the guard drops"
+        );
+        assert!(
+            same_disposition(current_disposition(Signal::SIGQUIT), baseline_sigquit),
+            "SIGQUIT disposition should be restored after the guard drops"
+        );
+    }
+
+    /// The theme idempotency guard must treat both the name AND the palette
+    /// mode as part of the theme identity, and report "no change" only when
+    /// both match. This is what keeps a config-file-watcher theme re-dispatch
+    /// (fired on every `config.toml` save: sidebar-collapse persistence, list
+    /// resize, `i`, settings) from forcing a flickering full-screen clear.
+    #[test]
+    fn theme_apply_needed_compares_name_and_palette_mode() {
+        assert!(
+            !theme_apply_needed(("empire", false), ("empire", false)),
+            "identical name + mode is a no-op (no redraw, no clear)"
+        );
+        assert!(
+            theme_apply_needed(("empire", false), ("zinc", false)),
+            "a different name must re-apply"
+        );
+        assert!(
+            theme_apply_needed(("empire", false), ("empire", true)),
+            "a different palette mode must re-apply even with the same name"
+        );
+    }
+
+    #[test]
+    fn tui_activity_marker_is_not_rewritten_for_every_key() {
+        let start = std::time::Instant::now();
+        assert!(!tui_activity_write_due(start, start));
+        assert!(!tui_activity_write_due(
+            start,
+            start + TUI_ACTIVITY_REFRESH_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(tui_activity_write_due(
+            start,
+            start + TUI_ACTIVITY_REFRESH_INTERVAL
+        ));
+    }
+
+    /// The pre-draw `cursor::Hide` is skipped only in the one state that
+    /// visibly flickers on non-synchronized-update terminals: live-send active
+    /// with no overlay or preview selection on top of it. Any local overlay,
+    /// preview selection, or non-live-send state keeps the Hide.
+    #[test]
+    fn skip_predraw_cursor_hide_only_in_live_send_without_overlay_or_selection() {
+        assert!(
+            skip_predraw_cursor_hide(true, false, false),
+            "live-send with no overlay must skip the pre-draw Hide (the fix)"
+        );
+        assert!(
+            !skip_predraw_cursor_hide(true, true, false),
+            "live-send with an overlay open must keep the Hide for IME protection"
+        );
+        assert!(
+            !skip_predraw_cursor_hide(true, false, true),
+            "live-send with a preview selection must hide the blinking cursor"
+        );
+        assert!(
+            !skip_predraw_cursor_hide(false, false, false),
+            "outside live-send the Hide must stay unchanged"
+        );
+        assert!(
+            !skip_predraw_cursor_hide(false, true, false),
+            "outside live-send with an overlay the Hide must stay unchanged"
+        );
+    }
+
+    #[test]
+    fn frozen_preview_ignores_preview_only_refresh_signals() {
+        let cases = [
+            // Either event-driven preview source draws while following output.
+            (true, false, false, true),
+            (false, true, false, true),
+            // The same sources stay quiet while selection/scrollback freezes it.
+            (true, false, true, false),
+            (false, true, true, false),
+            // No source means no draw in either state.
+            (false, false, false, false),
+            (false, false, true, false),
+        ];
+        for (post_key, preview, frozen, expected) in cases {
+            assert_eq!(
+                preview_signals_need_refresh(post_key, preview, frozen),
+                expected,
+                "post_key={post_key}, preview={preview}, frozen={frozen}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_owners_skip_paste_probe_except_under_mosh() {
+        let cases = [
+            // Home-list text can trigger shortcuts, so it keeps look-ahead.
+            (true, false, false, false, true),
+            // Dialog/live-send and the embedded composer own every character.
+            (true, false, true, false, false),
+            (true, false, false, true, false),
+            // Mosh strips bracketed-paste markers, so safe surfaces still probe.
+            (true, true, true, false, true),
+            (true, true, false, true, true),
+            // A surface that cannot route a burst never probes in any mode.
+            (false, false, false, false, false),
+            (false, true, false, false, false),
+        ];
+        for (wants, mosh, dialog, embedded, expected) in cases {
+            assert_eq!(
+                paste_burst_probe_needed(wants, mosh, dialog, embedded),
+                expected,
+                "wants={wants}, mosh={mosh}, dialog={dialog}, embedded={embedded}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_edge_scroll_waits_for_fresh_capture_but_state_changes_draw() {
+        assert!(skip_immediate_live_scroll_draw(true, true, false, false));
+        assert!(
+            !skip_immediate_live_scroll_draw(true, true, true, false),
+            "clearing a frozen selection must repaint immediately"
+        );
+        assert!(
+            !skip_immediate_live_scroll_draw(true, true, false, true),
+            "entering local scrollback must repaint immediately"
+        );
+        assert!(!skip_immediate_live_scroll_draw(false, true, false, false));
+        assert!(!skip_immediate_live_scroll_draw(true, false, false, false));
+    }
+
+    // The TUI create counter is a process-global static, so these tests mutate
+    // shared state. `#[serial]` (with the `telemetry_creates` group key) keeps
+    // them from racing each other; each resets the counter to a known base
+    // first rather than assuming a clean start.
+    fn reset_creates(to: u32) {
+        TUI_SESSION_CREATES.store(to, Ordering::Relaxed);
+    }
+
+    // #1897: a confirmed send clears only what the snapshot reported, so a create
+    // that lands between the snapshot build and the confirmed send survives into
+    // the next snapshot instead of being reset away. Mirrors the serve-side
+    // `reported_count_decrement_preserves_concurrent_increments`.
+    #[test]
+    #[serial_test::serial(telemetry_creates)]
+    fn create_counter_clear_preserves_in_flight_create() {
+        reset_creates(0);
+        record_session_create();
+        record_session_create();
+        record_session_create();
+        // The snapshot reported the 3 creates seen at build time.
+        let reported = reported_session_creates();
+        assert_eq!(reported, 3);
+        // One more create lands while the snapshot is in flight.
+        record_session_create();
+        clear_reported_session_creates(reported, SendOutcome::Sent);
+        assert_eq!(
+            TUI_SESSION_CREATES.load(Ordering::Relaxed),
+            1,
+            "the create that arrived during the send must be retained"
+        );
+    }
+
+    // A failed or deduped send must retain the full count so the next snapshot
+    // re-reports it; only a confirmed `Sent` consumes the reported value.
+    #[test]
+    #[serial_test::serial(telemetry_creates)]
+    fn create_counter_clear_retains_on_unconfirmed_send() {
+        for outcome in [SendOutcome::Failed, SendOutcome::Deduped] {
+            reset_creates(0);
+            record_session_create();
+            record_session_create();
+            let reported = reported_session_creates();
+            clear_reported_session_creates(reported, outcome);
+            assert_eq!(
+                TUI_SESSION_CREATES.load(Ordering::Relaxed),
+                2,
+                "{outcome:?} must retain the count for the next snapshot"
+            );
+        }
+    }
+
+    // A zero report is a no-op, and the decrement saturates rather than
+    // underflow-wrapping the AtomicU32 (cheap insurance against a future
+    // double-clear), mirroring the serve saturation test.
+    #[test]
+    #[serial_test::serial(telemetry_creates)]
+    fn create_counter_clear_is_noop_for_zero_and_saturates() {
+        reset_creates(3);
+        clear_reported_session_creates(0, SendOutcome::Sent);
+        assert_eq!(TUI_SESSION_CREATES.load(Ordering::Relaxed), 3);
+
+        reset_creates(2);
+        clear_reported_session_creates(5, SendOutcome::Sent);
+        assert_eq!(TUI_SESSION_CREATES.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn image_banner_shows_only_when_it_owns_the_row() {
+        // The plain case: an image update is pending and nothing outranks it.
+        assert!(should_show_image_banner(true, false, false, false));
+        // No pending update: nothing to show.
+        assert!(!should_show_image_banner(false, false, false, false));
+        // The app-update banner and any transient toast both outrank it.
+        assert!(!should_show_image_banner(true, true, false, false));
+        assert!(!should_show_image_banner(true, false, true, false));
+    }
+
+    #[test]
+    fn image_banner_stays_hidden_while_its_own_pull_runs() {
+        // #2072: once the user accepts the pull, the banner must stay down for
+        // the whole `docker pull`. Even after the "pulling…" toast clears
+        // (has_status = false) the in-flight pull keeps the banner hidden, so it
+        // can't redraw under the pull and re-arm `u` into "pull already in
+        // progress".
+        assert!(!should_show_image_banner(true, false, false, true));
+        assert!(!should_show_image_banner(true, false, true, true));
+    }
+
+    #[test]
+    fn ctrl_q_never_quits() {
+        // The whole point of #1569: Ctrl+Q is a live-mode-exit habit and
+        // must not close aoe from the home view, regardless of the other
+        // flags.
+        for creation_pending in [false, true] {
+            for confirm in [false, true] {
+                assert_eq!(
+                    quit_intent(KeyModifiers::CONTROL, creation_pending, confirm),
+                    QuitIntent::Ignore,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plain_q_quits_when_confirm_disabled() {
+        assert_eq!(
+            quit_intent(KeyModifiers::NONE, false, false),
+            QuitIntent::Quit,
+        );
+    }
+
+    #[test]
+    fn plain_q_confirms_when_enabled() {
+        assert_eq!(
+            quit_intent(KeyModifiers::NONE, false, true),
+            QuitIntent::Confirm,
+        );
+    }
+
+    #[test]
+    fn creation_pending_confirms_before_anything_else() {
+        // Creation-in-progress takes precedence over the quit confirm so
+        // the user is warned the hook will be cancelled.
+        assert_eq!(
+            quit_intent(KeyModifiers::NONE, true, true),
+            QuitIntent::ConfirmDuringCreation,
+        );
+        assert_eq!(
+            quit_intent(KeyModifiers::NONE, true, false),
+            QuitIntent::ConfirmDuringCreation,
+        );
+    }
+
+    #[test]
+    fn heartbeat_wins_when_both_disk_paths_are_ready() {
+        assert_eq!(
+            decide_disk_refresh(true, true, true),
+            DiskRefreshDecision::Heartbeat,
+            "when live-idle and both heartbeat and watcher are ready, the full reload wins"
+        );
+        assert_eq!(
+            decide_disk_refresh(true, true, false),
+            DiskRefreshDecision::Heartbeat,
+            "heartbeat fires even without a watcher kick"
+        );
+        assert_eq!(
+            decide_disk_refresh(true, false, true),
+            DiskRefreshDecision::Watcher,
+            "watcher kick alone fires the storage-only path"
+        );
+        assert_eq!(
+            decide_disk_refresh(true, false, false),
+            DiskRefreshDecision::None,
+            "no inputs ready yields no refresh"
+        );
+    }
+
+    #[test]
+    fn live_send_blocks_every_decision_branch() {
+        // The pure helper must return None for every (heartbeat_due,
+        // dirty) combination when live-send is on. Latch preservation is
+        // the caller's responsibility (see
+        // `caller_gating_preserves_dirty_latch_during_live_send`).
+        for &heartbeat in &[false, true] {
+            for &dirty in &[false, true] {
+                assert_eq!(
+                    decide_disk_refresh(false, heartbeat, dirty),
+                    DiskRefreshDecision::None,
+                    "live_send must block refresh (heartbeat={heartbeat}, dirty={dirty})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn caller_gating_preserves_dirty_latch_during_live_send() {
+        // Mirrors the gating logic in the tick loop: only consume the
+        // latch when live_idle is true. A watcher kick that arrived
+        // during live-send must remain observable on the next eligible
+        // tick.
+        let dirty_atomic = std::sync::atomic::AtomicBool::new(true);
+        let live_idle = false;
+        let _dirty = if live_idle {
+            dirty_atomic.swap(false, std::sync::atomic::Ordering::Acquire)
+        } else {
+            false
+        };
+        assert!(
+            dirty_atomic.load(std::sync::atomic::Ordering::Acquire),
+            "live_send tick must NOT consume the dirty latch; it must persist for the next tick"
+        );
+    }
+
+    #[test]
+    fn config_refresh_kick_is_gated_by_live_send() {
+        let dirty = std::sync::atomic::AtomicBool::new(true);
+        assert!(
+            !take_config_refresh_kick(false, &dirty),
+            "live-send must defer config refreshes"
+        );
+        assert!(
+            dirty.load(std::sync::atomic::Ordering::Acquire),
+            "live-send must leave config_dirty latched for the next eligible tick"
+        );
+    }
+
+    #[test]
+    fn config_refresh_and_disk_refresh_can_coexist_in_one_tick() {
+        let config_dirty = std::sync::atomic::AtomicBool::new(true);
+        let disk_dirty = std::sync::atomic::AtomicBool::new(true);
+
+        let config_kick = take_config_refresh_kick(true, &config_dirty);
+        // Mirrors the tick-loop gating: live_idle is true here, so the
+        // caller swaps the latch and passes the consumed value to the
+        // pure helper.
+        let dirty = disk_dirty.swap(false, std::sync::atomic::Ordering::Acquire);
+        let disk_decision = decide_disk_refresh(true, true, dirty);
+
+        assert!(config_kick, "config refresh must be scheduled first");
+        assert_eq!(disk_decision, DiskRefreshDecision::Heartbeat);
+        assert!(!config_dirty.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!disk_dirty.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_action_enum() {
+        let quit = Action::Quit;
+        let attach = Action::AttachSession("test-id".to_string());
+        let attach_terminal =
+            Action::AttachTerminal("test-id".to_string(), TerminalMode::Container);
+
+        assert_eq!(quit, Action::Quit);
+        assert_eq!(attach, Action::AttachSession("test-id".to_string()));
+        assert_eq!(
+            attach_terminal,
+            Action::AttachTerminal("test-id".to_string(), TerminalMode::Container)
+        );
+    }
+
+    #[test]
+    fn test_action_clone() {
+        let original = Action::AttachSession("session-123".to_string());
+        let cloned = original.clone();
+        assert_eq!(original, cloned);
+
+        let terminal_action = Action::AttachTerminal("session-123".to_string(), TerminalMode::Host);
+        let terminal_cloned = terminal_action.clone();
+        assert_eq!(terminal_action, terminal_cloned);
+    }
+
+    #[test]
+    fn test_poll_update_check_returns_true_when_update_available() {
+        // Create a oneshot channel and send an update notification
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let update_info = UpdateInfo {
+            available: true,
+            current_version: "0.4.0".to_string(),
+            latest_version: "0.5.0".to_string(),
+        };
+        tx.send(Ok(update_info)).unwrap();
+
+        // poll_update_receiver should return true when an update is available
+        let (info, rx_out, received) = poll_update_receiver(Some(rx), None);
+        assert!(received);
+        assert!(info.is_some());
+        assert_eq!(info.as_ref().unwrap().latest_version, "0.5.0");
+        assert!(rx_out.is_none()); // Channel consumed
+    }
+
+    #[test]
+    fn test_poll_update_check_returns_false_when_no_update() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let update_info = UpdateInfo {
+            available: false,
+            current_version: "0.5.0".to_string(),
+            latest_version: "0.5.0".to_string(),
+        };
+        tx.send(Ok(update_info)).unwrap();
+
+        // poll_update_receiver should return false when no update available
+        let (info, rx_out, received) = poll_update_receiver(Some(rx), None);
+        assert!(!received);
+        assert!(info.is_none());
+        assert!(rx_out.is_none()); // Channel consumed even though no update
+    }
+
+    #[test]
+    fn test_poll_update_check_returns_false_when_channel_empty() {
+        let (_tx, rx) = tokio::sync::oneshot::channel::<anyhow::Result<UpdateInfo>>();
+
+        // poll_update_receiver should return false when channel is empty
+        let (info, rx_out, received) = poll_update_receiver(Some(rx), None);
+        assert!(!received);
+        assert!(info.is_none());
+        // Receiver should be put back for next poll
+        assert!(rx_out.is_some());
+    }
+
+    #[test]
+    fn periodic_recheck_fires_after_interval_elapses() {
+        // The dominant bug (#1471): the original code spawned the update check
+        // only once at startup. After the configured interval has passed in a
+        // long-running TUI, the loop must spawn a fresh check.
+        let interval = Duration::from_secs(24 * 3600);
+        assert!(should_spawn_periodic_update_check(
+            Some(interval + Duration::from_secs(1)),
+            interval,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn periodic_recheck_holds_within_interval() {
+        let interval = Duration::from_secs(24 * 3600);
+        assert!(!should_spawn_periodic_update_check(
+            Some(interval - Duration::from_secs(1)),
+            interval,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn periodic_recheck_skips_when_in_flight() {
+        // Don't queue a second check while one is already running; the existing
+        // one will deliver its result on the oneshot channel and the next tick
+        // after that can fire normally.
+        let interval = Duration::from_secs(24 * 3600);
+        assert!(!should_spawn_periodic_update_check(
+            Some(interval + Duration::from_secs(1)),
+            interval,
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn periodic_recheck_skips_when_mode_disabled() {
+        // update_check_mode = "off" should suppress both startup and periodic
+        // checks. Mirror the gate at startup.
+        let interval = Duration::from_secs(24 * 3600);
+        assert!(!should_spawn_periodic_update_check(
+            Some(interval + Duration::from_secs(1)),
+            interval,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn periodic_recheck_fires_immediately_when_never_checked_and_mode_enabled() {
+        // User started with mode=off, toggled to notify/auto mid-session. The
+        // first guard tick after toggle should fire without waiting another
+        // full `PERIODIC_RECHECK_INTERVAL` from process launch.
+        let interval = Duration::from_secs(24 * 3600);
+        assert!(should_spawn_periodic_update_check(
+            None, interval, false, true,
+        ));
+    }
+
+    #[test]
+    fn periodic_recheck_skips_when_never_checked_but_mode_disabled() {
+        // Symmetric: a None elapsed does not override the mode gate. Mode=off
+        // still wins.
+        let interval = Duration::from_secs(24 * 3600);
+        assert!(!should_spawn_periodic_update_check(
+            None, interval, false, false,
+        ));
+    }
+
+    #[test]
+    fn periodic_recheck_fires_at_interval_boundary() {
+        // `>=`, not `>`. The tick fires at the interval mark, not
+        // interval + epsilon.
+        let interval = Duration::from_secs(3600);
+        assert!(should_spawn_periodic_update_check(
+            Some(interval),
+            interval,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn test_poll_update_check_preserves_existing_info() {
+        // If we already have update info and the channel is closed, preserve the existing info
+        let existing_info = UpdateInfo {
+            available: true,
+            current_version: "0.4.0".to_string(),
+            latest_version: "0.5.0".to_string(),
+        };
+
+        // No receiver, just existing info
+        let (info, rx_out, received) = poll_update_receiver(None, Some(existing_info));
+        assert!(!received); // No new update received
+        assert!(info.is_some()); // But existing info is preserved
+        assert_eq!(info.as_ref().unwrap().latest_version, "0.5.0");
+        assert!(rx_out.is_none());
+    }
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn burst_candidate_accepts_printable_chars_and_enter() {
+        assert!(App::is_burst_candidate(&key(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE
+        )));
+        assert!(App::is_burst_candidate(&key(
+            KeyCode::Char(' '),
+            KeyModifiers::NONE
+        )));
+        assert!(App::is_burst_candidate(&key(
+            KeyCode::Char('A'),
+            KeyModifiers::SHIFT
+        )));
+        assert!(App::is_burst_candidate(&key(
+            KeyCode::Enter,
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn burst_candidate_rejects_modified_chords_and_nav_keys() {
+        // Ctrl/Alt chords are intentional shortcuts, never paste burst chars.
+        assert!(!App::is_burst_candidate(&key(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!App::is_burst_candidate(&key(
+            KeyCode::Char('b'),
+            KeyModifiers::ALT
+        )));
+        // Navigation/control keys are not burst candidates.
+        assert!(!App::is_burst_candidate(&key(
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        )));
+        assert!(!App::is_burst_candidate(&key(
+            KeyCode::Tab,
+            KeyModifiers::NONE
+        )));
+        assert!(!App::is_burst_candidate(&key(
+            KeyCode::Up,
+            KeyModifiers::NONE
+        )));
+        assert!(!App::is_burst_candidate(&key(
+            KeyCode::Backspace,
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn auto_repeat_burst_rejects_held_navigation_but_not_pasted_text() {
+        let cases = [
+            (
+                vec![
+                    key(KeyCode::Char('j'), KeyModifiers::NONE),
+                    key(KeyCode::Char('j'), KeyModifiers::NONE),
+                    key(KeyCode::Char('j'), KeyModifiers::NONE),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    key(KeyCode::Char('k'), KeyModifiers::NONE),
+                    key(KeyCode::Char('k'), KeyModifiers::NONE),
+                    key(KeyCode::Char('k'), KeyModifiers::NONE),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    KeyEvent::new_with_kind(
+                        KeyCode::Char('j'),
+                        KeyModifiers::NONE,
+                        KeyEventKind::Press,
+                    ),
+                    KeyEvent::new_with_kind(
+                        KeyCode::Char('j'),
+                        KeyModifiers::NONE,
+                        KeyEventKind::Repeat,
+                    ),
+                    KeyEvent::new_with_kind(
+                        KeyCode::Char('j'),
+                        KeyModifiers::NONE,
+                        KeyEventKind::Repeat,
+                    ),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    key(KeyCode::Char('p'), KeyModifiers::NONE),
+                    key(KeyCode::Char('a'), KeyModifiers::NONE),
+                    key(KeyCode::Char('s'), KeyModifiers::NONE),
+                    key(KeyCode::Char('t'), KeyModifiers::NONE),
+                    key(KeyCode::Char('e'), KeyModifiers::NONE),
+                ],
+                false,
+            ),
+        ];
+        for (keys, expected) in cases {
+            assert_eq!(App::is_auto_repeat_burst(&keys), expected, "{keys:?}");
+        }
+    }
+
+    #[test]
+    fn burst_char_for_matches_is_burst_candidate_domain() {
+        // Contract: any key that passes is_burst_candidate must also yield
+        // Some from burst_char_for, otherwise the event-loop's expect() panics.
+        let candidates = [
+            key(KeyCode::Char('a'), KeyModifiers::NONE),
+            key(KeyCode::Char(' '), KeyModifiers::NONE),
+            key(KeyCode::Char('A'), KeyModifiers::SHIFT),
+            key(KeyCode::Char('~'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+        ];
+        for k in &candidates {
+            assert!(App::is_burst_candidate(k));
+            assert!(
+                App::burst_char_for(k).is_some(),
+                "burst_char_for must agree with is_burst_candidate for {:?}",
+                k
+            );
+        }
+        assert_eq!(
+            App::burst_char_for(&key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some('\n'),
+            "Enter must map to \\n so embedded sentence-breaks land in the burst"
+        );
+    }
+
+    #[test]
+    fn split_trailing_enter_peels_terminating_enter() {
+        // Regression: typing "hi<Enter>" with <5ms key gaps used to land
+        // as a single burst whose string `"hi\n"` was forwarded to
+        // handle_paste, so the textarea inserted `\n` as data and the
+        // dialog's Submit branch never fired. Peel the trailing Enter
+        // so handle_paste sees `"hi"` and we replay Enter for Submit.
+        let burst_keys = vec![
+            key(KeyCode::Char('h'), KeyModifiers::NONE),
+            key(KeyCode::Char('i'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+        ];
+        let (paste, enter) = App::split_trailing_enter("hi\n", &burst_keys);
+        assert_eq!(paste, "hi");
+        assert!(enter.is_some());
+        assert_eq!(enter.unwrap().code, KeyCode::Enter);
+    }
+
+    #[test]
+    fn split_trailing_enter_preserves_embedded_newlines() {
+        // Voice/dictation pastes with sentence breaks land embedded
+        // Enters in the burst. Those are data, not intent-to-submit.
+        // Only the trailing Enter is peeled.
+        let burst_keys = vec![
+            key(KeyCode::Char('a'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            key(KeyCode::Char('b'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+        ];
+        let (paste, enter) = App::split_trailing_enter("a\nb\n", &burst_keys);
+        assert_eq!(paste, "a\nb");
+        assert!(enter.is_some());
+    }
+
+    #[test]
+    fn split_trailing_enter_keeps_mid_burst_enter_when_burst_ends_on_char() {
+        // Burst ends on a printable char, so there is no trailing Enter to peel.
+        // The embedded Enter stays in the paste text.
+        let burst_keys = vec![
+            key(KeyCode::Char('h'), KeyModifiers::NONE),
+            key(KeyCode::Char('i'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            key(KeyCode::Char('t'), KeyModifiers::NONE),
+            key(KeyCode::Char('h'), KeyModifiers::NONE),
+            key(KeyCode::Char('e'), KeyModifiers::NONE),
+            key(KeyCode::Char('r'), KeyModifiers::NONE),
+            key(KeyCode::Char('e'), KeyModifiers::NONE),
+        ];
+        let (paste, enter) = App::split_trailing_enter("hi\nthere", &burst_keys);
+        assert_eq!(paste, "hi\nthere");
+        assert!(enter.is_none());
+    }
+
+    #[test]
+    fn split_trailing_enter_no_enter_at_all() {
+        let burst_keys = vec![
+            key(KeyCode::Char('a'), KeyModifiers::NONE),
+            key(KeyCode::Char('b'), KeyModifiers::NONE),
+            key(KeyCode::Char('c'), KeyModifiers::NONE),
+        ];
+        let (paste, enter) = App::split_trailing_enter("abc", &burst_keys);
+        assert_eq!(paste, "abc");
+        assert!(enter.is_none());
+    }
+
+    #[test]
+    fn split_trailing_enter_single_enter_yields_empty_paste() {
+        // Pathological: burst is just an Enter. paste_text is empty;
+        // caller skips handle_paste and only replays the Enter so
+        // Submit fires on whatever is in the textarea.
+        let burst_keys = vec![key(KeyCode::Enter, KeyModifiers::NONE)];
+        let (paste, enter) = App::split_trailing_enter("\n", &burst_keys);
+        assert_eq!(paste, "");
+        assert!(enter.is_some());
+    }
+
+    #[test]
+    fn split_trailing_enter_consecutive_trailing_enters_only_peels_last() {
+        // Two trailing Enters: keep the first as data (the user's
+        // intentional blank-line break) and peel only the last for
+        // Submit.
+        let burst_keys = vec![
+            key(KeyCode::Char('h'), KeyModifiers::NONE),
+            key(KeyCode::Char('i'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+        ];
+        let (paste, enter) = App::split_trailing_enter("hi\n\n", &burst_keys);
+        assert_eq!(paste, "hi\n");
+        assert!(enter.is_some());
+    }
+}

@@ -1,0 +1,337 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  # No branch filter: a stacked PR targets its parent branch rather than main,
+  # and a base filter would leave every PR but the bottom of the stack with no
+  # checks at all.
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy -- -D warnings
+      - name: file_watch consolidation guard
+        run: |
+          set -euo pipefail
+          hits="$(grep -rl 'notify::recommended_watcher' src/ || true)"
+          unexpected="$(printf '%s\n' "$hits" | grep -v '^src/file_watch.rs$' | grep . || true)"
+          if [ -n "$unexpected" ]; then
+            echo "::error::New notify::recommended_watcher found outside src/file_watch.rs:"
+            printf '%s\n' "$unexpected"
+            exit 1
+          fi
+
+  web-fmt:
+    name: Format (web)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        working-directory: web
+        run: npm ci
+      - name: Check formatting
+        working-directory: web
+        run: npm run format:check
+
+  eslint:
+    name: ESLint (web)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        working-directory: web
+        run: npm ci
+      - name: Run ESLint
+        working-directory: web
+        run: npm run lint
+
+  deny:
+    name: Supply Chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check CLI docs are up-to-date
+        run: |
+          mkdir -p target/ci-web-dist
+          printf '<!doctype html><title>aoe docs placeholder</title>\n' > target/ci-web-dist/index.html
+          AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo xtask gen-docs
+          git diff --exit-code docs/cli/reference.md \
+            || (echo "::error::CLI docs are out of date. Run 'cargo xtask gen-docs' and commit." && exit 1)
+      - name: Check rustdoc is warning-clean
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: |
+          mkdir -p target/ci-web-dist
+          printf '<!doctype html><title>aoe docs placeholder</title>\n' > target/ci-web-dist/index.html
+          AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo doc --no-deps --features serve
+
+  skill:
+    name: Skill Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check skill file references valid CLI commands
+        run: cargo xtask check-skill
+
+  build-cache-selftest:
+    name: Build Cache Self-Test
+    runs-on: ubuntu-latest
+    # Guards the zero-copy threshold checker that the kache verify script
+    # relies on (scripts/verify-shared-target.sh). No cargo, no kache, no
+    # toolchain: feeds a known reflinked report and a known all-copies report
+    # through the checker and asserts it accepts the first and rejects the
+    # second. Runs in seconds.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/verify-shared-target.sh --self-test
+
+  nix:
+    name: Nix Eval
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Runs before Nix is even installed: no toolchain, a couple of seconds, and
+      # it covers the failure class from #3204 (an embedded asset dropped by the
+      # Cargo source filter) on EVERY PR, which is why the compile-based Nix
+      # Build job below only has to fire when the flake recipe itself changes.
+      - name: Check embedded assets survive the Nix source filter
+        run: |
+          set -euo pipefail
+          python3 scripts/check-nix-embedded-assets.py --self-test
+          python3 scripts/check-nix-embedded-assets.py
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+      - name: Evaluate flake outputs (all systems)
+        run: |
+          set -euo pipefail
+          nix --version
+
+          echo "=== Flake metadata ==="
+          nix flake metadata
+
+          echo ""
+          echo "=== Flake structure ==="
+          nix flake show --all-systems
+
+          SYSTEMS="x86_64-linux aarch64-linux aarch64-darwin"
+
+          echo ""
+          echo "=== Evaluating packages for all systems ==="
+          for system in $SYSTEMS; do
+            echo ""
+            echo "--- $system ---"
+            for pkg in default aoe-with-web; do
+              printf "  %s: " "$pkg"
+              if output=$(nix eval ".#packages.$system.$pkg.drvPath" --raw 2>&1); then
+                echo "✓"
+              else
+                echo "✗"
+                echo "::error::Evaluation failed for packages.$system.$pkg"
+                echo "$output"
+                exit 1
+              fi
+            done
+          done
+
+          echo ""
+          echo "=== Evaluating devShells for all systems ==="
+          for system in $SYSTEMS; do
+            printf "%s: " "$system"
+            if output=$(nix eval ".#devShells.$system.default.drvPath" --raw 2>&1); then
+              echo "✓"
+            else
+              echo "✗"
+              echo "::error::Evaluation failed for devShells.$system.default"
+              echo "$output"
+              exit 1
+            fi
+          done
+
+          echo ""
+          echo "=== All evaluations passed ==="
+
+  nix-build:
+    name: Nix Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Builds the default (aoe) crate through crane. Nix Eval only evaluates
+    # derivations, so a flake recipe that compiles nowhere (a bad source filter,
+    # a missing buildInput) passes it but fails here.
+    #
+    # Gated to the flake recipe itself, and deliberately NOT to `src/**`. This is
+    # a ~20 minute compile with no binary cache, so firing it on every Rust PR
+    # would roughly triple the CI critical path. The one code-driven way to break
+    # the build source, adding an embedded asset the Cargo filter drops (#3204),
+    # is covered on every PR by the seconds-long
+    # `scripts/check-nix-embedded-assets.py` step in Nix Eval. Post-merge,
+    # cachix-push.yml builds a Rust package on every push to main matching
+    # `src/**`, `Cargo.*`, the build scripts or an embedded-asset directory
+    # (see its `paths:` list), so wider breakage still surfaces there.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect relevant changes
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            BASE="origin/$BASE_REF"
+          else
+            # `before` is the pre-push SHA (covers multi-commit pushes); fall
+            # back to the empty tree on the initial push where it is all-zero.
+            if [ -z "$EVENT_BEFORE" ] || [ "$EVENT_BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              BASE=$(git hash-object -t tree /dev/null)
+            else
+              BASE="$EVENT_BEFORE"
+            fi
+          fi
+          # Only the flake recipe: `flake.nix` carries the source filter, the
+          # buildInputs and the package definitions, and `flake.lock` pins
+          # nixpkgs and crane. A change to either can break the build in a way
+          # evaluation cannot see, and neither is touched by an ordinary PR.
+          # A git failure here would leave the pipeline non-zero and skip the
+          # build, so keep the diff simple enough that it cannot fail.
+          if git diff --name-only "$BASE"...HEAD \
+            | grep -E '^(flake\.nix|flake\.lock)$' \
+            >/dev/null; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+        if: steps.changes.outputs.relevant == 'true'
+
+      - name: Build default package
+        if: steps.changes.outputs.relevant == 'true'
+        run: nix build --no-link --print-out-paths -L .#packages.x86_64-linux.default
+
+  nix-build-web:
+    name: Nix Build Web
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Catches npmDepsHash desync at PR time even if the nix-npm-hash bot
+    # is offline. Path-gated so Rust-only PRs keep fast feedback.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect relevant changes
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            BASE="origin/$BASE_REF"
+          else
+            # `github.event.before` is the SHA before the push, which
+            # covers multi-commit pushes correctly. Falls back to the
+            # empty tree on the initial-push edge case (`before` is all
+            # zeros, no `HEAD~1` exists yet) so the diff still resolves.
+            if [ -z "$EVENT_BEFORE" ] || [ "$EVENT_BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              BASE=$(git hash-object -t tree /dev/null)
+            else
+              BASE="$EVENT_BEFORE"
+            fi
+          fi
+          if git diff --name-only "$BASE"...HEAD \
+            | grep -E '^(web/package-lock\.json|flake\.nix|flake\.lock)$' \
+            >/dev/null; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+        if: steps.changes.outputs.relevant == 'true'
+
+      - name: Build aoe-web-frontend
+        if: steps.changes.outputs.relevant == 'true'
+        # Builds only the npm + vite frontend (validates npmDepsHash
+        # as a side effect). Skips the full Rust crate so this job
+        # runs in 1-2 min instead of 20-30 min; Cargo Test + Nix Eval
+        # already cover the Rust side on every PR.
+        run: |
+          set -euo pipefail
+          nix build --no-link .#packages.x86_64-linux.aoe-web-frontend
+
+  website:
+    name: Website Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+      - name: Install and build
+        working-directory: website
+        run: npm install && npm run build

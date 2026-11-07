@@ -1,0 +1,569 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  # No branch filter: a stacked PR targets its parent branch rather than main,
+  # and a base filter would leave every PR but the bottom of the stack with no
+  # checks at all.
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-linux:
+    # Sharded Linux test matrix. Each leg runs on its own runner with its own
+    # rust-cache slot, so the feature-set switch that used to force a recompile
+    # between the sequential legs is gone and the legs run in parallel. The
+    # required-check context is the fan-in `cargo-linux-ok` job below (named
+    # "Cargo Test (linux)"), NOT these shard jobs; keep that in sync with the
+    # branch ruleset if the leg set changes.
+    name: Cargo Test (linux, ${{ matrix.leg }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [serve-e2e, serve-rest, bare-core]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # These jobs run repository-controlled build/test code after checkout
+          # and never push, so the job token must not linger in .git/config
+          # (zizmor artipacked). Matches the hardened convention in ci.yml and
+          # release.yml.
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Cache compiled binaries too. Same-PR pushes that don't
+          # touch Rust deps get a warm `target/` and skip the cold
+          # cargo build entirely; the first push still pays cold cost.
+          cache-bin: "true"
+          # Save on PRs too. Swatinem keys the cache on Cargo.lock +
+          # toolchain hash, so successive pushes to the same PR reuse
+          # the slot rather than thrashing the 10GB repo cache budget.
+          save-if: true
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+      # tests/integration/acp_smoke.rs spawns the Node ACP shim under
+      # acp-worker/test-shim/. The shim depends on @agentclientprotocol/sdk,
+      # so its deps must be installed before the integration crate runs. Only
+      # the serve-rest leg runs the integration binary; the serve-e2e leg uses
+      # the fake ACP agent under web/tests/helpers/ instead, and bare-core does
+      # not exercise the shim.
+      - name: Install ACP shim deps
+        if: matrix.leg == 'serve-rest'
+        working-directory: acp-worker/test-shim
+        run: npm ci
+      # serve-e2e: just the e2e binary. The e2e target is gated behind the
+      # `e2e-tests` feature so the serve-rest leg below can skip it; this leg
+      # opts in.
+      #
+      # `--test-threads=3` on a 4-vCPU runner: the suite used to be entirely
+      # `#[serial]` and took ~4 min of pure wall. Only the handful of tests that
+      # mutate process-global env still need that (see tests/e2e/harness.rs);
+      # the rest are `#[parallel]` and isolate through per-Command env plus a
+      # per-test tmux socket. The work is latency-bound (polling tmux panes),
+      # not CPU-bound, so 3 concurrent tests on 4 cores is comfortable:
+      # measured 336s -> 114s pinned to 4 cores, with identical results.
+      # Raise this only with evidence; 4+ starts trading wall for flake risk on
+      # the tests that wait on an ACP handshake.
+      - name: Cargo test (serve, e2e only)
+        if: matrix.leg == 'serve-e2e'
+        run: cargo test --features serve,e2e-tests --test e2e -- --test-threads=3
+      # serve-rest: the full serve suite minus e2e (lib + bins + integration +
+      # the standalone test bins). `--features serve` leaves the e2e target
+      # gated off, so it is skipped here while every non-e2e test binary stays
+      # auto-discovered. `--features serve` is a strict superset of the default
+      # suite and pulls in the aoe.web plugin (serve-gated) the e2e tests assert
+      # on, so the two feature gates are both covered across this leg + serve-e2e.
+      - name: Cargo test (serve, everything except e2e)
+        if: matrix.leg == 'serve-rest'
+        run: cargo test --features serve
+      # bare-core: the three no-default-features feature corners.
+      #  - lib/bins: with every bundled plugin compiled out, core must still
+      #    build and pass its unit tests. `--no-default-features` also drops
+      #    `serve`, so this doubles as the TUI-only compile gate, keeping the
+      #    ~27 cfg(feature = "serve") sites from rotting.
+      #  - e2e: acceptance criterion 1 of #268 (issue #2097): with all default
+      #    plugins disabled, aoe still creates, attaches to, and destroys a
+      #    tmux + worktree session from CLI and TUI. The serve-gated e2e modules
+      #    self-gate to empty here. `e2e-tests` opts the gated target back in.
+      #    Filtered to the modules that carry that criterion instead of the
+      #    whole 134-test suite: the rest re-asserts serve-off behavior the
+      #    serve-e2e leg already covers with plugins on, for ~90s of duplicate
+      #    wall on a concurrency-bound workflow.
+      #  - check --all-targets: default-plugins on, serve off compile gate;
+      #    `e2e-tests` keeps the e2e target inside the --all-targets sweep, which
+      #    the gate would otherwise silently drop.
+      - name: Cargo test (bare core, no default features)
+        if: matrix.leg == 'bare-core'
+        run: |
+          cargo test --no-default-features --lib --bins
+          cargo test --no-default-features --features e2e-tests --test e2e -- \
+            --test-threads=3 cli:: tui_launch:: new_session::
+          cargo check --no-default-features --features default-plugins,e2e-tests --all-targets
+      # Folded in from a former standalone `hook-privdrop` job. That job existed
+      # only to build a lib test binary it could re-run under sudo, which meant a
+      # third full compile of the crate at a third feature set (~1.7 min) plus
+      # its own 451MB rust-cache slot. This leg has already built the lib test
+      # binary, and `--features serve` is a superset of the default feature set,
+      # so the privdrop tests are present in it. Reusing that binary makes the
+      # privileged run nearly free.
+      #
+      # The privileged step is safe only on a disposable GitHub-hosted runner.
+      # Do not move this leg to a persistent or self-hosted machine.
+      - name: Exercise alien uid guards (privdrop)
+        if: matrix.leg == 'serve-rest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_binary="$(
+            cargo test --features serve --no-run --lib --message-format=json \
+              | jq -r '
+                  select(
+                    .reason == "compiler-artifact"
+                    and .profile.test == true
+                    and .target.name == "agent_of_empires"
+                    and .executable != null
+                  )
+                  | .executable
+                ' \
+              | tail -n 1
+          )"
+          test -n "$test_binary"
+          test -x "$test_binary"
+          test_count="$(
+            "$test_binary" privdrop_ --list \
+              | awk '/: test$/ { count += 1 } END { print count + 0 }'
+          )"
+          if [ "$test_count" -ne 4 ]; then
+            echo "expected 4 privdrop tests, found $test_count"
+            exit 1
+          fi
+          sudo env AOE_PRIVDROP_TESTS=1 \
+            "$test_binary" privdrop_ --test-threads=1 --nocapture
+
+  cargo-linux-ok:
+    # Fan-in for the branch ruleset: "Cargo Test (linux)" is a required status
+    # check, and matrix jobs report per-leg contexts the ruleset doesn't know
+    # about. This job carries the stable context name and fails unless every
+    # leg succeeded.
+    name: Cargo Test (linux)
+    needs: [cargo-linux]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check leg results
+        run: |
+          if [ "${{ needs.cargo-linux.result }}" != "success" ]; then
+            echo "linux legs result: ${{ needs.cargo-linux.result }}"
+            exit 1
+          fi
+
+  cargo-macos:
+    # macOS runs on pushes to main and on demand, NOT on pull requests.
+    #
+    # Why: this workflow is concurrency-bound, not test-bound. A PR fires ~24
+    # jobs across CI + Tests for ~70 runner-minutes against a contended runner
+    # pool (measured peak concurrency 9-20), so the last job does not start
+    # until +7 to +15 min and wall clock is runner-minutes / available
+    # concurrency. This job was the single largest contributor at ~12 min and
+    # ~22 runner-minutes across its two former halves, and it is also the
+    # longest job, which floors the wall clock even when nothing queues.
+    # Moving it to the post-merge path takes it off both constraints.
+    #
+    # The tradeoff, stated plainly: a macOS-only regression is now caught on
+    # main within ~15 min of merge rather than on the PR. Every merge to main
+    # runs this, so nothing reaches a release tag unverified on macOS.
+    #
+    # The job still RUNS on pull_request (reporting success in well under a
+    # minute) because "Cargo Test (macos)" is a required status check in the
+    # main branch ruleset. A job-level `if:` would report "skipped", which the
+    # ruleset does not accept as a pass, and the merge box would wait forever.
+    # Once the context is removed from the ruleset's required-check list this
+    # job can move to its own workflow with a `push` + `schedule` trigger and
+    # drop the per-step conditions.
+    #
+    # Both cargo invocations share one feature set so the crate compiles once.
+    # `e2e-tests` is an empty feature whose only consumer is `required-features`
+    # on the `[[test]] name = "e2e"` target, so adding it to the --lib --bins
+    # run changes the cargo fingerprint and not one line of compiled behavior.
+    # `--features serve` is a strict superset of the default suite, so one run
+    # covers both feature gates.
+    #
+    # The two halves of the macOS surface:
+    #  1. --lib --bins: macOS-specific code lives in src/process/macos.rs plus
+    #     `target_os = "macos"` cfgs spread across ~8 subtrees, so this is the
+    #     macOS compile gate as much as a test run. The integration crate
+    #     exercises OS-portable code the Linux legs already cover.
+    #  2. the acp live-daemon e2e modules: the structured-view
+    #     daemon -> runner -> ACP-handshake -> prompt path has genuinely
+    #     OS-divergent behavior (unix-socket sun_path limits, 104 on macOS vs
+    #     108 on Linux; /tmp vs /private/tmp resolution; setsid /
+    #     detached-spawn plus node cold-start timing). A macOS-only failure
+    #     living in the e2e crate (e.g. #1890) is outside the reach of
+    #     --lib --bins. The fake ACP agent is self-contained
+    #     (web/tests/helpers/fakeAcpAgent.mjs uses only `node:` builtins), so
+    #     no npm install is needed beyond the web bundle build.rs builds.
+    name: Cargo Test (macos)
+    runs-on: macos-latest
+    # Backstop against a hung test wedging a runner for GitHub's 6h cap (#2863).
+    # A normal run finishes well inside this; a timeout turns a hang into a
+    # fast, legible failure instead of a 6h slot burn.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name != 'pull_request'
+        with:
+          # These jobs run repository-controlled build/test code after checkout
+          # and never push, so the job token must not linger in .git/config
+          # (zizmor artipacked). Matches the hardened convention in ci.yml and
+          # release.yml.
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        if: github.event_name != 'pull_request'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: github.event_name != 'pull_request'
+        with:
+          cache-bin: "true"
+          save-if: true
+      - name: Install tmux
+        if: github.event_name != 'pull_request'
+        run: brew install tmux
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: github.event_name != 'pull_request'
+        with:
+          node-version: '22'
+      - name: Cargo test (macOS, lib + bins)
+        if: github.event_name != 'pull_request'
+        run: cargo test --features serve,e2e-tests --lib --bins
+      - name: Cargo test (macOS, acp live-daemon e2e)
+        if: github.event_name != 'pull_request'
+        run: cargo test --features serve,e2e-tests --test e2e -- acp_ --test-threads=1 --nocapture
+      - name: Skipped on pull requests
+        if: github.event_name == 'pull_request'
+        run: echo "macOS runs post-merge on main; see the comment on this job."
+
+  vitest:
+    name: Vitest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # These jobs run repository-controlled build/test code after checkout
+          # and never push, so the job token must not linger in .git/config
+          # (zizmor artipacked). Matches the hardened convention in ci.yml and
+          # release.yml.
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        working-directory: web
+        run: npm ci
+      - name: Run Vitest with coverage
+        working-directory: web
+        run: npm run test:unit -- --coverage --reporter=default --reporter=junit --outputFile.junit=test-report.junit.xml
+      # Vitest's v8 coverage reporter emits LCOV paths relative to the
+      # vitest cwd (web/), so SF: lines read "SF:src/...". Codecov
+      # matches file paths against the PR diff, which uses repo-root
+      # paths ("web/src/..."), so without this fixup new component
+      # files report 0% coverage even when vitest hit 85%. The
+      # Playwright coverage merge script already emits "web/src/..."
+      # paths, so only the vitest LCOV needs the prefix.
+      - name: Rewrite LCOV paths for codecov
+        if: ${{ !cancelled() }}
+        run: sed -i 's|^SF:src/|SF:web/src/|' web/coverage/vitest/lcov.info
+      - name: Upload to Codecov (vitest flag)
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          # The codecov-action's `files` input is additive, not restrictive:
+          # with `disable_search: false` (the default), the CLI also walks
+          # the workspace and uploads anything that looks like a coverage
+          # report. That picks up web/tests/coverage-matrix.json and
+          # coverage-matrix.exempt.json (our test-mapping metadata, not
+          # coverage data) and ships them to Codecov on every run.
+          # `disable_search: true` restricts the upload to the explicit
+          # `files:` list.
+          disable_search: true
+          files: web/coverage/vitest/lcov.info
+          flags: vitest
+          name: vitest
+          fail_ci_if_error: false
+      - name: Upload test results to Codecov (vitest)
+        if: ${{ !cancelled() }}
+        # Test-analytics upload only; a Codecov network blip must not fail the job.
+        continue-on-error: true
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1.2.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          disable_search: true
+          files: web/test-report.junit.xml
+          flags: vitest
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: vitest-coverage
+          path: web/coverage/vitest/
+          retention-days: 14
+
+  bundle-analysis:
+    name: Bundle Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # These jobs run repository-controlled build/test code after checkout
+          # and never push, so the job token must not linger in .git/config
+          # (zizmor artipacked). Matches the hardened convention in ci.yml and
+          # release.yml.
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        working-directory: web
+        run: npm ci
+      # Clean production build, intentionally WITHOUT AOE_COVERAGE: the inline
+      # sourcemaps the coverage build emits inflate chunk sizes and would
+      # report bogus bundle stats. The @codecov/vite-plugin uploads bundle
+      # stats to Codecov
+      # when CODECOV_TOKEN is present (gated in web/vite.config.ts); without
+      # the token the plugin is a no-op, so forks still build cleanly.
+      - name: Build web bundle and upload stats to Codecov
+        working-directory: web
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        run: npm run build
+
+  playwright:
+    name: Playwright (mocked)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # These jobs run repository-controlled build/test code after checkout
+          # and never push, so the job token must not linger in .git/config
+          # (zizmor artipacked). Matches the hardened convention in ci.yml and
+          # release.yml.
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        working-directory: web
+        run: npm ci
+      - name: Build web with coverage instrumentation
+        working-directory: web
+        env:
+          AOE_COVERAGE: '1'
+        run: npm run build
+      - name: Validate coverage matrix
+        working-directory: web
+        run: node tests/validate-coverage-matrix.mjs
+      # The Playwright browser cache (~150MB chromium) is keyed on the
+      # web/package-lock.json hash so it invalidates when @playwright/test
+      # bumps. --with-deps is omitted: the ubuntu-latest runner image
+      # already ships the apt packages Chromium needs.
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('web/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
+      - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        working-directory: web
+        run: npx playwright install chromium
+      - name: Run Playwright (mocked) with coverage
+        working-directory: web
+        env:
+          AOE_COVERAGE: '1'
+        run: npx playwright test --config=playwright.config.ts
+      - name: Build LCOV from collected Playwright coverage
+        working-directory: web
+        if: ${{ !cancelled() }}
+        run: npm run coverage:merge
+      - name: Upload to Codecov (playwright-mocked flag)
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          # See the matching comment in the vitest upload step: without
+          # disable_search the action also picks up the coverage-matrix
+          # JSON files under web/tests/ and ships them as if they were
+          # coverage reports.
+          disable_search: true
+          files: web/coverage/merged/lcov.info
+          flags: playwright-mocked
+          name: playwright-mocked
+          fail_ci_if_error: false
+      - name: Upload test results to Codecov (playwright-mocked)
+        if: ${{ !cancelled() }}
+        # Test-analytics upload only; a Codecov network blip must not fail the job.
+        continue-on-error: true
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1.2.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          disable_search: true
+          files: web/test-report.junit.xml
+          flags: playwright-mocked
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-report
+          path: web/playwright-report/
+          retention-days: 14
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-mocked-coverage
+          path: web/coverage/merged/
+          retention-days: 14
+
+  playwright-live:
+    # Sharded 2-way: each shard is a free 4-core runner running half the
+    # suite at the same 3-worker density, so wall-clock roughly halves
+    # without changing per-runner contention. The required-check context
+    # is the fan-in `playwright-live-ok` job below (named "Playwright
+    # (live)"), NOT these shard jobs; keep that in sync with the branch
+    # ruleset if the shard count changes.
+    name: Playwright (live, shard ${{ matrix.shard }}/2)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # These jobs run repository-controlled build/test code after checkout
+          # and never push, so the job token must not linger in .git/config
+          # (zizmor artipacked). Matches the hardened convention in ci.yml and
+          # release.yml.
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Cache compiled binaries too. Same-PR pushes that don't
+          # touch Rust deps get a warm `target/` and skip the 4-minute
+          # cargo build entirely; the first push still pays cold cost.
+          cache-bin: "true"
+          # Save on PRs too. Swatinem keys the cache on Cargo.lock +
+          # toolchain hash, so successive pushes to the same PR reuse
+          # the slot rather than thrashing the 10GB repo cache budget.
+          save-if: true
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      # Debug build instead of --release: --release with LTO and
+      # codegen-units=1 cost ~6 min on the GitHub runner; debug builds
+      # the same binary in ~2 min with no relevant runtime difference
+      # for e2e tests. The harness derives the tmux prefix from the
+      # binary path (aoe_dev_ for debug, aoe_ for release) so specs
+      # don't hard-code either.
+      - name: Build aoe with instrumented web bundle
+        env:
+          AOE_COVERAGE: '1'
+          # build.rs embeds `dist/` into the binary with rust-embed, and a
+          # separate `.js.map` file has no serving path there, so this build
+          # keeps INLINE sourcemaps. The mocked job uses external maps (much
+          # smaller `.js`, far faster navigation); see web/vite.config.ts.
+          AOE_COVERAGE_INLINE_SOURCEMAP: '1'
+        run: cargo build --features serve
+      - name: Install web deps
+        working-directory: web
+        run: npm ci
+      # Same scheme as the mocked job: cache Chromium under
+      # ~/.cache/ms-playwright, key on the lockfile, skip --with-deps
+      # because ubuntu-latest already has the apt prerequisites.
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('web/package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
+      - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        working-directory: web
+        run: npx playwright install chromium
+      - name: Run live Playwright with coverage
+        working-directory: web
+        env:
+          AOE_COVERAGE: '1'
+          AOE_E2E_BINARY: ${{ github.workspace }}/target/debug/aoe
+        run: npx playwright test --config=playwright.live.config.ts --shard=${{ matrix.shard }}/2
+      - name: Build LCOV from collected Playwright coverage
+        working-directory: web
+        if: ${{ !cancelled() }}
+        run: npm run coverage:merge
+      - name: Upload to Codecov (playwright-live flag)
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          # See the matching comment in the vitest upload step: without
+          # disable_search the action also picks up the coverage-matrix
+          # JSON files under web/tests/ and ships them as if they were
+          # coverage reports. Codecov merges the two shard uploads that
+          # share the playwright-live flag on the same commit.
+          disable_search: true
+          files: web/coverage/merged/lcov.info
+          flags: playwright-live
+          name: playwright-live-shard-${{ matrix.shard }}
+          fail_ci_if_error: false
+      - name: Upload test results to Codecov (playwright-live)
+        if: ${{ !cancelled() }}
+        # Test-analytics upload only; a Codecov network blip must not fail the job.
+        continue-on-error: true
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1.2.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          disable_search: true
+          files: web/test-report.junit.xml
+          flags: playwright-live
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-live-report-shard-${{ matrix.shard }}
+          path: web/playwright-live-report/
+          retention-days: 14
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-live-coverage-shard-${{ matrix.shard }}
+          path: web/coverage/merged/
+          retention-days: 14
+
+  playwright-live-ok:
+    # Fan-in for the branch ruleset: "Playwright (live)" is a required
+    # status check, and matrix jobs report per-shard contexts that the
+    # ruleset doesn't know about. This job carries the stable context
+    # name and fails unless every shard succeeded.
+    name: Playwright (live)
+    needs: playwright-live
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check shard results
+        run: |
+          if [ "${{ needs.playwright-live.result }}" != "success" ]; then
+            echo "live shards result: ${{ needs.playwright-live.result }}"
+            exit 1
+          fi

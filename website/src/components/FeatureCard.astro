@@ -1,0 +1,27 @@
+---
+interface Props {
+  title: string;
+  description: string;
+  n: string;
+  href?: string;
+}
+
+const { title, description, n, href } = Astro.props;
+const Tag = href ? 'a' : 'div';
+---
+
+<Tag
+  {...(href ? { href } : {})}
+  class:list={['feature-cell block p-7 h-full', href && 'group']}
+>
+  <div class="flex items-center justify-between mb-3.5">
+    <span class="font-mono text-xs text-brand-500">{n}</span>
+    {href && (
+      <svg class="w-3.5 h-3.5 text-brand-500 opacity-0 -translate-x-1 group-hover:opacity-100 group-hover:translate-x-0 transition-all duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3"/>
+      </svg>
+    )}
+  </div>
+  <h3 class="text-lg font-semibold font-display mb-2">{title}</h3>
+  <p class="text-sm text-gray-400 leading-relaxed">{description}</p>
+</Tag>

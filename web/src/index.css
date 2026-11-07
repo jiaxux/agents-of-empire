@@ -1,0 +1,649 @@
+/* Geist Sans */
+@font-face {
+  font-family: "Geist Sans";
+  src: url("/fonts/Geist-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Geist Sans";
+  src: url("/fonts/Geist-Medium.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Geist Sans";
+  src: url("/fonts/Geist-SemiBold.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* Geist Mono */
+@font-face {
+  font-family: "Geist Mono";
+  src: url("/fonts/GeistMono-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Geist Mono";
+  src: url("/fonts/GeistMono-Medium.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Geist Mono";
+  src: url("/fonts/GeistMono-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@import "tailwindcss";
+
+/* Build-time fallback palette. Mirrors the `zinc` builtin theme
+   (themes/builtin/zinc.toml) so the cold-load paint, before
+   useResolvedTheme has fetched and applied the user's selection,
+   matches the resolved palette for zinc. Keep these values in
+   sync with that TOML file. */
+@theme {
+  /* Brand, derived from zinc.accent */
+  --color-brand-100: #fdecce;
+  --color-brand-200: #fcddaa;
+  --color-brand-300: #faca79;
+  --color-brand-400: #f7b13c;
+  --color-brand-500: #f59e0b;
+  --color-brand-600: #d08609;
+  --color-brand-700: #ac6f08;
+  --color-brand-800: #865606;
+  --color-brand-900: #6e4705;
+  --color-text-on-brand: #000000;
+
+  /* Accent -- Muted Teal (used sparingly) */
+  --color-accent-500: #14b8a6;
+  --color-accent-600: #0d9488;
+  --color-accent-700: #0f766e;
+
+  /* Surfaces, derived from zinc.background and border */
+  --color-surface-500: #65656b;
+  --color-surface-600: #525258;
+  --color-surface-700: #3f3f46;
+  --color-surface-800: #2e2e31;
+  --color-surface-850: #27272a;
+  --color-surface-900: #1c1c1f;
+  --color-surface-950: #0f0f11;
+
+  /* Semantic Text */
+  --color-text-primary: #e4e4e7;
+  --color-text-secondary: #a1a1aa;
+  --color-text-muted: #71717a;
+  /* Body text using the dim slot must stay legible against
+     surface-900 (#1c1c1f) and surface-800 (#2e2e31); the previous
+     value (#52525b ≈ 2.6:1 vs surface-900) failed both AA body and
+     AA large. Bumped to ~5.0:1 vs surface-900 / ~4.0:1 vs surface-800
+     so per-setting descriptions and similar tertiary copy stay
+     legible. Decorative uses (separator hairlines, etc.) that need
+     to read as quieter can drop to surface-700 directly. See #1105. */
+  --color-text-dim: #8b8b94;
+  --color-text-bright: #fafafa;
+
+  /* Semantic Status */
+  --color-status-running: #22c55e;
+  /* Waiting (blocked on user input) is the brightest amber in the brand
+     ramp so it wins on luminance against fresh-idle. Saturation alone
+     reads as DIMMER on dark backgrounds, so we lean on luminance. */
+  --color-status-waiting: #fbbf24;
+  --color-status-warning: #fbbf24;
+  /* Color of an Idle session whose Stop fired within the decay window.
+     Held constant for the full window (then snaps to `--color-status-idle`)
+     so the breathe rattle's pulse stays visually consistent. One rung
+     dimmer than waiting so the hierarchy reads bright > amber > slate. */
+  --color-status-fresh-idle: #f59e0b;
+  --color-status-idle: #71717a;
+  /* Unread accent: a finished turn the user hasn't viewed, or a manual flag.
+     Sits between waiting and idle on the attention scale. Theme-projected
+     from `theme.unread` (see resolved.rs); this default matches `zinc`. */
+  --color-status-unread: #38bdf8;
+  --color-status-error: #ef4444;
+  --color-status-starting: #f59e0b;
+  --color-status-stopped: #52525b;
+  /* Dormant: a structured-view worker auto-stopped for inactivity
+     (resumable), distinct from a deliberate Stop. A dim amber, brighter
+     than the slate Stopped grey but muted well below the fresh-idle
+     attention amber so it reads as "parked, not urgent". Build-time
+     cold-load default; the resolved theme projection (resolved.rs)
+     overrides it at runtime from `fresh_idle` + `dimmed`. See #2250. */
+  --color-status-dormant: #b38742;
+
+  /* Extended semantic tokens populated by the resolved theme
+     projection (see src/tui/styles/resolved.rs). These build-time
+     defaults match the `zinc` builtin theme so cold-load paint
+     matches the post-fetch paint when no localStorage cache exists. */
+  --color-selection: #3f3f46;
+  --color-session-selection: #52525b;
+  --color-terminal-active: #0d9488;
+  --color-branch: #0d9488;
+  --color-sandbox: #94a3b8;
+  --color-diff-add: #22c55e;
+  --color-diff-delete: #ef4444;
+  --color-diff-modified: #fbbf24;
+  --color-diff-header: #0d9488;
+
+  /* Embedded terminal cold-load defaults. useResolvedTheme refetches
+     and overrides these once the resolved palette lands; the terminal
+     hook reads them on construction and on `aoe:theme-changed` to
+     build xterm.js's ITheme. These match the `zinc` builtin
+     projected by src/tui/styles/resolved.rs::terminal_projection so
+     the pre-fetch paint matches the post-fetch paint for the zinc theme. */
+  --term-bg: #1c1c1f;
+  --term-fg: #e4e4e7;
+  --term-cursor: #f59e0b;
+  --term-selection-bg: rgba(161, 161, 170, 0.35);
+  --term-color-0: #1c1c1f;
+  --term-color-1: #ef4444;
+  --term-color-2: #22c55e;
+  --term-color-3: #fbbf24;
+  --term-color-4: #0d9488;
+  --term-color-5: #f59e0b;
+  --term-color-6: #0d9488;
+  --term-color-7: #e4e4e7;
+  --term-color-8: #8b8b94;
+  --term-color-9: #f26969;
+  --term-color-10: #4ed17e;
+  --term-color-11: #fccc50;
+  --term-color-12: #3da9a0;
+  --term-color-13: #f7b13c;
+  --term-color-14: #3da9a0;
+  --term-color-15: #fbbf24;
+
+  /* Typography */
+  --font-sans: "Geist Sans", system-ui, -apple-system, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SFMono-Regular", monospace;
+
+  /* Layout widths */
+  --width-sidebar: 280px;
+  --width-sidebar-sm: 220px;
+  --min-width-sidebar: 280px;
+  --min-width-sidebar-sm: 220px;
+  --width-dialog: 400px;
+  --width-panel: 420px;
+  --width-content-max: 600px;
+}
+
+html {
+  height: 100dvh;
+  overflow: hidden;
+  overscroll-behavior: none;
+  overscroll-behavior-x: none;
+  /* Claim horizontal edge drags for the app. On iOS this prevents a swipe
+     from beginning the browser-history gesture while an overlay sidebar is
+     handling the same touch. Terminal forward mode opts into `none` on its
+     own scroller, so its custom vertical gesture remains unaffected. */
+  touch-action: pan-y pinch-zoom;
+  /* safe-area insets are handled by the App root, not html, to avoid
+     making the document taller than the viewport (which lets iOS scroll
+     the page when the keyboard opens, breaking keyboard-height math). */
+  --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+  /* Live sidebar width, published by WorkspaceSidebar so the TopBar's left
+     zone can match the column and extend the divider up through the header.
+     Default mirrors WorkspaceSidebar's DEFAULT_WIDTH. */
+  --aoe-sidebar-width: 280px;
+  /* Live right-panel width, published by ContentSplit for the symmetric
+     treatment on the right. Default mirrors ContentSplit's DEFAULT_DIFF_WIDTH. */
+  --aoe-right-panel-width: 380px;
+}
+
+body {
+  height: 100%;
+  overflow: hidden;
+  font-family: var(--font-sans);
+  background: var(--color-surface-900);
+  color: var(--color-text-primary);
+  overscroll-behavior: none;
+  overscroll-behavior-x: none;
+  touch-action: pan-y pinch-zoom;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  height: 100%;
+}
+
+@media (pointer: coarse) {
+  #root {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    overflow: hidden;
+  }
+}
+
+/* Structured view markdown — assistant-ui's MarkdownTextPrimitive renders
+   raw <p>/<ul>/<ol>/<h*>/<blockquote>/<code> elements (no class
+   names). Style them via descendant selectors so the prose looks
+   right inside the structured-view conversation. */
+/* The structured-view root publishes both conversation font-size preferences as
+   custom properties; CSS picks the active one, so a resize or an orientation
+   change switches sizes without a reload. Desktop is the default and mobile is
+   the override, keyed on the same classifier `clientFormFactor()` uses: coarse
+   primary pointer AND a viewport below the 768px `md` breakpoint. A touch
+   laptop and a narrow desktop window both stay on the desktop size, matching
+   how the rest of the dashboard decides what "mobile" means. */
+.acp-conversation-scope {
+  --acp-conversation-font-size: var(--acp-conversation-font-size-desktop, 0.875rem);
+}
+@media (pointer: coarse) and (max-width: 767.98px) {
+  .acp-conversation-scope {
+    --acp-conversation-font-size: var(--acp-conversation-font-size-mobile, 0.875rem);
+  }
+}
+/* Only the conversation renderer (Markdown.tsx) opts in. The other
+   `.acp-markdown` consumers (tool-card bodies, the diff pane's file viewer)
+   keep their own explicit sizes, so the child typography below stays in `rem`
+   for them and is re-expressed in `em` under `.acp-markdown-body` only. */
+.acp-markdown-body {
+  /* Fallback matches the previous fixed `text-sm` for transcript markdown
+     rendered outside the structured-view root (e.g. the skills manager). */
+  font-size: var(--acp-conversation-font-size, 0.875rem);
+}
+.acp-markdown p {
+  margin: 0.5rem 0;
+}
+.acp-markdown p:first-child {
+  margin-top: 0;
+}
+.acp-markdown p:last-child {
+  margin-bottom: 0;
+}
+.acp-markdown h1 {
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin: 1rem 0 0.5rem;
+}
+.acp-markdown h2 {
+  font-size: 1.125rem;
+  font-weight: 600;
+  margin: 0.875rem 0 0.5rem;
+}
+.acp-markdown h3 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin: 0.75rem 0 0.375rem;
+}
+.acp-markdown ul,
+.acp-markdown ol {
+  margin: 0.5rem 0;
+  padding-left: 1.5rem;
+}
+.acp-markdown ul {
+  list-style: disc;
+}
+.acp-markdown ol {
+  list-style: decimal;
+}
+.acp-markdown li {
+  margin: 0.125rem 0;
+}
+.acp-markdown blockquote {
+  border-left: 2px solid var(--color-surface-700);
+  padding-left: 0.75rem;
+  color: var(--color-text-secondary);
+  font-style: italic;
+  margin: 0.5rem 0;
+}
+.acp-markdown blockquote.acp-callout-warn {
+  border-left: 3px solid var(--color-status-waiting);
+  background: color-mix(in srgb, var(--color-status-waiting) 8%, transparent);
+  color: var(--color-status-waiting);
+  font-style: normal;
+  padding: 0.5rem 0.75rem;
+  border-radius: 0.25rem;
+}
+.acp-markdown blockquote.acp-callout-warn p {
+  margin: 0;
+}
+.acp-markdown blockquote.acp-callout-warn strong {
+  color: var(--color-text-bright);
+}
+.acp-markdown .acp-artifact-image {
+  max-width: 100%;
+  height: auto;
+  border-radius: 0.375rem;
+  border: 1px solid var(--color-surface-700);
+}
+.acp-markdown .acp-inert-path {
+  font-family: var(--font-mono, monospace);
+  color: var(--color-text-muted);
+  background: var(--color-surface-800);
+  padding: 0 0.25rem;
+  border-radius: 0.25rem;
+  word-break: break-all;
+  user-select: text;
+}
+.acp-markdown :where(p, li) > code {
+  background: var(--color-surface-800);
+  padding: 0 0.25rem;
+  border-radius: 0.25rem;
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+}
+.acp-markdown a {
+  color: var(--color-brand-500);
+  text-decoration: underline;
+}
+.acp-markdown a:hover {
+  color: var(--color-brand-400);
+}
+/* Break long unbreakable tokens (URLs, absolute file paths, the `─` rule
+   lines Playwright's list reporter emits) so they wrap inside the chat
+   bubble instead of pushing it past its width cap and forcing a
+   viewport-level horizontal scrollbar. `anywhere` (not `break-word`) so the
+   token also contributes to intrinsic min-content width, letting the
+   bubble's `min-w-0 max-w-[80%]` actually shrink. Fenced code blocks are
+   excluded; they keep their own `overflow-x-auto` scroll. See #1469. */
+.acp-markdown :where(p, li, blockquote, a) {
+  overflow-wrap: anywhere;
+}
+.acp-markdown pre {
+  margin: 0.5rem 0;
+  border-radius: 0.375rem;
+  /* overflow-x: auto (not hidden) so a fenced code block wider than the
+     bubble scrolls horizontally instead of clipping its long lines. `hidden`
+     here outranked the `overflow-x-auto` utility on the plain <pre> and
+     clipped shiki's inner <pre> before its wrapper could scroll. The radius
+     still clips the corners; no fixed height means no vertical scrollbar.
+     See #2443. */
+  overflow-x: auto;
+  border: 1px solid var(--color-surface-700);
+  background: var(--color-surface-950);
+}
+.acp-markdown hr {
+  border: none;
+  border-top: 1px solid var(--color-surface-800);
+  margin: 0.75rem 0;
+}
+.acp-markdown .acp-table-wrap {
+  margin: 0.75rem 0;
+  border: 1px solid var(--color-surface-800);
+  border-radius: 0.375rem;
+  overflow: auto;
+  max-height: 24rem;
+}
+.acp-markdown table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.acp-markdown thead {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--color-surface-900);
+}
+.acp-markdown th {
+  text-align: left;
+  padding: 0.375rem 0.625rem;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--color-text-dim);
+  border-bottom: 1px solid var(--color-surface-700);
+  white-space: nowrap;
+}
+.acp-markdown td {
+  padding: 0.3125rem 0.625rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  vertical-align: top;
+  white-space: nowrap;
+  color: var(--color-text-secondary);
+  border-bottom: 1px solid color-mix(in srgb, var(--color-surface-900) 50%, transparent);
+}
+.acp-markdown tbody tr:nth-child(even) {
+  background: color-mix(in srgb, var(--color-surface-900) 30%, transparent);
+}
+.acp-markdown tbody tr:hover {
+  background: var(--color-surface-800);
+}
+.acp-markdown tbody tr:last-child td {
+  border-bottom: none;
+}
+
+/* Child typography for the opted-in conversation renderer only, in `em` so the
+   whole hierarchy scales with the user's base size. The doubled class outranks
+   the single-class `.acp-markdown <type>` rules above regardless of where they
+   sit in the file. Ratios reproduce the `rem` values at the 14px default; the
+   other `.acp-markdown` consumers set their own base (tool cards render at
+   11px) and keep the fixed `rem` sizes. */
+.acp-markdown.acp-markdown-body h1 {
+  font-size: 1.43em; /* 20px at the 14px default */
+}
+.acp-markdown.acp-markdown-body h2 {
+  font-size: 1.29em; /* 18px at the 14px default */
+}
+.acp-markdown.acp-markdown-body h3 {
+  font-size: 1.14em; /* 16px at the 14px default */
+}
+.acp-markdown.acp-markdown-body th {
+  font-size: 0.79em; /* 11px at the 14px default */
+}
+.acp-markdown.acp-markdown-body td {
+  font-size: 0.86em; /* 12px at the 14px default */
+}
+
+/* Subtle scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-surface-700);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-dim);
+}
+
+/* Dialog/panel entrance animation */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes slide-in-right {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.animate-fade-in {
+  animation: fade-in 0.15s ease-out;
+}
+.animate-slide-up {
+  animation: slide-up 0.2s ease-out;
+}
+.animate-slide-in-right {
+  animation: slide-in-right 0.2s ease-out;
+}
+/* Reduced-motion users get the settled end state (elements default to opacity 1
+   / no transform) with no entrance movement or fade. Matches the per-animation
+   opt-out used by the blink and settings-highlight utilities below. */
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-in,
+  .animate-slide-up,
+  .animate-slide-in-right {
+    animation: none;
+  }
+}
+
+/* Live terminal cursor blink while its input is focused (MobileLiveTerminal's
+   `Row`). Only oscillates the filled-cursor colors set by the inline style;
+   the almost-equal keyframe percentages make the swap an instant cut instead
+   of a fade. `color: inherit` on the off phase approximates the original
+   glyph color rather than reproducing it exactly, good enough since the
+   cursor sits on the input line, which is normally default-colored text. */
+@keyframes term-cursor-blink {
+  0%,
+  50% {
+    background-color: var(--term-cursor, #f59e0b);
+    color: var(--term-bg, #1c1c1f);
+  }
+  50.001%,
+  100% {
+    background-color: transparent;
+    color: inherit;
+  }
+}
+.animate-term-cursor-blink {
+  animation: term-cursor-blink 1.06s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .animate-term-cursor-blink {
+    animation: none;
+  }
+}
+
+/* One-shot flash for the field a settings-search jump lands on. The target
+   wrapper remounts on each jump (SettingsView keys the content subtree on the
+   focus nonce), so the animation replays without any JS timer or state. */
+@keyframes settings-search-highlight {
+  0%,
+  60% {
+    box-shadow: 0 0 0 2px var(--color-brand-500);
+  }
+  100% {
+    box-shadow: 0 0 0 2px transparent;
+  }
+}
+.animate-settings-highlight {
+  animation: settings-search-highlight 300ms cubic-bezier(0.16, 1, 0.3, 1);
+  border-radius: 0.5rem;
+}
+@media (prefers-reduced-motion: reduce) {
+  .animate-settings-highlight {
+    animation: none;
+  }
+}
+/* Cheat-code easter egg effects (command palette). One-off, non-blocking. */
+@keyframes cheat-fly-ltr {
+  from {
+    transform: translateX(-20vw) translateY(-50%) rotate(-8deg);
+  }
+  to {
+    transform: translateX(120vw) translateY(-50%) rotate(8deg);
+  }
+}
+@keyframes cheat-fly-rtl {
+  from {
+    transform: translateX(120vw) translateY(-50%) rotate(8deg);
+  }
+  to {
+    transform: translateX(-20vw) translateY(-50%) rotate(-8deg);
+  }
+}
+@keyframes cheat-confetti-fall {
+  from {
+    transform: translateY(-10vh) rotate(0deg);
+    opacity: 1;
+  }
+  to {
+    transform: translateY(110vh) rotate(540deg);
+    opacity: 0;
+  }
+}
+@keyframes cheat-flash {
+  0% {
+    opacity: 0;
+  }
+  35% {
+    opacity: 0.55;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+@keyframes cheat-pulse {
+  0% {
+    transform: translate(-50%, -50%) scale(0.4);
+    opacity: 0;
+  }
+  40% {
+    transform: translate(-50%, -50%) scale(1.1);
+    opacity: 1;
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(2.2);
+    opacity: 0;
+  }
+}
+.animate-cheat-fly-ltr {
+  animation: cheat-fly-ltr 1.6s ease-in forwards;
+}
+.animate-cheat-fly-rtl {
+  animation: cheat-fly-rtl 1.6s ease-in forwards;
+}
+.animate-cheat-confetti-fall {
+  animation: cheat-confetti-fall 2s ease-in forwards;
+}
+.animate-cheat-flash {
+  animation: cheat-flash 0.6s ease-out forwards;
+}
+.animate-cheat-pulse {
+  animation: cheat-pulse 1s ease-out forwards;
+}
+/* Respect reduced-motion: drop the visual flourish entirely (the toast still
+   fires as the functional signal). Hiding the overlay avoids a static
+   full-screen flash that animation:none would otherwise leave behind. */
+@media (prefers-reduced-motion: reduce) {
+  [data-testid="cheat-overlay"] {
+    display: none;
+  }
+}
+
+/* Focus indicators for keyboard navigation */
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+[role="button"]:focus-visible {
+  outline: 2px solid var(--color-brand-600);
+  outline-offset: 2px;
+}
+
+.safe-area-inset {
+  /* Top/right/left only. The BOTTOM inset is intentionally NOT reserved here:
+     the App root is `overflow-hidden`, so a bottom-anchored child (the ACP
+     composer, the terminal toolbar) that tried to reach the physical edge got
+     clipped at the padding edge on iOS. Instead each bottom-anchored surface
+     owns its own `env(safe-area-inset-bottom)` clearance, and the composer
+     hugs the bottom with no reservation. iOS reports the bottom inset as 0
+     while the keyboard is open, so the keyboard-lift math is unaffected. */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
+}

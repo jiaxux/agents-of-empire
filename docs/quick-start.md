@@ -1,0 +1,151 @@
+# Quick Start
+
+## Launch the TUI
+
+```bash
+aoe
+```
+
+This opens the dashboard. You'll see an empty session list on first run.
+
+| Key | Action |
+|-----|--------|
+| `n` | New session |
+| `b` | New session from saved project |
+| `p` | Manage saved projects (add/remove) |
+| `Enter` | Attach to session |
+| `d` | Delete session |
+| `t` | Toggle Agent/Terminal view |
+| `D` | Open diff view |
+| `y` | Open selected session context for review or sharing |
+| `Ctrl+F` | Open Fleet Operations across sessions |
+| `/` | Search sessions |
+| `?` | Show help (full keymap) |
+| `q` | Quit |
+| `Ctrl+b d` | Detach from tmux session |
+
+Press `?` in the TUI for the full keymap.
+
+To pass findings between sessions without attaching, select the source and
+press `y`, then press `s`, choose a target with `j`/`k`, and confirm with
+`Enter`. See [Session Context and Agent-to-Agent Sharing](guides/session-context.md).
+
+To inspect the whole fleet, press `Ctrl+F`. Move between panels with `Tab` or
+`h`/`l`. In Checkpoints, press `c` to capture the selected session without
+pausing it. On a finished checkpoint, press `f` for a fresh session at that
+historical code state or `t` to run the same prompt and verification command
+through two or more agents in isolated worktrees. Use `a` to acknowledge an
+Attention occurrence and `s` to coordinate a conflict through the existing
+message composer. Outside the TUI, `aoe fleet`, `aoe fleet --json`, and the web
+dashboard expose the same fleet facts. See
+[Fleet Operations](guides/fleet-operations.md).
+
+## Create Your First Session
+
+**From the TUI:** Press `n` to open the new session dialog. Fill in the path to your project (or leave it as `.` for the current directory) and press `Enter`.
+
+**From the CLI:**
+
+```bash
+aoe add /path/to/project
+```
+
+The session appears in the dashboard with status **Idle**.
+
+## Projects and Groups
+
+These two words show up around the dashboard and mean different things.
+
+A **project** is a saved directory path, usually a git repository, that you register once so you can start sessions from it without retyping the path. It is an AoE registry entry, not a Claude Code project (which is tied to a directory by Claude itself). You do not have to register your repos; `n` and `aoe add <path>` work on any path. Registering is only a convenience for repos you reach for often.
+
+Add a project two ways:
+
+```bash
+aoe project add /path/to/repo        # CLI
+```
+
+In the TUI, press `p` to open **Manage projects**, then `a` to add one. Once a project is registered, `b` starts a new session from it (this is why `b` reports "No Projects" until you have added at least one). See [Multi-Repo Workspaces](guides/multi-repo-workspaces.md#the-project-registry) for scopes and multi-repo sessions.
+
+A **group** is unrelated to projects. It is a label you assign to existing sessions to sort them in the sidebar (for example `fix` and `feature`), set from the session rename dialog or with `aoe group move`. Projects are where sessions start; groups are how sessions are bucketed once they exist. See the [Web Dashboard grouping section](guides/web/dashboard.md#sidebar-grouping-by-repo-by-group-or-both) for the grouping axes.
+
+## Attach to a Session
+
+Select a session and press `Enter` to attach. You're now inside a tmux session running your AI agent (Claude Code by default).
+
+To return to the TUI, press **`Ctrl+b d`** (the standard tmux detach shortcut).
+
+## Use the Terminal View
+
+Press `t` to toggle between Structured View and Terminal View. Each agent session has a paired shell terminal where you can run builds, tests, and git commands without interrupting the agent.
+
+## Review Changes with Diff View
+
+Press `D` to open the diff view. This shows changes between your working directory and the base branch. Navigate files with `j`/`k`, press `e` to edit, and `Esc` to close.
+
+## Create a Worktree Session
+
+To work on a new branch with its own directory:
+
+```bash
+# CLI
+aoe add . -w feat/my-feature -b
+
+# TUI: press n, enter a title, enable Worktree
+# Optional: press Ctrl+P on Worktree and fill in Name
+```
+
+This creates a new git branch, a worktree directory, and a session pointing at it. When you delete the session, AoE offers to clean up the worktree too.
+
+## Attach to Existing Work
+
+**Attach to an existing branch or worktree.** Omit `-b` and AoE re-uses the worktree for that branch, or checks the branch out into a new worktree if none exists:
+
+```bash
+aoe add . -w feat/my-feature
+```
+
+In the TUI, press `Ctrl+P` on the Worktree field and toggle **Attach to existing branch** (same toggle in the web wizard). Removing the session only cleans up worktrees AoE created; attached ones are left alone. See [Worktrees Reference](guides/worktrees.md) for the full matrix.
+
+**Resume a Claude Code conversation.** After attaching, run `/resume` in the Claude pane and pick a conversation. AoE captures the session ID and persists it so the next launch reattaches automatically. See [Session Resume](guides/session-resume.md), including `aoe session set-session-id` to set the Claude UUID explicitly.
+
+## Create a Sandboxed Session
+
+To run an agent inside a Docker container:
+
+```bash
+aoe add --sandbox .
+```
+
+In the TUI, toggle the sandbox checkbox when creating a session. The agent runs in an isolated container with your project mounted at `/workspace` and authentication credentials shared via persistent Docker volumes.
+
+Requires Docker to be installed.
+
+## Choose a Different Agent
+
+By default, AoE uses Claude Code. To use a different tool:
+
+```bash
+aoe add -c opencode .   # or any other supported agent
+```
+
+In the TUI, select the tool from the dropdown in the new session dialog.
+
+## Use the Web Dashboard
+
+Prefer a browser? Run `aoe serve` to start the web dashboard:
+
+```bash
+aoe serve                         # localhost only
+aoe serve --host 0.0.0.0          # accessible from other devices (use with VPN)
+aoe serve --daemon                # run in background
+```
+
+Open the printed URL in any browser (phone, tablet, or another computer) for the same session list, live terminal streaming, and session controls. Install it as a PWA for an app-like experience. See the [Web Dashboard Guide](guides/web-dashboard.md) for details.
+
+## Next Steps
+
+- [Web Dashboard](guides/web-dashboard.md): access sessions from any browser
+- [Workflow Guide](guides/workflow.md): recommended setup with bare repos and parallel agents
+- [Docker Sandbox](guides/sandbox.md): container configuration and custom images
+- [Repo Config & Hooks](guides/repo-config.md): per-project settings
+- [CLI Reference](cli/reference.md): every command and flag

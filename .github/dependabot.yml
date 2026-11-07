@@ -1,0 +1,240 @@
+version: 2
+updates:
+  # cargo
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "rust"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    cooldown:
+      default-days: 7
+      semver-minor-days: 14
+      semver-major-days: 28
+    groups:
+      cargo-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # docker
+  - package-ecosystem: "docker"
+    directory: "/docker"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    cooldown:
+      default-days: 7
+
+  # github-actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "github_actions"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    cooldown:
+      default-days: 7
+    groups:
+      actions-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # npm: web
+  - package-ecosystem: "npm"
+    directory: "/web"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "javascript"
+      - "area:web"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    cooldown:
+      default-days: 7
+      semver-minor-days: 14
+      semver-major-days: 28
+    groups:
+      tailwind:
+        patterns:
+          - "tailwindcss"
+          - "@tailwindcss/*"
+        update-types: ["minor", "patch"]
+      web-minor-patch:
+        patterns: ["*"]
+        exclude-patterns:
+          - "react"
+          - "react-dom"
+          - "tailwindcss"
+          - "@tailwindcss/*"
+          # Pre-1.0 packages: a minor bump is a breaking change by semver
+          # convention, but dependabot still classifies it as "minor" and so
+          # would group it with the routine updates. Excluding them gives each
+          # its own PR, so one breaking library cannot hold the rest hostage.
+          # In #3394, @assistant-ui/react 0.14 to 0.15 dropped three hooks and
+          # blocked 15 unrelated bumps behind a red build.
+          - "@assistant-ui/*"
+          - "eslint-plugin-react-refresh"
+          - "oxfmt"
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "react"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "react-dom"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "tailwindcss"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@tailwindcss/*"
+        update-types: ["version-update:semver-major"]
+
+  # npm: acp-worker/aoe-agent
+  - package-ecosystem: "npm"
+    directory: "/acp-worker/aoe-agent"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "javascript"
+      - "area:web"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    cooldown:
+      default-days: 7
+      semver-minor-days: 14
+      semver-major-days: 28
+    groups:
+      ai-sdk:
+        patterns: ["@ai-sdk/*", "ai"]
+        update-types: ["minor", "patch"]
+      acp:
+        patterns: ["@agentclientprotocol/*"]
+        update-types: ["minor", "patch"]
+      aoe-agent-other-minor-patch:
+        patterns: ["*"]
+        exclude-patterns:
+          - "@ai-sdk/*"
+          - "ai"
+          - "@agentclientprotocol/*"
+        update-types: ["minor", "patch"]
+
+  # npm: acp-worker/adapters/* (one pinned ACP adapter per directory).
+  # These pins are what `aoe acp doctor --fix` installs, so without
+  # dependabot the bundled adapter version rots by design (#1017).
+  - package-ecosystem: "npm"
+    directories:
+      - "/acp-worker/adapters/claude-agent-acp"
+      - "/acp-worker/adapters/codex-acp"
+      - "/acp-worker/adapters/pi-acp"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "javascript"
+      - "area:infra"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    cooldown:
+      default-days: 7
+      semver-minor-days: 14
+      semver-major-days: 28
+
+  # npm: acp-worker/test-shim
+  - package-ecosystem: "npm"
+    directory: "/acp-worker/test-shim"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "javascript"
+      - "area:web"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    cooldown:
+      default-days: 7
+      semver-minor-days: 14
+      semver-major-days: 28
+    groups:
+      acp:
+        patterns: ["@agentclientprotocol/*"]
+        update-types: ["minor", "patch"]
+
+  # npm: website
+  - package-ecosystem: "npm"
+    directory: "/website"
+    schedule:
+      interval: "monthly"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "javascript"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    cooldown:
+      default-days: 7
+      semver-minor-days: 14
+      semver-major-days: 28
+    groups:
+      tailwind:
+        patterns:
+          - "tailwindcss"
+          - "@tailwindcss/*"
+        update-types: ["minor", "patch"]
+      website-minor-patch:
+        patterns: ["*"]
+        exclude-patterns:
+          - "tailwindcss"
+          - "@tailwindcss/*"
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "tailwindcss"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@tailwindcss/*"
+        update-types: ["version-update:semver-major"]
