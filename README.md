@@ -85,6 +85,8 @@ cd agents-of-empire
 
 The first build takes about 8 minutes. To update later, run `git pull && ./install.sh`.
 
+On Linux, install tmux, Node.js, and Rust yourself first. If your distro's default `cc` is GCC 9 (Ubuntu 20.04), also install `gcc-11` or `clang`; the TLS library refuses GCC 9, and the script switches to the newer compiler on its own.
+
 Don't use `aoe update`: it downloads the stock upstream release and replaces this build. The install script turns off update checks for that reason. To remove AoE, run `aoe uninstall`.
 
 ### Official upstream release
