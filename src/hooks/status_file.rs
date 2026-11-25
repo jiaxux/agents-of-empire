@@ -8,7 +8,7 @@
 
 use std::os::fd::AsFd;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use anyhow::Result;
 use uuid::Uuid;
@@ -16,9 +16,6 @@ use uuid::Uuid;
 use crate::session::Status;
 
 use super::dir_guard;
-
-/// Maximum age before a sidecar `session_id` file is considered stale.
-pub(crate) const SESSION_ID_SIDECAR_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 
 /// Cap used when reading a status file. The legitimate values are short
 /// tokens; an attacker-planted larger payload is irrelevant either way.
@@ -117,15 +114,14 @@ fn parse_status(bytes: &[u8]) -> Option<Status> {
 
 /// Read a Claude session UUID from the hook-written `session_id` sidecar.
 ///
-/// Returns `None` when the file is absent, malformed (non-UUID), or older
-/// than `SESSION_ID_SIDECAR_MAX_AGE`.
+/// Returns `None` when the file is absent or malformed (non-UUID). There is
+/// deliberately no age limit: the sidecar is unlinked before every Claude
+/// launch and rewritten by `SessionStart` (startup, `/clear`, `/resume`,
+/// compaction) and `UserPromptSubmit`, so an old file only means the session
+/// has been idle, not that it names the wrong conversation. Ageing it out sent
+/// idle sessions to the shared-cwd mtime scan, which adopts a sibling's chat.
 pub fn read_hook_session_id(instance_id: &str) -> Option<String> {
     let dir = dir_guard::open_instance_dir_read_only(instance_id).ok()??;
-    let meta = dir_guard::metadata_at(dir.as_fd(), "session_id").ok()??;
-    let mtime = meta.modified().ok()?;
-    if mtime.elapsed().ok()? > SESSION_ID_SIDECAR_MAX_AGE {
-        return None;
-    }
     let bytes =
         dir_guard::read_file_at(dir.as_fd(), "session_id", SESSION_ID_FILE_READ_CAP).ok()??;
     let id = std::str::from_utf8(&bytes).ok()?.trim().to_string();
@@ -391,18 +387,21 @@ mod tests {
 
     #[test]
     #[serial_test::serial(hook_base)]
-    fn test_read_hook_session_id_rejects_stale_file() {
+    fn test_read_hook_session_id_keeps_idle_sidecar() {
         let (_g, base, _tmp) = BaseGuard::ready();
         let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-        write_session_id_sidecar("session_id_stale", uuid);
-        let stale = std::time::SystemTime::now() - Duration::from_secs(10 * 60);
+        write_session_id_sidecar("session_id_idle", uuid);
+        let idle = std::time::SystemTime::now() - Duration::from_secs(10 * 60);
         std::fs::File::options()
             .write(true)
-            .open(base.join("session_id_stale").join("session_id"))
+            .open(base.join("session_id_idle").join("session_id"))
             .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(stale))
+            .set_times(std::fs::FileTimes::new().set_modified(idle))
             .unwrap();
-        assert_eq!(read_hook_session_id("session_id_stale"), None);
+        assert_eq!(
+            read_hook_session_id("session_id_idle").as_deref(),
+            Some(uuid)
+        );
     }
 
     #[test]

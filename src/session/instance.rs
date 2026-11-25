@@ -3164,6 +3164,16 @@ impl Instance {
     /// Full set of session IDs capture must skip for this instance: live tmux
     /// ownership, cascade-cleared ids, and conversations same-project peers
     /// parked while running another tool.
+    /// Whether AoE's Claude hooks are installed for this session, making the
+    /// hook-written `session_id` sidecar the only trusted record of which
+    /// conversation it runs (see [`claude_poll_fn`]).
+    fn claude_sidecar_authoritative(&self) -> bool {
+        self.tool == "claude"
+            && super::profile_config::resolve_config_or_warn(&self.effective_profile())
+                .session
+                .agent_status_hooks
+    }
+
     fn retroactive_capture_exclusion_set(&self) -> HashSet<String> {
         super::capture::compose_exclusion_with_persisted_peers(
             &self.id,
@@ -3537,10 +3547,9 @@ impl Instance {
     /// unlike the mtime disk scan, which picks the most-recent jsonl in the
     /// shared `~/.claude/projects/<encoded-cwd>/` dir and so can select a
     /// co-located peer's session when several AoE sessions share one cwd
-    /// (#2344). The mtime scan is only used as a fallback when no fresh
-    /// sidecar exists (e.g. an old session resumed after the 5-minute
-    /// sidecar window), matching the ordering already used by
-    /// `claude_poll_fn`. Sandboxed Claude is included: its `SessionStart`
+    /// (#2344). The mtime scan is only used as a fallback when there is no
+    /// sidecar and AoE's hooks are not installed, matching the ordering
+    /// already used by `claude_poll_fn`. Sandboxed Claude is included: its `SessionStart`
     /// hook writes through the `/tmp/aoe-hooks/<id>` bind-mount onto the
     /// host path, so `read_hook_session_id` reads it the same way, and the
     /// mtime fallback below still routes through the container-aware branch
@@ -3560,6 +3569,13 @@ impl Instance {
                     return None;
                 }
                 return override_if_distinct(self.agent_session_id.as_deref(), authoritative);
+            }
+            // No sidecar (a reboot wiped `/tmp`) while hooks are installed: the
+            // stored sid is the last one the hooks reported, so keep it. The
+            // mtime scan would pick whichever same-cwd sibling wrote last and
+            // resume that sibling's conversation under this session's name.
+            if self.claude_sidecar_authoritative() {
+                return None;
             }
         }
 
@@ -5749,6 +5765,7 @@ impl Instance {
                         instance_id.clone(),
                         extra_excludes.clone(),
                         self.resolved_host_environment(),
+                        self.claude_sidecar_authoritative(),
                     ))
                 }
             }
@@ -13915,7 +13932,7 @@ mod tests {
 
             #[test]
             #[serial]
-            fn supersedes_stale_claude_sid_after_clear() {
+            fn fresher_same_cwd_jsonl_supersedes_only_without_hooks() {
                 let temp = tempdir().unwrap();
                 let _guard = claude_home_guard(&temp);
 
@@ -13939,11 +13956,32 @@ mod tests {
                     now - Duration::from_secs(10),
                 );
 
-                let mut inst = Instance::new("verify-claude-bascule", project_path);
-                inst.tool = "claude".to_string();
-                inst.agent_session_id = Some(stale.to_string());
-                inst.resume_intent = ResumeIntent::Default;
+                let new_inst = || {
+                    let mut inst = Instance::new("verify-claude-bascule", project_path);
+                    inst.tool = "claude".to_string();
+                    inst.agent_session_id = Some(stale.to_string());
+                    inst.resume_intent = ResumeIntent::Default;
+                    inst
+                };
 
+                // Hooks installed (the default) and no sidecar, as after a
+                // reboot: the newer jsonl may be a same-cwd sibling's, so the
+                // stored sid is resumed rather than the sibling's chat.
+                let mut inst = new_inst();
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(stale));
+                assert!(is_existing);
+
+                // Without hooks the mtime scan is the only way to follow a
+                // `/clear`, so the fresher jsonl still supersedes.
+                let profile_dir =
+                    crate::session::get_profile_dir(&inst.effective_profile()).unwrap();
+                fs::write(
+                    profile_dir.join("config.toml"),
+                    "[session]\nagent_status_hooks = false\n",
+                )
+                .unwrap();
+                let mut inst = new_inst();
                 let (sid, is_existing) = inst.acquire_session_id();
                 assert_eq!(sid.as_deref(), Some(fresh));
                 assert!(is_existing);
@@ -14271,45 +14309,6 @@ mod tests {
                 assert_eq!(sid.as_deref(), Some(mine));
                 assert!(is_existing);
                 assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
-            }
-
-            // Companion to the above: without a sidecar (e.g. a session resumed
-            // after the 5-minute sidecar window) the mtime fallback still
-            // applies, preserving the #2291 daemon-mode fix.
-            #[test]
-            #[serial]
-            fn mtime_fallback_applies_without_sidecar() {
-                let temp = tempdir().unwrap();
-                let _guard = claude_home_guard(&temp);
-
-                let project_path = "/tmp/aoe-test-2344-no-sidecar";
-                let claude_dir = temp
-                    .path()
-                    .join(".claude")
-                    .join("projects")
-                    .join(encode_claude_project_path(project_path));
-                fs::create_dir_all(&claude_dir).unwrap();
-
-                let stale = "cccccccc-3333-4333-8333-cccccccccccc";
-                let fresh = "dddddddd-4444-4444-8444-dddddddddddd";
-                let now = SystemTime::now();
-                write_jsonl_with_mtime(
-                    &claude_dir.join(format!("{stale}.jsonl")),
-                    now - Duration::from_secs(120),
-                );
-                write_jsonl_with_mtime(
-                    &claude_dir.join(format!("{fresh}.jsonl")),
-                    now - Duration::from_secs(5),
-                );
-
-                let mut inst = Instance::new("verify-2344-no-sidecar", project_path);
-                inst.tool = "claude".to_string();
-                inst.agent_session_id = Some(stale.to_string());
-                inst.resume_intent = ResumeIntent::Default;
-
-                let (sid, _is_existing) = inst.acquire_session_id();
-                assert_eq!(sid.as_deref(), Some(fresh));
-                assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
             }
 
             // #2355: when a co-located stopped peer leaves a fresher jsonl in

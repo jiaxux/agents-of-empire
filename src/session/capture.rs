@@ -335,9 +335,14 @@ fn read_claude_json_session_id(claude_json: &Path, project_path: &Path) -> Optio
 ///
 /// Per tick, in order:
 /// 1. Read `/tmp/aoe-hooks-<euid>/<instance_id>/session_id` (written by Claude's
-///    `SessionStart` / `UserPromptSubmit` hooks). When present and ≤ 5 min
-///    old, return it and skip the disk scan.
-/// 2. Otherwise scan `<config>/projects/<encoded-path>/`, where `<config>` is
+///    `SessionStart` / `UserPromptSubmit` hooks). When present, return it and
+///    skip the disk scan.
+/// 2. When `sidecar_authoritative` (AoE's hooks are installed for this
+///    session), stop there: the hooks report every conversation change, and
+///    the scan below cannot tell this pane's jsonl from a sibling's when
+///    several sessions share a cwd, so it would adopt the sibling's chat
+///    (and resume it after a restart).
+/// 3. Otherwise scan `<config>/projects/<encoded-path>/`, where `<config>` is
 ///    the session's profile-scoped Claude config dir (`host_env`), so a
 ///    same-cwd peer in another profile is never a candidate. The scan uses
 ///    `compose_exclusion(instance_id, extra_excludes)` to skip UUIDs claimed
@@ -351,6 +356,7 @@ pub(crate) fn claude_poll_fn(
     instance_id: String,
     extra_excludes: HashSet<String>,
     host_env: Vec<String>,
+    sidecar_authoritative: bool,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     let last_known = std::sync::Mutex::new(known_session_id);
     move || {
@@ -369,6 +375,9 @@ pub(crate) fn claude_poll_fn(
                     return Some(validated);
                 }
             }
+        }
+        if sidecar_authoritative {
+            return None;
         }
 
         let current_known = last_known.lock().ok().and_then(|g| g.clone());
@@ -3473,6 +3482,7 @@ mod tests {
             "test-instance-promote-last-known".to_string(),
             extra_excludes,
             Vec::new(),
+            false,
         );
 
         assert_eq!(poll().as_deref(), Some(uuid_post_fork));
@@ -6644,6 +6654,7 @@ mod tests {
             instance_id.to_string(),
             HashSet::new(),
             Vec::new(),
+            false,
         );
         assert_eq!(poll().as_deref(), Some(sidecar_uuid));
 
@@ -6655,7 +6666,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_claude_poll_fn_skips_stale_sidecar_falls_through_to_disk() {
+    fn test_claude_poll_fn_sidecar_authority_in_shared_cwd() {
         use std::os::unix::fs::PermissionsExt;
         let hook_tmp = tempfile::tempdir().unwrap();
         let hook_base = hook_tmp.path().join("aoe-hooks");
@@ -6672,38 +6683,49 @@ mod tests {
         }
         let _cleanup = Cleanup;
 
-        let instance_id = "test_sidecar_stale_falls_through";
+        let instance_id = "test_sidecar_authority";
         let hook_dir = hook_base.join(instance_id);
         std::fs::create_dir(&hook_dir).unwrap();
         std::fs::set_permissions(&hook_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let stale_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let own_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let sidecar_path = hook_dir.join("session_id");
-        std::fs::write(&sidecar_path, stale_uuid).unwrap();
-        let stale = std::time::SystemTime::now() - Duration::from_secs(10 * 60);
+        std::fs::write(&sidecar_path, own_uuid).unwrap();
+        let idle = std::time::SystemTime::now() - Duration::from_secs(10 * 60);
         std::fs::File::options()
             .write(true)
             .open(&sidecar_path)
             .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(stale))
+            .set_times(std::fs::FileTimes::new().set_modified(idle))
             .unwrap();
 
+        // A same-cwd sibling is actively writing its own transcript.
         let tmp = tempfile::tempdir().unwrap();
         let project_dir = tmp.path().join("projects").join("-tmp-myproject");
         std::fs::create_dir_all(&project_dir).unwrap();
-        let disk_uuid = "11111111-2222-3333-4444-555555555555";
-        std::fs::write(project_dir.join(format!("{disk_uuid}.jsonl")), "d\n").unwrap();
+        let sibling_uuid = "11111111-2222-3333-4444-555555555555";
+        std::fs::write(project_dir.join(format!("{sibling_uuid}.jsonl")), "d\n").unwrap();
 
         let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
+        let poll_with = |authoritative: bool| {
+            claude_poll_fn(
+                "/tmp/myproject".to_string(),
+                Some(own_uuid.to_string()),
+                instance_id.to_string(),
+                HashSet::new(),
+                Vec::new(),
+                authoritative,
+            )()
+        };
 
-        let poll = claude_poll_fn(
-            "/tmp/myproject".to_string(),
-            None,
-            instance_id.to_string(),
-            HashSet::new(),
-            Vec::new(),
-        );
-        assert_eq!(poll().as_deref(), Some(disk_uuid));
+        // An idle sidecar still names this session's own conversation.
+        assert_eq!(poll_with(true).as_deref(), Some(own_uuid));
+        assert_eq!(poll_with(false).as_deref(), Some(own_uuid));
+        // Without a sidecar, installed hooks mean "nothing new to report",
+        // never "adopt the sibling"; only a hookless session scans the dir.
+        std::fs::remove_file(&sidecar_path).unwrap();
+        assert_eq!(poll_with(true), None);
+        assert_eq!(poll_with(false).as_deref(), Some(sibling_uuid));
 
         match old_val {
             Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
