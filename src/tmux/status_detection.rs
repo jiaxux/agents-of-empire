@@ -2721,6 +2721,9 @@ pub fn detect_qwen_status(raw_content: &str) -> Status {
     Status::Idle
 }
 
+/// Antigravity's dot spinner, which leads its status line above the prompt.
+const ANTIGRAVITY_SPINNER_FRAMES: &[char] = &['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
+
 pub fn detect_antigravity_status(raw_content: &str) -> Status {
     let content = raw_content.to_lowercase();
     let lines: Vec<&str> = content.lines().collect();
@@ -2761,19 +2764,48 @@ pub fn detect_antigravity_status(raw_content: &str) -> Status {
         return Status::Waiting;
     }
 
-    if contains_approval_prompt(
-        &last_lines_lower,
-        &[
-            "permission request",
-            "do you trust the contents",
-            "yes, i trust this folder",
-            "execute?",
-            "run command?",
-            "enter to select",
-            "enter confirm",
-            "esc to cancel",
-        ],
-    ) {
+    if [
+        "permission request",
+        "do you trust the contents",
+        "yes, i trust this folder",
+        "enter to select",
+        "enter confirm",
+    ]
+    .iter()
+    .any(|p| last_lines_lower.contains(p))
+    {
+        return Status::Waiting;
+    }
+
+    // A turn keeps an `esc to cancel` footer and a spinner-led status line on
+    // screen until it ends; while thinking, that line is a free-text summary
+    // rather than an activity word. Checked before the generic approval words,
+    // which also match transcript text such as "allows" above the prompt.
+    let footer_cancel = non_empty_lines
+        .iter()
+        .rev()
+        .take(3)
+        .any(|line| line.contains("esc to cancel"));
+    let spinner_status_line = non_empty_lines
+        .iter()
+        .rev()
+        .take(30)
+        .any(|line| line.trim_start().starts_with(ANTIGRAVITY_SPINNER_FRAMES));
+    if footer_cancel || spinner_status_line {
+        return Status::Running;
+    }
+    // Once the turn ends the footer switches to `? for shortcuts`, so transcript
+    // words like "allow" must not turn an idle session into Waiting.
+    if non_empty_lines
+        .iter()
+        .rev()
+        .take(3)
+        .any(|line| line.contains("? for shortcuts"))
+    {
+        return Status::Idle;
+    }
+
+    if contains_approval_prompt(&last_lines_lower, &["execute?", "run command?"]) {
         return Status::Waiting;
     }
 
@@ -6487,14 +6519,51 @@ Antigravity CLI requires permission to read, edit, and execute files here.
 
     #[test]
     fn test_detect_antigravity_status_running() {
-        assert_eq!(
-            detect_antigravity_status("processing request\nesc to interrupt"),
-            Status::Running
-        );
-        assert_eq!(
-            detect_antigravity_status("⠋ Thinking about your request"),
-            Status::Running
-        );
+        let cases = [
+            "processing request\nesc to interrupt",
+            "⠋ Thinking about your request",
+            // agy 1.5 thinking: the spinner line is a free-text summary, the
+            // footer reads `esc to cancel`, and transcript text above says
+            // "allows", which used to read as an approval prompt.
+            "\
+● Explored 6 files (README.md, main.tex, sec_training.tex, +3)
+○ Thought for 12s (This allows the draft to cite the shared papers.)
+⢿  Initial assessment: Reviewing the downloaded papers on drone racing... 1s
+└ Tip: Use /tasks to see background tasks and their status.
+──────────────────────────────
+>
+──────────────────────────────
+esc to cancel                                        auto · Gemini 4 Neon · high",
+            "\
+⣟  Running command... 2s
+──────────────────────────────
+>
+──────────────────────────────
+esc to cancel                                        auto · Gemini 4 Neon · high",
+            // A queued message replaces the `esc to cancel` footer, and the
+            // step checklist pushes the spinner line well above the prompt.
+            "\
+● Edited 2 files (README.md, refs.bib) (ctrl+o to expand)
+⣟  1/6 steps · Now focusing on the use of these labels and macros... 27s
+  ⎿  ✓ Review draft and fetch RPG papers
+     ● Catalog shared RPG papers and update references
+     ○ Refine main text and introduction
+     ○ Refine generalist and architecture sections
+     ○ Refine humanoid section and appendices
+     ○ Compile PDF and verify LaTeX build
+▸  good can you have a read of all the papers... (alt+m to send immediately)
+──────────────────────────────
+>
+──────────────────────────────
+  Press up to edit queued messages                   auto · Gemini 4 Neon · high",
+        ];
+        for content in cases {
+            assert_eq!(
+                detect_antigravity_status(content),
+                Status::Running,
+                "{content}"
+            );
+        }
     }
 
     #[test]
@@ -6540,7 +6609,8 @@ Antigravity CLI requires permission to read, edit, and execute files here.
         // Real header rendered above Antigravity tool permission prompts.
         // "approval" does not contain "approve", so the shared
         // contains_approval_prompt helper misses this header; the detector
-        // matches "approval required" explicitly instead.
+        // matches "approval required" explicitly instead. It must also win over
+        // the `esc to cancel` footer that stays up for the whole turn.
         let content = "\
 read_file
 path: /workspace/secrets.env
@@ -6549,7 +6619,9 @@ path: /workspace/secrets.env
 
 > Yes, just this once
   Yes, allow always
-  No, deny access";
+  No, deny access
+
+esc to cancel";
         assert_eq!(detect_antigravity_status(content), Status::Waiting);
     }
 
@@ -6563,11 +6635,30 @@ path: /workspace/secrets.env
 
     #[test]
     fn test_detect_antigravity_status_idle() {
-        assert_eq!(detect_antigravity_status("file saved"), Status::Idle);
-        assert_eq!(
-            detect_antigravity_status("random output text"),
-            Status::Idle
-        );
+        let cases = [
+            "file saved",
+            "random output text",
+            // agy 1.5 after a turn, with a background task still listed and
+            // transcript text that would otherwise match approval words.
+            "\
+● Edited 1 file (main.tex)
+● Running (python3 -c ' import re txt = open(\"main.tex\").read() ...) (ctrl+o to expand)
+▸ Thought for 4s, 209 tokens
+  This allows the abstract to stay under the limit; approve the wording later.
+──────────────────────────────
+>
+──────────────────────────────
+  ● [12:04:40] python3 -c ' import re ... running
+──────────────────────────────
+? for shortcuts                                      auto · Gemini 4 Neon · high · 1 task(s) · /tasks",
+        ];
+        for content in cases {
+            assert_eq!(
+                detect_antigravity_status(content),
+                Status::Idle,
+                "{content}"
+            );
+        }
     }
 
     #[test]
