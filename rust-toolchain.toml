@@ -1,2 +1,4 @@
+# Pinned so future Rust stable bumps do not break CI clippy unexpectedly.
 [toolchain]
-channel = "stable"
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
