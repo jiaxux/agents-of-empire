@@ -8,7 +8,12 @@ no-default-features = false
 [advisories]
 # Deny any crate with a known security vulnerability
 version = 2
-ignore = []
+ignore = [
+    # chrono is unmaintained in the v1.15 lockfile; mirrors upstream #5820.
+    "RUSTSEC-2026-0543",
+    # libz-sys advisory in the pinned v1.15 lockfile; mirrors upstream #5820.
+    "RUSTSEC-2026-0544",
+]
 
 # License policy
 [licenses]

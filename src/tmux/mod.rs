@@ -73,6 +73,13 @@ enum TmuxSocket {
     Name(String),
 }
 
+/// Default private tmux socket name (`tmux -L aoe`) used when the user has
+/// not configured `tmux.socket_name` and there are no legacy `aoe_*` sessions
+/// still running on tmux's default server. Isolating AoE onto its own tmux
+/// server prevents external `tmux` commands, plugins, or server restarts from
+/// killing AoE chats.
+pub(crate) const DEFAULT_ISOLATED_SOCKET_NAME: &str = "aoe";
+
 /// Resolve which tmux server this build talks to, or `None` to use tmux's
 /// default per-user socket. Cached: neither the process env nor the config are
 /// re-read at runtime (moving live sessions across servers is not meaningful).
@@ -84,12 +91,11 @@ enum TmuxSocket {
 ///   e2e their own tmux server so they can never poison an installed release
 ///   build's shared server (#2608); the app dir is already namespaced
 ///   (`~/.agent-of-empires-dev`).
-/// - `tmux.socket_name` config set -> that name via `-L` (#2267): the user
-///   opts into a private tmux server so their hand-managed `tmux ls` no longer
-///   lists aoe's sessions. Release builds only; debug/test already isolate onto
-///   their own socket above.
-/// - release builds        -> `None`: keep tmux's default socket so upgrading
-///   does not orphan the release build's live sessions.
+/// - `tmux.socket_name` config set -> that name via `-L` (#2267), or `None`
+///   when explicitly set to `"default"`.
+/// - release builds (unset)-> `Some(TmuxSocket::Name("aoe"))` by default for
+///   isolation, unless legacy `aoe_*` sessions are still live on tmux's
+///   default socket (so upgrading never orphans running chats).
 fn tmux_socket() -> Option<TmuxSocket> {
     static SOCKET: OnceLock<Option<TmuxSocket>> = OnceLock::new();
     SOCKET
@@ -102,9 +108,67 @@ fn tmux_socket() -> Option<TmuxSocket> {
             if let Some(path) = build_isolation_socket() {
                 return Some(TmuxSocket::Path(path));
             }
-            socket_from_config_name(configured_socket_name())
+            let configured = configured_socket_name();
+            let legacy_live = if configured
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+            {
+                default_socket_has_aoe_sessions()
+            } else {
+                false
+            };
+            resolve_release_socket(configured, legacy_live)
         })
         .clone()
+}
+
+/// Probe tmux's default socket (ignoring any inherited `$TMUX`) to see whether
+/// legacy `aoe_*` sessions are still alive there. Used once at startup so
+/// switching release builds onto `-L aoe` never orphans already-running chats.
+fn default_socket_has_aoe_sessions() -> bool {
+    let Ok(output) = Command::new("tmux")
+        .env_remove("TMUX")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.lines().any(is_aoe_session)
+}
+
+/// Pure socket selection for release builds:
+/// - Explicit `"default"` opts into tmux's shared default server (`None`).
+/// - Any other valid bare `socket_name` maps to `-L <name>`.
+/// - When unset/empty, isolates onto `-L aoe` unless `default_has_live_aoe_sessions`
+///   is true (keeping existing default-socket sessions attached until closed).
+fn resolve_release_socket(
+    configured: Option<String>,
+    default_has_live_aoe_sessions: bool,
+) -> Option<TmuxSocket> {
+    if let Some(trimmed) = configured
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if trimmed.eq_ignore_ascii_case("default") {
+            return None;
+        }
+        return socket_from_config_name(Some(trimmed.to_string()));
+    }
+    if default_has_live_aoe_sessions {
+        tracing::info!(
+            target: "tmux.socket",
+            "found live aoe sessions on tmux's default socket; staying on default socket for this run so existing chats stay attached"
+        );
+        None
+    } else {
+        Some(TmuxSocket::Name(DEFAULT_ISOLATED_SOCKET_NAME.to_string()))
+    }
 }
 
 /// The build-specific isolation socket path, if this build forces one. Test
@@ -793,10 +857,7 @@ pub fn stop_all_sessions() -> anyhow::Result<usize> {
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
             if is_aoe_session(line) {
-                if let Some(pid) = crate::process::get_pane_pid(line) {
-                    crate::process::kill_process_tree(pid);
-                }
-                let _ = tmux_command().args(["kill-session", "-t", line]).output();
+                let _ = utils::kill_session_cleanly(line);
                 killed += 1;
             }
         }
@@ -1883,6 +1944,31 @@ mod tests {
         );
         assert_eq!(socket_from_config_name(Some("a/b".to_string())), None);
         assert_eq!(socket_from_config_name(Some("a\\b".to_string())), None);
+    }
+
+    #[test]
+    fn resolve_release_socket_isolates_by_default_without_orphaning_legacy_sessions() {
+        // Fresh machine / no legacy default-socket sessions -> isolated `-L aoe`.
+        assert_eq!(
+            resolve_release_socket(None, false),
+            Some(TmuxSocket::Name("aoe".to_string()))
+        );
+        assert_eq!(
+            resolve_release_socket(Some("   ".to_string()), false),
+            Some(TmuxSocket::Name("aoe".to_string()))
+        );
+        // Existing live default-socket sessions -> stay on default socket to avoid orphaning.
+        assert_eq!(resolve_release_socket(None, true), None);
+        // Explicit `"default"` opts back into default socket even when empty.
+        assert_eq!(
+            resolve_release_socket(Some("default".to_string()), false),
+            None
+        );
+        // Explicit custom socket name always wins.
+        assert_eq!(
+            resolve_release_socket(Some("aoe_custom".to_string()), true),
+            Some(TmuxSocket::Name("aoe_custom".to_string()))
+        );
     }
 
     #[test]

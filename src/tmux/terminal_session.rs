@@ -255,12 +255,7 @@ impl PairedTerminal {
             return Ok(());
         }
 
-        // Kill the entire process tree first to ensure child processes are terminated
-        if let Some(pane_pid) = self.get_pane_pid() {
-            process::kill_process_tree(pane_pid);
-        }
-
-        super::utils::kill_session_if_present(&self.name)?;
+        super::utils::kill_session_cleanly(&self.name)?;
 
         refresh_session_cache();
 
@@ -477,6 +472,9 @@ impl ContainerTerminalSession {
 /// web tabs (`_t{N}` suffixes) and any title-change orphans are all reaped on
 /// session teardown. Mirrors [`crate::tmux::kill_all_tool_sessions_for_id`].
 pub fn kill_all_terminals_for_id(id: &str) {
+    if id.trim().is_empty() {
+        return;
+    }
     let needle = format!("_{}", truncate_id(id, 8));
 
     let output = crate::tmux::tmux_command()
@@ -501,12 +499,7 @@ pub fn kill_all_terminals_for_id(id: &str) {
                 if !after.is_empty() && !after.starts_with("_t") {
                     continue;
                 }
-                if let Some(pid) = process::get_pane_pid(line) {
-                    process::kill_process_tree(pid);
-                }
-                let _ = crate::tmux::tmux_command()
-                    .args(["kill-session", "-t", line])
-                    .output();
+                let _ = super::utils::kill_session_cleanly(line);
             }
         }
     }

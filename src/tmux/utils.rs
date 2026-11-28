@@ -262,19 +262,35 @@ pub(crate) enum PaneProbe {
     Unknown,
 }
 
+/// Build an exact-match tmux session target (`=<name>`), rejecting empty or
+/// whitespace-only names so tmux can never fall back to prefix or current
+/// session resolution.
+pub(crate) fn exact_session_target(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with('=') {
+        Some(trimmed.to_string())
+    } else {
+        Some(format!("={trimmed}"))
+    }
+}
+
+/// Build an exact-match target for the first window's first pane
+/// (`=<session>:^.0`), rejecting empty or whitespace-only session names.
+pub(crate) fn exact_pane_target(session_name: &str) -> Option<String> {
+    exact_session_target(session_name).map(|target| format!("{target}:^.0"))
+}
+
 pub(crate) fn probe_pane(session_name: &str) -> PaneProbe {
     // An empty name would make the target `:^.0`, which tmux resolves against
     // whatever session is current: an unrelated live pane would then answer
     // `Alive` and a poller seeded with no name would never terminate. Nothing
     // resolved, so `Missing`.
-    if session_name.is_empty() {
+    let Some(target) = exact_pane_target(session_name) else {
         return PaneProbe::Missing;
-    }
-    // Use `^.0` to target the first window's first pane regardless of
-    // base-index or which pane is active, so the check always hits the
-    // agent's pane even when the user has created additional tmux windows
-    // or split panes.  See #435, #488.
-    let target = format!("{session_name}:^.0");
+    };
     // `tmux_query_command`, not `tmux_command`: `classify_pane_probe` matches
     // the ENOENT marker in tmux's `error connecting to <socket> (<strerror>)`,
     // and glibc localizes `strerror` by `LC_MESSAGES`.
@@ -317,9 +333,10 @@ pub fn is_pane_dead(session_name: &str) -> bool {
 }
 
 pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
-    // Use `^.0` to target the first window's first pane regardless of
-    // base-index or which pane is active.  See #435, #488.
-    let target = format!("{session_name}:^.0");
+    // Use `=<session>:^.0` to exact-match the session and target the first
+    // window's first pane regardless of base-index or which pane is active.
+    // See #435, #488.
+    let target = exact_pane_target(session_name)?;
     crate::tmux::tmux_query_command()
         .args([
             "display-message",
@@ -336,7 +353,9 @@ pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
 }
 
 fn pane_start_command_is_protected(session_name: &str) -> bool {
-    let target = format!("{session_name}:^.0");
+    let Some(target) = exact_pane_target(session_name) else {
+        return false;
+    };
     crate::tmux::tmux_query_command()
         .args([
             "display-message",
@@ -408,17 +427,83 @@ pub fn tmux_prefix_display() -> &'static str {
     })
 }
 
-/// Run `tmux kill-session -t <name>`. A missing session is treated as
-/// success, since the goal is "this session is not present": `can't find
-/// session` (the session is gone, e.g. callers commonly kill the pane's
-/// process tree first, which can tear the session down before this lands)
-/// and `no server running` (no tmux server at all, so no session exists)
-/// are both swallowed in the C locale. Any other tmux failure returns
-/// `Err`. Caller is responsible for `refresh_session_cache` after a
-/// successful kill.
+/// Parse `tmux list-panes -s -t =<name> -F "#{pid} #{pane_dead} #{pane_pid}"`
+/// into deduplicated `(pane_pid, server_pid)` pairs for live panes only.
+///
+/// Dead panes (`pane_dead != "0"`) are skipped because `remain-on-exit on`
+/// keeps a crashed pane's old `#{pane_pid}` around after the process exited;
+/// signaling that PID could hit an unrelated process if the OS recycled it.
+pub(crate) fn parse_live_pane_pids(stdout: &str) -> Vec<(u32, u32)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut live = Vec::new();
+    for line in stdout.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(server_raw), Some(dead_raw), Some(pane_raw)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if dead_raw != "0" {
+            continue;
+        }
+        let (Ok(server_pid), Ok(pane_pid)) = (server_raw.parse::<u32>(), pane_raw.parse::<u32>())
+        else {
+            continue;
+        };
+        if server_pid <= 1 || pane_pid <= 1 || pane_pid == server_pid {
+            continue;
+        }
+        if seen.insert(pane_pid) {
+            live.push((pane_pid, server_pid));
+        }
+    }
+    live
+}
+
+/// Kill the process trees of every LIVE pane belonging to exact session `name`,
+/// verifying each pane PID is still a direct child of that tmux server so dead
+/// or recycled PIDs can never kill another chat or the tmux server itself.
+pub(crate) fn kill_live_pane_trees(name: &str) {
+    let Some(target) = exact_session_target(name) else {
+        return;
+    };
+    let Ok(output) = crate::tmux::tmux_query_command()
+        .args([
+            "list-panes",
+            "-s",
+            "-t",
+            &target,
+            "-F",
+            "#{pid} #{pane_dead} #{pane_pid}",
+        ])
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for (pane_pid, server_pid) in parse_live_pane_pids(&stdout) {
+        crate::process::kill_process_tree_with_parent(pane_pid, server_pid);
+    }
+}
+
+/// Run `tmux kill-session -t =<name>`. Uses tmux's `=` exact-match prefix so an
+/// empty or already-vanished session name can never prefix-match another
+/// session. A missing session is treated as success, since the goal is "this
+/// session is not present": `can't find session` (the session is gone, e.g.
+/// callers commonly kill the pane's process tree first, which can tear the
+/// session down before this lands) and `no server running` (no tmux server at
+/// all, so no session exists) are both swallowed in the C locale. Any other
+/// tmux failure returns `Err`. Caller is responsible for
+/// `refresh_session_cache` after a successful kill.
 pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
+    let Some(target) = exact_session_target(name) else {
+        return Ok(());
+    };
     let output = crate::tmux::tmux_query_command()
-        .args(["kill-session", "-t", name])
+        .args(["kill-session", "-t", &target])
         .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -428,6 +513,7 @@ pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
         // pollers need the narrower ENOENT-only test to keep transient glitches
         // on the error path; here a false "absent" cannot act on a live pane.
         let absent = stderr.contains("can't find session")
+            || stderr.contains("session not found")
             || stderr.contains("no server running")
             || stderr.contains("error connecting");
         if !absent {
@@ -435,6 +521,14 @@ pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Cleanly tear down one exact tmux session: first terminate only its live
+/// pane process trees (verified against the tmux server PID), then remove the
+/// tmux session itself using an exact `=<name>` target.
+pub(crate) fn kill_session_cleanly(name: &str) -> Result<()> {
+    kill_live_pane_trees(name);
+    kill_session_if_present(name)
 }
 
 /// Convert tmux's raw prefix notation (e.g. "C-a", "M-b", "F12") to the
@@ -983,6 +1077,78 @@ mod tests {
         assert!(
             !exists,
             "session should be gone after kill_session_if_present"
+        );
+    }
+
+    #[test]
+    fn exact_target_helpers_reject_empty_and_prefix_with_equals() {
+        assert_eq!(exact_session_target(""), None);
+        assert_eq!(exact_session_target("   "), None);
+        assert_eq!(
+            exact_session_target("aoe_chat_12345678"),
+            Some("=aoe_chat_12345678".to_string())
+        );
+        assert_eq!(
+            exact_session_target("=aoe_chat_12345678"),
+            Some("=aoe_chat_12345678".to_string())
+        );
+        assert_eq!(exact_pane_target(""), None);
+        assert_eq!(
+            exact_pane_target("aoe_chat_12345678"),
+            Some("=aoe_chat_12345678:^.0".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_live_pane_pids_skips_dead_and_invalid_pids() {
+        let raw = "\
+27590 1 28204
+27590 0 0
+27590 0 1
+27590 0 27590
+1 0 28204
+27590 0 28756
+27590 0 28756
+27590 0 68926
+garbage
+";
+        assert_eq!(
+            parse_live_pane_pids(raw),
+            vec![(28756, 27590), (68926, 27590)]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn kill_session_if_present_uses_exact_match_and_does_not_kill_prefix_sibling() {
+        if !tmux_available() {
+            return;
+        }
+        let prefix = "aoe_test_exact_kill";
+        let sibling = "aoe_test_exact_kill_sibling";
+        let _ = kill_session_if_present(prefix);
+        let _ = kill_session_if_present(sibling);
+
+        let spawn = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", sibling, "sleep 30"])
+            .status();
+        if !spawn.map(|s| s.success()).unwrap_or(false) {
+            return;
+        }
+
+        // Killing the non-existent prefix must NOT match `sibling`.
+        assert!(kill_session_if_present(prefix).is_ok());
+        assert!(kill_session_if_present("").is_ok());
+
+        let sibling_alive = crate::tmux::tmux_command()
+            .args(["has-session", "-t", &format!("={sibling}")])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let _ = kill_session_cleanly(sibling);
+        assert!(
+            sibling_alive,
+            "killing a missing prefix or empty name must never kill a sibling session"
         );
     }
 }

@@ -1319,35 +1319,66 @@ fn build_fork_flags(tool: &str, parent_id: &str, child_id: &str) -> String {
 /// Waits until the resumed Antigravity pane displays its ready footer
 /// (`? for shortcuts`) without a blocking trust/sign-in screen, then sends
 /// `/fork` + Enter so Antigravity branches the conversation into a new UUID.
-/// Runs off the TUI thread and exits immediately once sent or if the pane dies.
-fn spawn_antigravity_fork_trigger(session_name: String, instance_id: String) {
+/// Resolves the live tmux session name by `instance_id` on every poll so
+/// renaming the session right after forking never breaks the trigger. Once
+/// `/fork` completes, dispatches `/rename <title>` (using the latest persisted
+/// title) so the forked Antigravity conversation gets its own distinct name.
+fn spawn_antigravity_fork_trigger(
+    profile: String,
+    initial_session_name: String,
+    instance_id: String,
+    initial_title: String,
+) {
     let _ = std::thread::Builder::new()
         .name(format!("antigravity-fork-{instance_id}"))
         .spawn(move || {
             use crate::agents::KeyToken;
 
-            let tmux = tmux::Session::from_name(&session_name);
+            let resolve_tmux = || {
+                let live_name =
+                    crate::tmux::live_agent_session_name(&instance_id, &initial_session_name);
+                tmux::Session::from_name(&live_name)
+            };
+
+            let is_ready = |lower: &str| {
+                let ready = lower
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .rev()
+                    .take(3)
+                    .any(|line| line.contains("? for shortcuts"));
+                let blocked = lower.contains("do you trust the contents")
+                    || lower.contains("not signed in")
+                    || lower.contains("signing in");
+                ready && !blocked
+            };
+
+            let latest_title = || {
+                super::storage::Storage::new_unwatched(&profile)
+                    .ok()
+                    .and_then(|s| s.load().ok())
+                    .and_then(|list| list.into_iter().find(|i| i.id == instance_id))
+                    .map(|i| i.title)
+                    .filter(|t| !t.trim().is_empty())
+                    .unwrap_or_else(|| initial_title.clone())
+            };
+
+            let mut forked = false;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             while std::time::Instant::now() < deadline {
+                let tmux = resolve_tmux();
                 if !tmux.exists() {
                     return;
                 }
                 if let Ok(pane) = tmux.capture_pane(30) {
                     let lower = pane.to_lowercase();
                     if lower.contains("forked conversation") {
-                        return;
+                        forked = true;
+                        break;
                     }
-                    let ready = lower
-                        .lines()
-                        .filter(|l| !l.trim().is_empty())
-                        .rev()
-                        .take(3)
-                        .any(|line| line.contains("? for shortcuts"));
-                    let blocked = lower.contains("do you trust the contents")
-                        || lower.contains("not signed in")
-                        || lower.contains("signing in");
-                    if ready && !blocked {
+                    if is_ready(&lower) {
                         std::thread::sleep(std::time::Duration::from_millis(150));
+                        let tmux = resolve_tmux();
                         if let Err(e) = tmux.send_key_tokens(&[KeyToken::Literal("/fork")]) {
                             tracing::warn!(
                                 target: "session.store",
@@ -1370,16 +1401,54 @@ fn spawn_antigravity_fork_trigger(session_name: String, instance_id: String) {
                             instance = %instance_id,
                             "Dispatched /fork to Antigravity session"
                         );
-                        return;
+                        forked = true;
+                        break;
                     }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(250));
             }
-            tracing::warn!(
-                target: "session.store",
-                instance = %instance_id,
-                "Timed out waiting for Antigravity pane readiness before /fork"
-            );
+
+            if !forked {
+                tracing::warn!(
+                    target: "session.store",
+                    instance = %instance_id,
+                    "Timed out waiting for Antigravity pane readiness before /fork"
+                );
+                return;
+            }
+
+            // Wait for Antigravity to finish switching onto the forked
+            // conversation, then dispatch `/rename <title>` so the fork gets a
+            // distinct native name matching AoE's sidebar title.
+            let rename_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < rename_deadline {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let tmux = resolve_tmux();
+                if !tmux.exists() {
+                    return;
+                }
+                if let Ok(pane) = tmux.capture_pane(30) {
+                    let lower = pane.to_lowercase();
+                    if lower.contains("forked conversation") && is_ready(&lower) {
+                        let title = super::agent_title::sanitize_agent_title(&latest_title());
+                        if title.is_empty() {
+                            return;
+                        }
+                        let rename_cmd = format!("/rename {title}");
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        let tmux = resolve_tmux();
+                        if tmux.send_keys_with_delay(&rename_cmd, 150).is_ok() {
+                            tracing::info!(
+                                target: "session.store",
+                                instance = %instance_id,
+                                title = %title,
+                                "Dispatched /rename to forked Antigravity session"
+                            );
+                        }
+                        return;
+                    }
+                }
+            }
         });
 }
 
@@ -3712,6 +3781,17 @@ impl Instance {
                     splice_subcommand_or_append(cmd, &fork_part, is_subcommand);
                     if matches!(
                         crate::agents::get_agent(&self.tool).map(|a| &a.fork_strategy),
+                        Some(crate::agents::ForkStrategy::ClaudeFork)
+                    ) && !super::agent_title::command_has_name_flag(cmd)
+                    {
+                        let clean_title = super::agent_title::sanitize_agent_title(&self.title);
+                        if !clean_title.is_empty() {
+                            cmd.push_str(" --name ");
+                            cmd.push_str(&super::agent_title::shell_single_quote(&clean_title));
+                        }
+                    }
+                    if matches!(
+                        crate::agents::get_agent(&self.tool).map(|a| &a.fork_strategy),
                         Some(crate::agents::ForkStrategy::AntigravityFork)
                     ) {
                         // Antigravity mints its own forked conversation UUID when
@@ -5118,6 +5198,8 @@ impl Instance {
         // the TUI on the multiple tmux subprocess calls they require.
         let fork_session_name = session_name.to_string();
         let fork_instance_id = self.id.clone();
+        let fork_profile = profile.to_string();
+        let fork_title = self.title.clone();
         let session_name = session_name.to_string();
         let instance_id_for_log = self.id.clone();
         let title = self.title.clone();
@@ -5150,7 +5232,12 @@ impl Instance {
         }
 
         if should_send_antigravity_fork {
-            spawn_antigravity_fork_trigger(fork_session_name, fork_instance_id);
+            spawn_antigravity_fork_trigger(
+                fork_profile,
+                fork_session_name,
+                fork_instance_id,
+                fork_title,
+            );
         }
     }
 
@@ -11866,7 +11953,7 @@ mod tests {
         let is_existing = inst.apply_session_flags(&mut cmd, "test");
         assert_eq!(
             cmd,
-            "claude --resume parent-1111-2222-3333-444444444444 --fork-session --session-id child-5555-6666-7777-888888888888"
+            "claude --resume parent-1111-2222-3333-444444444444 --fork-session --session-id child-5555-6666-7777-888888888888 --name 'Forked'"
         );
         // A fork is a NEW session (not a resume-in-place), so report not-existing.
         assert!(!is_existing);

@@ -1516,6 +1516,16 @@ impl HomeView {
                     }
                     self.save()?;
                     drop(_identity_lock);
+                    if effective_title != current_title {
+                        if let Some(inst) = self.get_instance(&id).cloned() {
+                            let title = effective_title.clone();
+                            std::thread::spawn(move || {
+                                crate::session::agent_title::sync_instance_agent_title(
+                                    &inst, &title,
+                                );
+                            });
+                        }
+                    }
                     let tmux_warning =
                         rekey_tmux_after_persist(&id, &current_title, &effective_title);
                     self.reload()?;
@@ -1540,6 +1550,14 @@ impl HomeView {
                 }
             })?;
             drop(_identity_lock);
+            if effective_title != current_title {
+                if let Some(inst) = self.get_instance(&id).cloned() {
+                    let title = effective_title.clone();
+                    std::thread::spawn(move || {
+                        crate::session::agent_title::sync_instance_agent_title(&inst, &title);
+                    });
+                }
+            }
             let tmux_warning = rekey_tmux_after_persist(&id, &current_title, &effective_title);
 
             // Rebuild group trees and create group if needed

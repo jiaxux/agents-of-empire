@@ -7,24 +7,17 @@ pub(super) use super::unix::{
     configure_process_group, kill_process_group, terminate_process_group,
 };
 
-/// Collect `pid` and every descendant by parsing `ps -A` once and walking the map.
-pub(super) fn collect_pid_tree(pid: u32) -> Vec<u32> {
-    let children_map = build_children_map();
-    let mut pids = vec![pid];
-    super::collect_descendants_from_map(pid, &children_map, &mut pids);
-    pids
-}
-
-/// Build a map of parent PID -> list of child PIDs by parsing `ps` output once
-pub(super) fn build_children_map() -> HashMap<u32, Vec<u32>> {
+/// Build `(children_map, parent_map)` by parsing `ps` output once.
+pub(super) fn build_process_maps() -> (HashMap<u32, Vec<u32>>, HashMap<u32, u32>) {
     let mut children_map: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut parent_map: HashMap<u32, u32> = HashMap::new();
 
     let Ok(output) = Command::new("ps").args(["-o", "pid=,ppid=", "-A"]).output() else {
-        return children_map;
+        return (children_map, parent_map);
     };
 
     if !output.status.success() {
-        return children_map;
+        return (children_map, parent_map);
     }
 
     for line in String::from_utf8_lossy(&output.stdout).lines() {
@@ -32,11 +25,12 @@ pub(super) fn build_children_map() -> HashMap<u32, Vec<u32>> {
         if parts.len() >= 2 {
             if let (Ok(child_pid), Ok(ppid)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
                 children_map.entry(ppid).or_default().push(child_pid);
+                parent_map.insert(child_pid, ppid);
             }
         }
     }
 
-    children_map
+    (children_map, parent_map)
 }
 
 /// One `ps -A -ww -E -o command=` fork deciding, for each candidate `i`,

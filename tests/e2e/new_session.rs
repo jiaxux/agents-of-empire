@@ -498,8 +498,8 @@ fn test_new_session_from_saved_project_prefills_path() {
     h.send_keys("Enter"); // dismiss first-run welcome
     h.wait_for("No sessions yet");
 
-    // `b` opens the saved-project picker, which lists every registered repo.
-    h.send_keys("b");
+    // `B` opens the saved-project picker, which lists every registered repo.
+    h.send_keys("B");
     h.wait_for("New Session from Project");
     h.assert_screen_contains("frontend");
     h.assert_screen_contains("backend");
@@ -534,8 +534,8 @@ fn test_new_session_from_project_empty_state_opens_add_form() {
     h.send_keys("Enter"); // dismiss first-run welcome
     h.wait_for("No sessions yet");
 
-    // With no saved projects, `b` opens the project add form directly.
-    h.send_keys("b");
+    // With no saved projects, `B` opens the project add form directly.
+    h.send_keys("B");
     h.wait_for(" Projects ");
     h.assert_screen_contains("Path:");
     h.assert_screen_contains("Base branch:");

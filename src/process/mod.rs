@@ -1,6 +1,6 @@
 //! Process utilities for tmux session management
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -212,29 +212,123 @@ pub fn reset_signals_on_exec(cmd: &mut Command) {
 }
 
 /// Recursively collect all descendant PIDs of `pid` using a pre-built
-/// parent -> children map. Shared by the per-OS `collect_pid_tree`
-/// implementations, which each build the map their own way (a `/proc`
-/// scan on Linux, a `ps` parse on macOS).
+/// parent -> children map.
+#[cfg_attr(not(test), allow(dead_code))]
 fn collect_descendants_from_map(
     pid: u32,
     children_map: &HashMap<u32, Vec<u32>>,
     pids: &mut Vec<u32>,
 ) {
+    let protected = HashSet::new();
+    let mut visited = HashSet::new();
+    visited.insert(pid);
+    collect_descendants_from_map_guarded(pid, children_map, &protected, &mut visited, pids);
+}
+
+/// Recursively collect all non-protected descendant PIDs of `pid` using a
+/// pre-built parent -> children map, with a visited set to break any snapshot
+/// cycle.
+fn collect_descendants_from_map_guarded(
+    pid: u32,
+    children_map: &HashMap<u32, Vec<u32>>,
+    protected: &HashSet<u32>,
+    visited: &mut HashSet<u32>,
+    pids: &mut Vec<u32>,
+) {
     if let Some(children) = children_map.get(&pid) {
         for &child_pid in children {
+            if protected.contains(&child_pid) || !visited.insert(child_pid) {
+                continue;
+            }
             pids.push(child_pid);
-            collect_descendants_from_map(child_pid, children_map, pids);
+            collect_descendants_from_map_guarded(child_pid, children_map, protected, visited, pids);
         }
     }
 }
 
+/// Build the safe set of PIDs to signal for `root_pid`, refusing system PIDs
+/// (`<= 1`), `self_pid` and all of its ancestors, `extra_protected`, and (when
+/// `expected_ppid` is provided) any root whose parent PID does not match
+/// `expected_ppid` (protecting against signaling a recycled PID).
+pub(crate) fn safe_pid_tree_from_maps(
+    root_pid: u32,
+    expected_ppid: Option<u32>,
+    self_pid: u32,
+    extra_protected: &[u32],
+    children_map: &HashMap<u32, Vec<u32>>,
+    parent_map: &HashMap<u32, u32>,
+) -> Vec<u32> {
+    if root_pid <= 1 {
+        tracing::warn!(
+            target: "process.tree",
+            root_pid,
+            "refusing to collect process tree for invalid root pid"
+        );
+        return Vec::new();
+    }
+
+    let mut protected: HashSet<u32> = HashSet::new();
+    protected.insert(0);
+    protected.insert(1);
+    protected.extend(extra_protected.iter().copied());
+    if let Some(ppid) = expected_ppid {
+        protected.insert(ppid);
+    }
+
+    // Protect our own process and every ancestor up to PID 1 so aoe, the user's
+    // shell/terminal, or an enclosing tmux server can never be signaled.
+    let mut cursor = self_pid;
+    while cursor > 1 && protected.insert(cursor) {
+        match parent_map.get(&cursor).copied() {
+            Some(parent) if parent != cursor => cursor = parent,
+            _ => break,
+        }
+    }
+
+    if protected.contains(&root_pid) {
+        tracing::warn!(
+            target: "process.tree",
+            root_pid,
+            self_pid,
+            "refusing to signal protected root pid"
+        );
+        return Vec::new();
+    }
+
+    if let Some(expected) = expected_ppid {
+        let actual = parent_map.get(&root_pid).copied();
+        if actual != Some(expected) {
+            tracing::warn!(
+                target: "process.tree",
+                root_pid,
+                expected_ppid = expected,
+                actual_ppid = ?actual,
+                "refusing to signal pid whose parent does not match tmux server (exited or recycled)"
+            );
+            return Vec::new();
+        }
+    }
+
+    let mut visited: HashSet<u32> = HashSet::new();
+    visited.insert(root_pid);
+    let mut pids = vec![root_pid];
+    collect_descendants_from_map_guarded(
+        root_pid,
+        children_map,
+        &protected,
+        &mut visited,
+        &mut pids,
+    );
+    pids
+}
+
 /// Get the PID of the shell process running in a tmux pane
 pub fn get_pane_pid(session_name: &str) -> Option<u32> {
-    // Use `^.0` to target the first window's first pane regardless of
-    // base-index or which pane is active, so we always query the agent's
-    // pane even when the user has created additional tmux windows or split
-    // panes.  See #435, #488.
-    let target = format!("{session_name}:^.0");
+    // Use `=<session>:^.0` to exact-match the session and target the first
+    // window's first pane regardless of base-index or which pane is active, so
+    // an empty or vanished session name can never prefix-match another session.
+    // See #435, #488.
+    let target = crate::tmux::utils::exact_pane_target(session_name)?;
     let output = crate::tmux::tmux_query_command()
         .args(["display-message", "-t", &target, "-p", "#{pane_pid}"])
         .output()
@@ -254,7 +348,11 @@ pub fn get_pane_pid(session_name: &str) -> Option<u32> {
         return None;
     }
 
-    let pid = String::from_utf8_lossy(&output.stdout).trim().parse().ok();
+    let pid = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|&p| p > 1);
     if tracing::enabled!(target: "process.ppid", tracing::Level::TRACE) {
         tracing::trace!(
             target: "process.ppid",
@@ -491,29 +589,65 @@ fn sleep_inhibit_child_held_alive(child: &mut Option<Child>, exit_reason: &str) 
     }
 }
 
-/// Kill a process and all its descendants
-/// Sends SIGTERM first, then SIGKILL to any survivors
+/// Kill a process and all its descendants.
+/// Sends SIGTERM first, then SIGKILL to any survivors.
+/// Refuses invalid PIDs (`<= 1`), our own process, and our ancestors.
 pub fn kill_process_tree(pid: u32) {
-    #[cfg(target_os = "linux")]
-    let pids = linux::collect_pid_tree(pid);
+    kill_process_tree_guarded(pid, None, &[]);
+}
 
-    #[cfg(target_os = "macos")]
-    let pids = macos::collect_pid_tree(pid);
+/// Kill a tmux pane process and all its descendants only after verifying that
+/// `pid` is still a direct child of `expected_ppid` (the tmux server PID) and
+/// protecting `expected_ppid`, `aoe`, and its ancestors from ever being signaled.
+pub fn kill_process_tree_with_parent(pid: u32, expected_ppid: u32) {
+    kill_process_tree_guarded(pid, Some(expected_ppid), &[expected_ppid]);
+}
 
+fn kill_process_tree_guarded(pid: u32, expected_ppid: Option<u32>, extra_protected: &[u32]) {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    kill_with_fallback(&pids);
+    {
+        let pids = collect_safe_pid_tree(pid, expected_ppid, extra_protected);
+        kill_with_fallback(&pids);
+    }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = pid;
+        let _ = (pid, expected_ppid, extra_protected);
         // No-op on unsupported platforms, fall back to tmux kill-session only
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn collect_safe_pid_tree(
+    pid: u32,
+    expected_ppid: Option<u32>,
+    extra_protected: &[u32],
+) -> Vec<u32> {
+    #[cfg(target_os = "linux")]
+    let (children_map, parent_map) = linux::build_process_maps();
+
+    #[cfg(target_os = "macos")]
+    let (children_map, parent_map) = macos::build_process_maps();
+
+    safe_pid_tree_from_maps(
+        pid,
+        expected_ppid,
+        std::process::id(),
+        extra_protected,
+        &children_map,
+        &parent_map,
+    )
 }
 
 /// SIGTERM every pid in reverse order (children first), wait briefly for
 /// graceful shutdown, then SIGKILL anything still alive.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn kill_with_fallback(pids: &[u32]) {
+    if pids.is_empty() {
+        return;
+    }
+
+    let self_pid = std::process::id();
     tracing::debug!(
         target: "process.tree",
         descendants = ?pids,
@@ -521,6 +655,9 @@ fn kill_with_fallback(pids: &[u32]) {
     );
 
     for &p in pids.iter().rev() {
+        if p <= 1 || p == self_pid {
+            continue;
+        }
         tracing::debug!(target: "process.signal", pid = p, signal = "SIGTERM", "sending signal");
         let _ = kill(Pid::from_raw(p as i32), Signal::SIGTERM);
     }
@@ -528,6 +665,9 @@ fn kill_with_fallback(pids: &[u32]) {
     std::thread::sleep(Duration::from_millis(100));
 
     for &p in pids.iter().rev() {
+        if p <= 1 || p == self_pid {
+            continue;
+        }
         if process_exists(p) {
             tracing::warn!(
                 target: "process.reap",
@@ -584,11 +724,12 @@ pub fn continue_process_tree(pid: u32) {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn signal_process_tree(pid: u32, signal: Signal) {
-    #[cfg(target_os = "linux")]
-    let pids = linux::collect_pid_tree(pid);
-    #[cfg(target_os = "macos")]
-    let pids = macos::collect_pid_tree(pid);
+    let pids = collect_safe_pid_tree(pid, None, &[]);
+    if pids.is_empty() {
+        return;
+    }
 
+    let self_pid = std::process::id();
     tracing::debug!(
         target: "process.tree",
         descendants = ?pids,
@@ -596,6 +737,9 @@ fn signal_process_tree(pid: u32, signal: Signal) {
         "signaling process tree"
     );
     for &p in pids.iter().rev() {
+        if p <= 1 || p == self_pid {
+            continue;
+        }
         if let Err(e) = kill(Pid::from_raw(p as i32), signal) {
             if e != Errno::ESRCH {
                 tracing::debug!(
@@ -625,6 +769,78 @@ mod tests {
         if let Some(id) = boot_id() {
             assert!(!id.is_empty());
         }
+    }
+
+    #[test]
+    fn safe_pid_tree_refuses_invalid_self_ancestors_and_parent_mismatch() {
+        // Tree:
+        //   1 (init)
+        //     ├── 100 (terminal) -> 200 (shell) -> 300 (self / aoe)
+        //     └── 500 (tmux server)
+        //           ├── 600 (pane A shell) -> 601 (agent A) -> 602 (child)
+        //           └── 700 (pane B shell) -> 701 (agent B)
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        children.insert(1, vec![100, 500]);
+        children.insert(100, vec![200]);
+        children.insert(200, vec![300]);
+        children.insert(500, vec![600, 700]);
+        children.insert(600, vec![601]);
+        children.insert(601, vec![602]);
+        children.insert(700, vec![701]);
+
+        let mut parents: HashMap<u32, u32> = HashMap::new();
+        parents.insert(100, 1);
+        parents.insert(200, 100);
+        parents.insert(300, 200);
+        parents.insert(500, 1);
+        parents.insert(600, 500);
+        parents.insert(601, 600);
+        parents.insert(602, 601);
+        parents.insert(700, 500);
+        parents.insert(701, 700);
+
+        // Invalid system PIDs are refused.
+        assert!(safe_pid_tree_from_maps(0, None, 300, &[], &children, &parents).is_empty());
+        assert!(safe_pid_tree_from_maps(1, None, 300, &[], &children, &parents).is_empty());
+
+        // Self and ancestors are refused.
+        assert!(safe_pid_tree_from_maps(300, None, 300, &[], &children, &parents).is_empty());
+        assert!(safe_pid_tree_from_maps(200, None, 300, &[], &children, &parents).is_empty());
+        assert!(safe_pid_tree_from_maps(100, None, 300, &[], &children, &parents).is_empty());
+
+        // The tmux server itself is refused when protected.
+        assert!(
+            safe_pid_tree_from_maps(500, Some(500), 300, &[500], &children, &parents).is_empty()
+        );
+
+        // Recycled/unrelated PID whose parent is NOT the tmux server is refused.
+        assert!(
+            safe_pid_tree_from_maps(601, Some(500), 300, &[500], &children, &parents).is_empty()
+        );
+        assert!(
+            safe_pid_tree_from_maps(999, Some(500), 300, &[500], &children, &parents).is_empty()
+        );
+
+        // Valid pane A under tmux server 500 collects ONLY pane A's subtree, never pane B or tmux.
+        assert_eq!(
+            safe_pid_tree_from_maps(600, Some(500), 300, &[500], &children, &parents),
+            vec![600, 601, 602]
+        );
+    }
+
+    #[test]
+    fn safe_pid_tree_handles_cycles_without_infinite_recursion() {
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        children.insert(600, vec![601]);
+        children.insert(601, vec![600]);
+        let mut parents: HashMap<u32, u32> = HashMap::new();
+        parents.insert(600, 500);
+        parents.insert(601, 600);
+
+        assert_eq!(
+            safe_pid_tree_from_maps(600, Some(500), 300, &[500], &children, &parents),
+            vec![600, 601]
+        );
     }
 
     /// A live process carrying a unique marker in its argv is matched by the

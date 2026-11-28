@@ -13,7 +13,7 @@
 // when `AOE_COVERAGE=1`). Without that env var, coverage collection is a
 // no-op and the override is invisible.
 
-import { test as base, expect } from "@playwright/test";
+import { test as base, expect, type Page } from "@playwright/test";
 import { startCoverage, stopAndWriteCoverage } from "./coverageCapture";
 
 export const test = base.extend({
@@ -23,5 +23,14 @@ export const test = base.extend({
     await stopAndWriteCoverage(page, testInfo.titlePath.join(" > "), started);
   },
 });
+
+/**
+ * Press a global shortcut once its listener is attached; an early key is silently lost.
+ * Does not click first: a click at the viewport centre can land on a pane button.
+ */
+export async function pressShortcut(page: Page, key: string) {
+  await expect(page.locator("html[data-shortcuts-ready]")).toBeAttached();
+  await page.keyboard.press(key);
+}
 
 export { expect };

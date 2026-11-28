@@ -38,6 +38,11 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
     // shortcuts like Cmd+K, Cmd+`, and Ctrl+Alt+B whenever the terminal
     // is focused.
     document.addEventListener("keydown", handler, true);
-    return () => document.removeEventListener("keydown", handler, true);
+    // Lets browser tests wait for the listener instead of racing the effect flush.
+    document.documentElement.dataset.shortcutsReady = "true";
+    return () => {
+      document.removeEventListener("keydown", handler, true);
+      delete document.documentElement.dataset.shortcutsReady;
+    };
   }, [getActions]);
 }

@@ -1,5 +1,6 @@
 //! Session management module
 
+pub(crate) mod agent_title;
 pub(crate) mod approval_autopilot;
 pub mod artifacts;
 pub mod attach_project;

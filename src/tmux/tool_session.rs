@@ -9,7 +9,6 @@ use super::utils::{
 };
 use super::{refresh_session_cache, TOOL_PREFIX};
 use crate::cli::truncate_id;
-use crate::process;
 
 pub struct ToolSession {
     name: String,
@@ -130,11 +129,7 @@ impl ToolSession {
             return Ok(());
         }
 
-        if let Some(pane_pid) = self.get_pane_pid() {
-            process::kill_process_tree(pane_pid);
-        }
-
-        super::utils::kill_session_if_present(&self.name)?;
+        super::utils::kill_session_cleanly(&self.name)?;
 
         refresh_session_cache();
         Ok(())
@@ -209,16 +204,15 @@ impl ToolSession {
     pub fn capture_window_composited(&self, lines: usize) -> Result<String> {
         super::Session::from_name(&self.name).capture_window_composited(lines)
     }
-
-    fn get_pane_pid(&self) -> Option<u32> {
-        process::get_pane_pid(&self.name)
-    }
 }
 
 /// Kill all tool sessions associated with a given agent session ID.
 /// Uses tmux list-sessions to find matches by ID suffix, so it works
 /// even if tools have been removed from the config since creation.
 pub fn kill_all_tool_sessions_for_id(session_id: &str) {
+    if session_id.trim().is_empty() {
+        return;
+    }
     let id_suffix = format!("_{}", truncate_id(session_id, 8));
 
     let output = crate::tmux::tmux_command()
@@ -230,12 +224,7 @@ pub fn kill_all_tool_sessions_for_id(session_id: &str) {
             let stdout = String::from_utf8_lossy(&out.stdout);
             for line in stdout.lines() {
                 if line.starts_with(TOOL_PREFIX) && line.ends_with(&id_suffix) {
-                    if let Some(pid) = process::get_pane_pid(line) {
-                        process::kill_process_tree(pid);
-                    }
-                    let _ = crate::tmux::tmux_command()
-                        .args(["kill-session", "-t", line])
-                        .output();
+                    let _ = super::utils::kill_session_cleanly(line);
                 }
             }
         }

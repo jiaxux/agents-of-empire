@@ -601,14 +601,10 @@ impl Session {
             return Ok(());
         }
 
-        // Kill the entire process tree first to ensure child processes are terminated.
-        // This handles cases where tools like Claude spawn subprocesses that may
-        // survive tmux's SIGHUP signal.
-        if let Some(pane_pid) = self.get_pane_pid() {
-            process::kill_process_tree(pane_pid);
-        }
-
-        super::utils::kill_session_if_present(&self.name)?;
+        // Kill live pane process trees first (verified against the tmux server
+        // PID, skipping dead panes so recycled PIDs are never signaled), then
+        // remove the exact tmux session.
+        super::utils::kill_session_cleanly(&self.name)?;
 
         refresh_session_cache();
 

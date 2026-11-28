@@ -686,7 +686,7 @@ impl CheckpointStore {
 
     /// Default export path under AoE's app data. Intended for the TUI, where a
     /// single key should produce a discoverable bundle without opening a path
-    /// editor. The CLI accepts an explicit destination through [`export_to`].
+    /// editor. The CLI accepts an explicit destination through [`Self::export_to`].
     pub fn export_default(&self, checkpoint_id: &str) -> Result<CheckpointExportResult> {
         let manifest = self.inspect(checkpoint_id)?;
         let label = portable_filename_component(&manifest.label);
@@ -697,7 +697,7 @@ impl CheckpointStore {
         self.export_to(checkpoint_id, output)
     }
 
-    /// Import a bundle produced by [`export_to`]. Every archive path, manifest
+    /// Import a bundle produced by [`Self::export_to`]. Every archive path, manifest
     /// id, media type, byte count, and SHA-256 is checked before anything is
     /// published. Re-importing identical content is idempotent.
     pub fn import_from(&self, input: impl AsRef<Path>) -> Result<CheckpointImportResult> {

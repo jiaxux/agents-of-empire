@@ -362,6 +362,9 @@ fn drain_and_persist_session_ids_inner(
         if let Some(inst) = instances.iter_mut().find(|i| i.id == *id) {
             inst.agent_session_id = Some(sid.clone());
             inst.resume_probe_failed_sid = None;
+            let inst_clone = inst.clone();
+            let title = inst.title.clone();
+            crate::session::agent_title::sync_instance_agent_title(&inst_clone, &title);
         }
     }
     for rb in &to_rollback {

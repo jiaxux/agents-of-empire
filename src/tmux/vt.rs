@@ -598,7 +598,10 @@ fn capture_seed_stream(target: &str, rows: u16) -> Option<Vec<u8>> {
 fn stream_has_unread_bytes(stream: &UnixStream) -> bool {
     let mut avail: libc::c_int = 0;
     // SAFETY: `FIONREAD` takes a pointer to a `c_int` and does not retain it.
-    let rc = unsafe { libc::ioctl(stream.as_raw_fd(), libc::FIONREAD, &mut avail) };
+    // Cast with `as _` because `libc::FIONREAD` is `c_ulong` on macOS and
+    // `c_int` on some Linux libc targets while `ioctl` takes `Ioctl`.
+    #[allow(clippy::unnecessary_cast)]
+    let rc = unsafe { libc::ioctl(stream.as_raw_fd(), libc::FIONREAD as _, &mut avail) };
     rc == 0 && avail > 0
 }
 
