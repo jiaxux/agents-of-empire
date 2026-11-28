@@ -660,36 +660,33 @@ impl RowTag {
     }
 }
 
-/// Compact sidebar badge identifying which agent CLI backs a chat row
-/// (`[agy]`, `[claude]`, `[gpt]`, etc.). Returns an empty string if `tool` is
-/// blank so callers can omit the badge cleanly.
-pub(crate) fn agent_sidebar_badge(tool: &str) -> Cow<'static, str> {
+/// Compact 1-cell sidebar icon identifying which agent CLI backs a chat row
+/// (`▲` Antigravity, `✻` Claude, `⬡` Codex/ChatGPT, `✦` Gemini, etc.). Returns
+/// an empty string if `tool` is blank so callers can omit the icon cleanly.
+pub(crate) fn agent_sidebar_badge(tool: &str) -> &'static str {
     let trimmed = tool.trim();
     if trimmed.is_empty() {
-        return Cow::Borrowed("");
+        return "";
     }
     match trimmed {
-        "antigravity" => Cow::Borrowed("[agy]"),
-        "claude" => Cow::Borrowed("[claude]"),
-        "codex" => Cow::Borrowed("[gpt]"),
-        "gemini" => Cow::Borrowed("[gem]"),
-        "opencode" => Cow::Borrowed("[oc]"),
-        "pi" => Cow::Borrowed("[pi]"),
-        "vibe" => Cow::Borrowed("[vibe]"),
-        "copilot" => Cow::Borrowed("[copilot]"),
-        "cursor" => Cow::Borrowed("[cursor]"),
-        "amp" => Cow::Borrowed("[amp]"),
-        "kimi" => Cow::Borrowed("[kimi]"),
-        "kiro" => Cow::Borrowed("[kiro]"),
-        "qwen" => Cow::Borrowed("[qwen]"),
-        "hermes" => Cow::Borrowed("[hermes]"),
-        "omp" => Cow::Borrowed("[omp]"),
-        "droid" => Cow::Borrowed("[droid]"),
-        "aoe-agent" => Cow::Borrowed("[aoe]"),
-        other => {
-            let short: String = other.chars().take(6).collect();
-            Cow::Owned(format!("[{short}]"))
-        }
+        "antigravity" => "▲",
+        "claude" => "✻",
+        "codex" => "⬡",
+        "gemini" => "✦",
+        "opencode" => "◈",
+        "pi" => "◬",
+        "vibe" => "∿",
+        "copilot" => "◉",
+        "cursor" => "➤",
+        "amp" => "⌁",
+        "kimi" => "☽",
+        "kiro" => "✧",
+        "qwen" => "⬢",
+        "hermes" => "⟡",
+        "omp" => "◎",
+        "droid" => "▣",
+        "aoe-agent" => "♛",
+        _ => "◇",
     }
 }
 
@@ -2041,6 +2038,27 @@ impl HomeView {
             text_style = text_style.add_modifier(ratatui::style::Modifier::BOLD);
         }
         line_spans.push(Span::styled(format!("{} ", icon), icon_style));
+        if let Item::Session { id, .. } = item {
+            if self.view_mode == ViewMode::Structured {
+                if let Some(inst) = self.get_instance(id) {
+                    let agent_icon = agent_sidebar_badge(&inst.tool);
+                    if !agent_icon.is_empty() {
+                        let muted = inst.is_archived()
+                            || inst.is_trashed()
+                            || (in_attention && inst.is_snoozed());
+                        let tag_style = agent_badge_style(&inst.tool, muted, theme);
+                        line_spans.push(Span::styled(
+                            format!("{agent_icon} "),
+                            if is_selected {
+                                selected_row_style(tag_style, theme)
+                            } else {
+                                tag_style
+                            },
+                        ));
+                    }
+                }
+            }
+        }
         line_spans.push(Span::styled(text.into_owned(), text_style));
 
         if let Item::Session { id, .. } = item {
@@ -2121,31 +2139,7 @@ impl HomeView {
                 let column_pad = activity_column_padding(used_width, list_width, badge_width);
                 let column_fits = column_pad.is_some();
                 if let Some(pad_len) = column_pad {
-                    let agent_badge = if self.view_mode == ViewMode::Structured {
-                        let b = agent_sidebar_badge(&inst.tool);
-                        (!b.is_empty()).then_some(b)
-                    } else {
-                        None
-                    };
-                    if let Some(agent_tag) = agent_badge.filter(|b| pad_len >= b.len() + 2) {
-                        let before_pad = pad_len - agent_tag.len() - 1;
-                        if before_pad > 0 {
-                            line_spans.push(Span::raw(" ".repeat(before_pad)));
-                        }
-                        let muted = inst.is_archived()
-                            || inst.is_trashed()
-                            || (in_attention && inst.is_snoozed());
-                        let tag_style = agent_badge_style(&inst.tool, muted, theme);
-                        line_spans.push(Span::styled(
-                            agent_tag.into_owned(),
-                            if is_selected {
-                                selected_row_style(tag_style, theme)
-                            } else {
-                                tag_style
-                            },
-                        ));
-                        line_spans.push(Span::raw(" "));
-                    } else if pad_len > 0 {
+                    if pad_len > 0 {
                         line_spans.push(Span::raw(" ".repeat(pad_len)));
                     }
                     // In Attention mode, snoozed rows show remaining sleep
@@ -5253,12 +5247,23 @@ mod tests {
 
     #[test]
     fn agent_sidebar_badge_maps_known_and_custom_agents() {
-        assert_eq!(agent_sidebar_badge("antigravity"), "[agy]");
-        assert_eq!(agent_sidebar_badge("claude"), "[claude]");
-        assert_eq!(agent_sidebar_badge("codex"), "[gpt]");
-        assert_eq!(agent_sidebar_badge("gemini"), "[gem]");
-        assert_eq!(agent_sidebar_badge("opencode"), "[oc]");
-        assert_eq!(agent_sidebar_badge("custom-long-agent"), "[custom]");
+        let cases = [
+            ("antigravity", "▲"),
+            ("claude", "✻"),
+            ("codex", "⬡"),
+            ("gemini", "✦"),
+            ("opencode", "◈"),
+            ("custom-long-agent", "◇"),
+        ];
+        for (tool, expected) in cases {
+            let icon = agent_sidebar_badge(tool);
+            assert_eq!(icon, expected, "{tool}");
+            assert_eq!(
+                unicode_width::UnicodeWidthStr::width(icon),
+                1,
+                "{tool} icon must be 1 cell wide"
+            );
+        }
         assert_eq!(agent_sidebar_badge("   "), "");
     }
 

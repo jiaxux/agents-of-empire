@@ -2292,9 +2292,10 @@ fn matched_running_row_keeps_status_color_on_spinner_and_bolds() {
     let item = env.view.flat_items[running].clone();
     let line = env.view.render_item_line(&item, false, true, &theme, 80);
 
-    // Spans: [indent, spinner, title, ...].
+    // Spans: [indent, spinner, agent_icon, title, ...].
     let spinner = &line.spans[1];
-    let title = &line.spans[2];
+    assert_eq!(line.spans[2].content.as_ref(), "✻ ");
+    let title = &line.spans[3];
 
     assert_eq!(
         spinner.style.fg,
@@ -6132,11 +6133,8 @@ fn test_row_tag_none_hides_worktree_branch_suffix() {
     });
 
     let text = rendered_single_session_text(inst, crate::session::config::RowTagMode::None);
-    let without_agent_badge = text.replace("[claude]", "");
     assert!(
-        !text.contains("feature/foo")
-            && !text.contains("[foo")
-            && !without_agent_badge.contains('['),
+        !text.contains("feature/foo") && !text.contains("[foo") && !text.contains('['),
         "None mode should hide all worktree suffix metadata: {text:?}"
     );
 }
@@ -6177,11 +6175,8 @@ fn test_row_tag_none_hides_workspace_suffix() {
     });
 
     let text = rendered_single_session_text(inst, crate::session::config::RowTagMode::None);
-    let without_agent_badge = text.replace("[claude]", "");
     assert!(
-        !text.contains("feature/foo")
-            && !text.contains("repos")
-            && !without_agent_badge.contains('['),
+        !text.contains("feature/foo") && !text.contains("repos") && !text.contains('['),
         "None mode should hide all workspace suffix metadata: {text:?}"
     );
 }
