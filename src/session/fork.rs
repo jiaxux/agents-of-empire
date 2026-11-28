@@ -117,6 +117,13 @@ mod tests {
                 child_session_id: "child-uuid".into(),
             })
         );
+        assert_eq!(
+            terminal_fork_seed("antigravity", Some("parent-uuid"), "child-uuid".into()),
+            Ok(ForkSeed::Terminal {
+                parent_agent_session_id: "parent-uuid".into(),
+                child_session_id: "child-uuid".into(),
+            })
+        );
     }
 
     #[test]

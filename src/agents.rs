@@ -87,6 +87,12 @@ pub enum ForkStrategy {
     /// A single flag appended when forking, used alongside the agent's normal
     /// resume flag (e.g. opencode `--session <parent> --fork`).
     Flag(&'static str),
+    /// Antigravity CLI: resumes the parent conversation (`--conversation
+    /// <parent>`) and sends the built-in `/fork` slash command once the TUI
+    /// reaches its ready footer (`? for shortcuts`). Antigravity mints the new
+    /// forked conversation UUID, which AoE's lifecycle hooks capture into the
+    /// child's per-instance sidecar.
+    AntigravityFork,
     /// Agent cannot fork a session.
     Unsupported,
 }
@@ -1193,10 +1199,10 @@ pub const AGENTS: &[AgentDef] = &[
             events: ANTIGRAVITY_SIDECAR_EVENTS,
         }),
         resume_strategy: ResumeStrategy::Flag("--conversation"),
-        fork_strategy: ForkStrategy::Unsupported,
+        fork_strategy: ForkStrategy::AntigravityFork,
         host_only: false,
         send_keys_enter_delay_ms: 0,
-        ready_marker: None,
+        ready_marker: Some("? for shortcuts"),
         install_hint: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
         permission_response: Some(PermissionResponse {
             allow: &[KeyToken::Named("Enter")],
@@ -2396,9 +2402,9 @@ mod tests {
 
     #[test]
     fn test_fork_strategy_is_set_for_fork_capable_agents() {
-        // Only claude, codex, and opencode can fork; every other agent is
-        // Unsupported. Iterating the full AGENTS slice makes a new agent with a
-        // stray fork_strategy fail loudly here.
+        // Only claude, codex, opencode, and antigravity can fork; every other
+        // agent is Unsupported. Iterating the full AGENTS slice makes a new
+        // agent with a stray fork_strategy fail loudly here.
         assert!(matches!(
             get_agent("claude").unwrap().fork_strategy,
             ForkStrategy::ClaudeFork
@@ -2411,8 +2417,13 @@ mod tests {
             get_agent("opencode").unwrap().fork_strategy,
             ForkStrategy::Flag("--fork")
         ));
+        assert!(matches!(
+            get_agent("antigravity").unwrap().fork_strategy,
+            ForkStrategy::AntigravityFork
+        ));
         for agent in AGENTS {
-            let fork_capable = matches!(agent.name, "claude" | "codex" | "opencode");
+            let fork_capable =
+                matches!(agent.name, "claude" | "codex" | "opencode" | "antigravity");
             assert_eq!(
                 matches!(agent.fork_strategy, ForkStrategy::Unsupported),
                 !fork_capable,

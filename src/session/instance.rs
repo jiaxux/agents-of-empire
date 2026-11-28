@@ -1297,8 +1297,82 @@ fn build_fork_flags(tool: &str, parent_id: &str, child_id: &str) -> String {
                 _ => String::new(),
             }
         }
+        ForkStrategy::AntigravityFork => {
+            // Resume the parent conversation; `finalize_launch` dispatches the
+            // built-in `/fork` slash command once the pane reaches `? for shortcuts`.
+            format!("--conversation {parent_id}")
+        }
         ForkStrategy::Unsupported => String::new(),
     }
+}
+
+/// Detached post-launch worker for `ForkStrategy::AntigravityFork`.
+///
+/// Waits until the resumed Antigravity pane displays its ready footer
+/// (`? for shortcuts`) without a blocking trust/sign-in screen, then sends
+/// `/fork` + Enter so Antigravity branches the conversation into a new UUID.
+/// Runs off the TUI thread and exits immediately once sent or if the pane dies.
+fn spawn_antigravity_fork_trigger(session_name: String, instance_id: String) {
+    let _ = std::thread::Builder::new()
+        .name(format!("antigravity-fork-{instance_id}"))
+        .spawn(move || {
+            use crate::agents::KeyToken;
+
+            let tmux = tmux::Session::from_name(&session_name);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while std::time::Instant::now() < deadline {
+                if !tmux.exists() {
+                    return;
+                }
+                if let Ok(pane) = tmux.capture_pane(30) {
+                    let lower = pane.to_lowercase();
+                    if lower.contains("forked conversation") {
+                        return;
+                    }
+                    let ready = lower
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .rev()
+                        .take(3)
+                        .any(|line| line.contains("? for shortcuts"));
+                    let blocked = lower.contains("do you trust the contents")
+                        || lower.contains("not signed in")
+                        || lower.contains("signing in");
+                    if ready && !blocked {
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        if let Err(e) = tmux.send_key_tokens(&[KeyToken::Literal("/fork")]) {
+                            tracing::warn!(
+                                target: "session.store",
+                                instance = %instance_id,
+                                "Failed to type /fork into Antigravity pane: {e}"
+                            );
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        if let Err(e) = tmux.send_key_tokens(&[KeyToken::Named("Enter")]) {
+                            tracing::warn!(
+                                target: "session.store",
+                                instance = %instance_id,
+                                "Failed to submit /fork in Antigravity pane: {e}"
+                            );
+                            return;
+                        }
+                        tracing::info!(
+                            target: "session.store",
+                            instance = %instance_id,
+                            "Dispatched /fork to Antigravity session"
+                        );
+                        return;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            tracing::warn!(
+                target: "session.store",
+                instance = %instance_id,
+                "Timed out waiting for Antigravity pane readiness before /fork"
+            );
+        });
 }
 
 /// Splice `part` into `cmd`: insert it right after the binary (before other
@@ -3605,6 +3679,17 @@ impl Instance {
                         Some(crate::agents::ForkStrategy::CodexFork)
                     );
                     splice_subcommand_or_append(cmd, &fork_part, is_subcommand);
+                    if matches!(
+                        crate::agents::get_agent(&self.tool).map(|a| &a.fork_strategy),
+                        Some(crate::agents::ForkStrategy::AntigravityFork)
+                    ) {
+                        // Antigravity mints its own forked conversation UUID when
+                        // `/fork` runs; drop the synthetic pre-pinned child UUID
+                        // and exclude the parent UUID so only the new forked id
+                        // can be adopted from the hook sidecar.
+                        self.agent_session_id = None;
+                        self.retroactive_capture_excludes.insert(from);
+                    }
                 }
             }
             // A fork is a fresh session, not an in-place resume.
@@ -4951,6 +5036,8 @@ impl Instance {
             }
         }
 
+        let should_send_antigravity_fork = self.tool == "antigravity"
+            && matches!(expected_prior_intent, ResumeIntent::Fork { .. });
         let outcome = self.persist_session_id(profile, expected_prior_sid, expected_prior_intent);
 
         // Skip outcomes leave AOE_CAPTURED_SESSION_ID untouched: this path
@@ -4998,6 +5085,8 @@ impl Instance {
 
         // Apply status bar options in a background thread to avoid blocking
         // the TUI on the multiple tmux subprocess calls they require.
+        let fork_session_name = session_name.to_string();
+        let fork_instance_id = self.id.clone();
         let session_name = session_name.to_string();
         let instance_id_for_log = self.id.clone();
         let title = self.title.clone();
@@ -5027,6 +5116,10 @@ impl Instance {
                     "Failed to spawn finalize-tmux thread"
                 );
             }
+        }
+
+        if should_send_antigravity_fork {
+            spawn_antigravity_fork_trigger(fork_session_name, fork_instance_id);
         }
     }
 
@@ -11761,6 +11854,30 @@ mod tests {
         // OpenCode: resume the parent session and add --fork. agent mints new id.
         let oc = build_fork_flags("opencode", "parent-id", "ignored-child");
         assert_eq!(oc, "--session parent-id --fork");
+        // Antigravity: resume the parent conversation; finalize_launch dispatches `/fork`.
+        let agy = build_fork_flags("antigravity", "parent-id", "ignored-child");
+        assert_eq!(agy, "--conversation parent-id");
+    }
+
+    #[test]
+    fn fork_command_for_antigravity_clears_synthetic_child_and_excludes_parent() {
+        let mut inst = Instance::new("Forked", "/tmp/x");
+        inst.tool = "antigravity".to_string();
+        inst.agent_session_id = Some("synthetic-child-id".to_string());
+        inst.resume_intent = ResumeIntent::Fork {
+            from: "parent-uuid-1234".to_string(),
+        };
+        let mut cmd = "agy --dangerously-skip-permissions".to_string();
+        let is_existing = inst.apply_session_flags(&mut cmd, "test");
+        assert!(!is_existing);
+        assert_eq!(
+            cmd,
+            "agy --dangerously-skip-permissions --conversation parent-uuid-1234"
+        );
+        assert_eq!(inst.agent_session_id, None);
+        assert!(inst
+            .retroactive_capture_excludes
+            .contains(&"parent-uuid-1234".to_string()));
     }
 
     #[test]

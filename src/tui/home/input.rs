@@ -3579,7 +3579,7 @@ impl HomeView {
                     self.info_dialog = Some(InfoDialog::new(
                         "Fork not supported",
                         &format!(
-                            "The '{}' agent cannot fork a session. Fork is available for Claude, Codex, and OpenCode.",
+                            "The '{}' agent cannot fork a session. Fork is available for Claude, Codex, OpenCode, and Antigravity.",
                             tool
                         ),
                     ));
