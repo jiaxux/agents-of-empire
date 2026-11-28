@@ -18,7 +18,8 @@ pub use session::{PaneCursor, PaneEnvMutation, Session, SIZE_OWNER_HEARTBEAT, SI
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};
 pub(crate) use status_detection::{
     claude_pane_is_ambiguous_typed_prompt, claude_pane_marker_fingerprint,
-    reconcile_claude_hook_status, reconcile_claude_idle_hook_status, reconcile_codex_hook_status,
+    reconcile_antigravity_hook_status, reconcile_claude_hook_status,
+    reconcile_claude_idle_hook_status, reconcile_codex_hook_status,
     reconcile_codex_idle_hook_status, reconcile_waiting_hook, verified_permission_prompt_signature,
     PermissionPromptApproval,
 };
@@ -194,19 +195,17 @@ pub(crate) fn tmux_command() -> Command {
     cmd
 }
 
-/// Like [`tmux_command`], but pins `LC_ALL=C` so tmux's connection-failure
-/// messages on stderr stay stable English for callers that match them. tmux's
-/// `client.c` prints `error connecting to <socket> (strerror(errno))` for a
-/// non-`ECONNREFUSED` connect failure, and glibc localizes `strerror` by
-/// `LC_MESSAGES`, so on a non-English host the `(No such file or directory)`
-/// ENOENT marker for an absent socket (#3337) would not match. Used by the
-/// status-query callers (which classify via [`tmux_no_server_running`]) and by
-/// `kill_session_if_present`. NOT folded into [`tmux_command`]: the
-/// interactive attach/switch-client/capture-pane paths must keep the user's
-/// locale for UTF-8 and status-bar rendering.
+/// Like [`tmux_command`], but pins `LC_MESSAGES=C` (clearing `LC_ALL`) and
+/// passes global `-u` so tmux's stderr stays English while format output
+/// (session names, pane titles, tabs) stays valid UTF-8 even under `LC_CTYPE=C`.
+/// Used for every query whose output aoe parses, and by `kill_session_if_present`.
+/// NOT folded into [`tmux_command`]: interactive attach/switch-client/capture-pane
+/// paths must keep the user's locale.
 pub(crate) fn tmux_query_command() -> Command {
     let mut cmd = tmux_command();
-    cmd.env("LC_ALL", "C");
+    cmd.arg("-u");
+    cmd.env_remove("LC_ALL");
+    cmd.env("LC_MESSAGES", "C");
     cmd
 }
 

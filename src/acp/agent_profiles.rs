@@ -274,6 +274,20 @@ pub const KIMI: AgentProfile = AgentProfile {
     yolo_mode_id: Some("yolo"),
 };
 
+/// Google Antigravity CLI via native `agy acp`. Its ACP mode taxonomy and
+/// subagent meta linkage stay fail-closed until verified against a live
+/// `agy acp` handshake, so generic tool rendering applies safely.
+pub const ANTIGRAVITY: AgentProfile = AgentProfile {
+    key: "antigravity",
+    parent_meta_namespaces: &[],
+    clear_aliases: &["/new", "/clear"],
+    clear_requires_driven_reset: false,
+    supports_exit_plan_mode: false,
+    supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
+    yolo_mode_id: None,
+};
+
 /// aoe's bundled multi-provider agent. Treated as Claude-equivalent
 /// for now (Vercel AI SDK 6 with Claude as one of the providers); the
 /// claude_capabilities subset is the safest reference until aoe-agent
@@ -317,6 +331,7 @@ pub fn resolve(key: &str) -> &'static AgentProfile {
         "pi" => &PI,
         "omp" => &OMP,
         "kimi" => &KIMI,
+        "antigravity" => &ANTIGRAVITY,
         "aoe-agent" => &AOE_AGENT,
         _ => &DEFAULT,
     }
@@ -353,6 +368,7 @@ mod tests {
         assert_eq!(resolve("pi").key, "pi");
         assert_eq!(resolve("omp").key, "omp");
         assert_eq!(resolve("kimi").key, "kimi");
+        assert_eq!(resolve("antigravity").key, "antigravity");
         assert_eq!(resolve("aoe-agent").key, "aoe-agent");
     }
 

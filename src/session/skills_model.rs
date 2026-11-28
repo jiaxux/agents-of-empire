@@ -68,8 +68,16 @@ const SKILL_ROOTS: &[SkillRoot] = &[
         id: "agents-standard",
         label: "Agent Skills",
         relative_path: ".agents/skills",
-        consumers: &["codex", "opencode"],
+        consumers: &["codex", "opencode", "antigravity"],
         primary_agent: "codex",
+        legacy: false,
+    },
+    SkillRoot {
+        id: "antigravity-user",
+        label: "Antigravity",
+        relative_path: ".gemini/config/skills",
+        consumers: &["antigravity"],
+        primary_agent: "antigravity",
         legacy: false,
     },
     SkillRoot {

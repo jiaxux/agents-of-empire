@@ -253,6 +253,9 @@ pub enum SidecarFormat {
     /// which also holds provider/oauth settings, so its installer preserves
     /// the surrounding document.
     KimiToml,
+    /// Antigravity CLI global `hooks.json` in `.gemini/config/hooks.json`,
+    /// keyed at top level by named hook group (`"aoe-status"`).
+    AntigravityJson,
 }
 
 /// Everything we know about a single agent CLI.
@@ -670,6 +673,27 @@ pub(crate) const KIRO_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
 /// (`PermissionRequest` / `PermissionResult`), so the waiting/running
 /// transition needs no `Notification` matcher the way Claude's does.
 /// `StopFailure` backstops `Stop` for the API-error turn-end path.
+/// Antigravity CLI lifecycle hook events. AoE writes these under its own
+/// `"aoe-status"` group in `~/.gemini/config/hooks.json` (preserving user hook
+/// groups). `SessionStart` is installed unconditionally alongside these to
+/// capture `conversationId` without marking an idle session as running, and
+/// `PreToolUse` is deliberately omitted because Antigravity requires a
+/// permission `decision` on `PreToolUse` stdout.
+pub(crate) const ANTIGRAVITY_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
+    SidecarHookEvent {
+        name: "PreInvocation",
+        status: HookStatus::Running,
+    },
+    SidecarHookEvent {
+        name: "PostToolUse",
+        status: HookStatus::Running,
+    },
+    SidecarHookEvent {
+        name: "Stop",
+        status: HookStatus::Idle,
+    },
+];
+
 pub(crate) const KIMI_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
     SidecarHookEvent {
         name: "UserPromptSubmit",
@@ -1147,7 +1171,7 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "antigravity",
-        oneshot_flag: None,
+        oneshot_flag: Some("-p"),
         binary: "agy",
         launch_subcommand: None,
         aliases: &["agy"],
@@ -1158,14 +1182,27 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_antigravity_status,
         container_env: &[],
         hook_config: None,
-        sidecar_hooks: None,
-        resume_strategy: ResumeStrategy::Unsupported,
+        sidecar_hooks: Some(SidecarHooks {
+            host_config_subpath: ".gemini/config/hooks.json",
+            sandbox_config_subpath: ".gemini/config/sandbox/hooks.json",
+            install: crate::hooks::install_antigravity_hooks_with_events,
+            uninstall: crate::hooks::uninstall_antigravity_hooks,
+            post_install_host: None,
+            selected_agent_hooks: None,
+            format: SidecarFormat::AntigravityJson,
+            events: ANTIGRAVITY_SIDECAR_EVENTS,
+        }),
+        resume_strategy: ResumeStrategy::Flag("--conversation"),
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         ready_marker: None,
         install_hint: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
-        permission_response: None,
+        permission_response: Some(PermissionResponse {
+            allow: &[KeyToken::Named("Enter")],
+            allow_always: Some(&[KeyToken::Named("Down"), KeyToken::Named("Enter")]),
+            deny: &[KeyToken::Named("Escape")],
+        }),
     },
     AgentDef {
         name: "kimi",
@@ -1265,6 +1302,7 @@ impl AgentDef {
     pub fn oneshot_trailing_args(&self) -> &'static [&'static str] {
         match self.name {
             "copilot" => &["-s", "--allow-all-tools", "--no-ask-user"],
+            "antigravity" => &["--disable-slash-commands"],
             _ => &[],
         }
     }
@@ -1277,7 +1315,7 @@ impl AgentDef {
     /// ignored rather than mis-injected (fail-closed).
     pub fn oneshot_model_flag(&self) -> Option<&'static str> {
         match self.name {
-            "claude" | "copilot" | "omp" => Some("--model"),
+            "claude" | "copilot" | "omp" | "antigravity" => Some("--model"),
             "codex" | "gemini" | "opencode" | "kimi" => Some("-m"),
             _ => None,
         }
@@ -1315,7 +1353,7 @@ impl AgentDef {
     /// `type: string, nargs: 1`; kimi `-p` is a `typer.Option(str)`; copilot
     /// `-p <text>` takes a value; claude `-p`/`--print` is boolean.
     pub fn oneshot_flag_binds_prompt(&self) -> bool {
-        matches!(self.name, "copilot" | "gemini" | "kimi")
+        matches!(self.name, "copilot" | "gemini" | "kimi" | "antigravity")
     }
 
     /// The base launch token(s) for the default (non-overridden) command:
@@ -1719,7 +1757,7 @@ mod tests {
         // flag to emit it.
         for agent in AGENTS {
             let expected = match agent.name {
-                "claude" | "copilot" | "omp" => Some("--model"),
+                "claude" | "copilot" | "omp" | "antigravity" => Some("--model"),
                 "codex" | "gemini" | "opencode" | "kimi" => Some("-m"),
                 _ => None,
             };
@@ -1762,7 +1800,7 @@ mod tests {
         // silently mis-injects an override (a value-binding flag would swallow
         // the model selector as its prompt), so pin the verified set exactly.
         for agent in AGENTS {
-            let expected = matches!(agent.name, "copilot" | "gemini" | "kimi");
+            let expected = matches!(agent.name, "copilot" | "gemini" | "kimi" | "antigravity");
             assert_eq!(
                 agent.oneshot_flag_binds_prompt(),
                 expected,
@@ -2330,6 +2368,7 @@ mod tests {
             ("settl", SidecarFormat::SettlToml),
             ("hermes", SidecarFormat::HermesYaml),
             ("kiro", SidecarFormat::KiroJson),
+            ("antigravity", SidecarFormat::AntigravityJson),
             ("kimi", SidecarFormat::KimiToml),
         ];
         for (name, fmt) in expected {

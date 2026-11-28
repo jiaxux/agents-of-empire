@@ -26,6 +26,7 @@ pub fn install_hint_for(binary: &str) -> Option<&'static str> {
             "follow https://github.com/mistralai/mistral-vibe (ships the `vibe-acp` binary)"
         }
         "kimi" => "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash  (then `kimi acp`)",
+        "agy" => "curl -fsSL https://antigravity.google/cli/install.sh | bash  (then `agy acp`)",
         "omp" => "curl -fsSL https://omp.sh/install | sh",
         _ => return None,
     })
@@ -162,6 +163,7 @@ mod tests {
             "vibe-acp",
             "pi-acp",
             "kimi",
+            "agy",
             "omp",
         ] {
             assert!(

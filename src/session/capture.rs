@@ -2745,6 +2745,26 @@ pub(crate) fn capture_kimi_session_id(
     select_kimi_session(&sessions, project_path, exclusion, launch_time_ms)
 }
 
+/// Polling closure for Antigravity CLI session tracking.
+///
+/// Antigravity's `SessionStart` and `PreInvocation` hooks write the session's
+/// `conversationId` UUID into `/tmp/aoe-hooks-<euid>/<instance_id>/session_id`.
+/// Because the sidecar is scoped per AoE instance (never shared across sibling
+/// panes in the same directory), this poller does zero filesystem scanning and
+/// cannot cross-pollinate conversations across co-located sessions.
+pub(crate) fn antigravity_poll_fn(
+    instance_id: String,
+    extra_excludes: HashSet<String>,
+) -> impl Fn() -> Option<String> + Send + 'static {
+    move || {
+        let id = crate::hooks::read_hook_session_id(&instance_id)?;
+        if extra_excludes.contains(&id) {
+            return None;
+        }
+        validated_session_id(id)
+    }
+}
+
 /// Polling closure for Kimi Code session tracking. `launch_time_ms` floors the
 /// live poll so it never claims a conversation that predates this launch.
 pub(crate) fn kimi_poll_fn(
@@ -6852,5 +6872,24 @@ mod tests {
 
         let found = scan_claude_project_dir(home.path(), project, None, &HashSet::new()).unwrap();
         assert_eq!(found.map(|(id, _)| id), Some(sid.to_string()));
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn test_antigravity_poll_fn_reads_sidecar_and_honors_excludes() {
+        let (_g, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let inst_id = "antigravity_poll_test";
+        let cid = "ec33ebf9-0cba-4100-8142-c61503f6c587";
+
+        let poll = antigravity_poll_fn(inst_id.to_string(), HashSet::new());
+        assert_eq!(poll(), None, "absent sidecar returns None");
+
+        crate::hooks::write_session_id_via_guard(inst_id, cid).unwrap();
+        assert_eq!(poll().as_deref(), Some(cid));
+
+        let mut excluded = HashSet::new();
+        excluded.insert(cid.to_string());
+        let poll_excluded = antigravity_poll_fn(inst_id.to_string(), excluded);
+        assert_eq!(poll_excluded(), None, "excluded conversationId is skipped");
     }
 }

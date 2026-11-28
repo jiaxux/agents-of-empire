@@ -41,8 +41,11 @@ fn run_inner<R: Read>(stdin: R, instance_id: &str) -> Result<()> {
     let value: serde_json::Value = serde_json::from_str(&buf)?;
     let sid = value
         .get("session_id")
+        .or_else(|| value.get("conversationId"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("payload has no top-level string `session_id`"))?;
+        .ok_or_else(|| {
+            anyhow!("payload has no top-level string `session_id` or `conversationId`")
+        })?;
     uuid::Uuid::parse_str(sid)?;
     crate::hooks::write_session_id_via_guard(instance_id, sid)
 }
@@ -80,6 +83,19 @@ mod tests {
         let payload = format!(r#"{{"session_id":"{uuid}","cwd":"/x"}}"#);
         extract(&payload, "compact").unwrap();
         assert_eq!(read_sidecar(&base, "compact").as_deref(), Some(uuid));
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn extracts_antigravity_conversation_id() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let uuid = "ec33ebf9-0cba-4100-8142-c61503f6c587";
+        let payload = format!(r#"{{"conversationId":"{uuid}","hookEventName":"SessionStart"}}"#);
+        extract(&payload, "antigravity_cid").unwrap();
+        assert_eq!(
+            read_sidecar(&base, "antigravity_cid").as_deref(),
+            Some(uuid)
+        );
     }
 
     #[test]

@@ -184,6 +184,15 @@ impl AgentRegistry {
             },
         );
         reg.agents.insert(
+            "antigravity".into(),
+            AgentSpec {
+                command: "agy".into(),
+                args: vec!["acp".into()],
+                description: "Google Antigravity CLI, native ACP via `agy acp`".into(),
+                env_allowlist: default_env_allowlist("agy"),
+            },
+        );
+        reg.agents.insert(
             "aoe-agent".into(),
             AgentSpec {
                 command: "${aoe_data_dir}/acp-worker/dist/aoe-agent".into(),
@@ -520,7 +529,7 @@ mod tests {
 
         // Deferred adapters stay None until each adapter's env reads are
         // verified from its own source.
-        for name in ["pi", "omp", "kimi", "vibe"] {
+        for name in ["pi", "omp", "kimi", "vibe", "antigravity"] {
             assert!(
                 al(name).is_none(),
                 "{name} must have None env_allowlist until source-verified"

@@ -173,6 +173,9 @@ pub(crate) fn verified_permission_prompt_signature(
         "omp" if raw_content.contains("Allow tool:") => {
             verified_omp_permission_signature(raw_content)
         }
+        "antigravity" if raw_content.contains("Approval Required") => {
+            verified_antigravity_permission_signature(raw_content)
+        }
         // OpenCode has mapped manual response keys, but no sufficiently
         // stable pane signature yet. Manual `a` remains available; the safe
         // automation failure mode is to leave an unverified prompt alone.
@@ -365,6 +368,59 @@ fn verified_omp_permission_signature(raw_content: &str) -> Option<VerifiedPermis
     Some(VerifiedPermissionPrompt {
         signature: normalized_permission_lines(prompt_tail.iter().copied()),
         approval: PermissionPromptApproval::AllowOnce,
+    })
+}
+
+fn verified_antigravity_permission_signature(
+    raw_content: &str,
+) -> Option<VerifiedPermissionPrompt> {
+    let clean = strip_ansi(raw_content);
+    let lower = clean.to_lowercase();
+    let non_empty: Vec<&str> = lower
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let recent = &non_empty[non_empty.len().saturating_sub(30)..];
+    let header_index = recent.iter().rposition(|line| {
+        line.trim().trim_start_matches('⚠').trim_start() == "approval required"
+    })?;
+    let prompt = &recent[header_index..];
+
+    let allow_once_index = prompt.iter().position(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix('>')
+            .or_else(|| trimmed.strip_prefix('❯'))
+            .or_else(|| trimmed.strip_prefix('›'))
+            .map(str::trim_start)
+            .is_some_and(|rest| rest == "yes, just this once")
+    })?;
+    let deny_index = prompt
+        .iter()
+        .position(|line| line.trim() == "no, deny access")?;
+    if deny_index <= allow_once_index {
+        return None;
+    }
+
+    // Only pick `MappedAllowAlways` (Down + Enter) when `yes, allow always` is
+    // directly below `yes, just this once` and above `no, deny access`;
+    // otherwise fall back to `AllowOnce` (Enter).
+    let has_allow_always = prompt.get(allow_once_index + 1).is_some_and(|line| {
+        line.trim() == "yes, allow always" && allow_once_index + 1 < deny_index
+    });
+
+    Some(VerifiedPermissionPrompt {
+        signature: normalized_permission_lines(
+            prompt
+                .iter()
+                .copied()
+                .filter(|line| !line.trim_start().starts_with(ANTIGRAVITY_SPINNER_FRAMES)),
+        ),
+        approval: if has_allow_always {
+            PermissionPromptApproval::MappedAllowAlways
+        } else {
+            PermissionPromptApproval::AllowOnce
+        },
     })
 }
 
@@ -2733,47 +2789,61 @@ pub fn detect_antigravity_status(raw_content: &str) -> Status {
         .copied()
         .collect();
 
-    let last_lines_lower: String = non_empty_lines
+    let recent_lines: Vec<&str> = non_empty_lines
         .iter()
         .rev()
         .take(30)
         .rev()
         .copied()
-        .collect::<Vec<&str>>()
-        .join("\n");
+        .collect();
+    let last_lines_lower = recent_lines.join("\n");
 
-    if last_lines_lower.contains("not signed in")
-        || last_lines_lower.contains("signing in")
-        || last_lines_lower.contains("authorization url")
-        || last_lines_lower.contains("authorization code")
-        || last_lines_lower.contains("google sign-in")
+    let bottom_3: Vec<&str> = non_empty_lines.iter().rev().take(3).copied().collect();
+    let bottom_5: Vec<&str> = non_empty_lines.iter().rev().take(5).copied().collect();
+    let bottom_12: Vec<&str> = non_empty_lines.iter().rev().take(12).copied().collect();
+
+    let footer_cancel = bottom_3.iter().any(|line| line.contains("esc to cancel"));
+    let footer_idle = bottom_3.iter().any(|line| line.contains("? for shortcuts"));
+    let footer_queued = bottom_3
+        .iter()
+        .any(|line| line.contains("press up to edit queued messages"));
+    let has_composer = footer_cancel || footer_idle || footer_queued;
+
+    // Sign-in and workspace-trust screens own the full viewport and never
+    // render above a live composer footer. Gating on `!has_composer` prevents
+    // transcript prose or code diffs mentioning "signing in" or "trust" from
+    // flipping a working or idle turn to Waiting (orange).
+    if !has_composer
+        && (last_lines_lower.contains("not signed in")
+            || last_lines_lower.contains("signing in")
+            || last_lines_lower.contains("authorization url")
+            || last_lines_lower.contains("authorization code")
+            || last_lines_lower.contains("google sign-in")
+            || last_lines_lower.contains("do you trust the contents")
+            || last_lines_lower.contains("yes, i trust this folder"))
     {
         return Status::Waiting;
     }
 
-    // "Approval Required" is the actual header Antigravity renders above tool
-    // permission prompts. The substring "approve" does NOT appear in
-    // "approval", so the base contains_approval_prompt list misses it; match
-    // explicitly. "deny access" is the rejection button rendered alongside.
-    // "awaiting user approval" is the status line shown while the agent is
-    // blocked on the user's decision.
-    if last_lines_lower.contains("approval required")
-        || last_lines_lower.contains("awaiting user approval")
-        || last_lines_lower.contains("deny access")
-    {
+    // Active tool-permission card or subagent approval prompt. Anchor to
+    // structural UI rows in the bottom region so quoted strings inside diffs or
+    // tool output above the composer cannot flag a working turn as Waiting.
+    let has_approval_card = bottom_12.iter().any(|line| {
+        let trimmed = line.trim();
+        trimmed.trim_start_matches('⚠').trim_start() == "approval required"
+            || trimmed == "no, deny access"
+            || trimmed.contains("awaiting user approval")
+    }) || bottom_5.iter().any(|line| line.contains("ctrl+k approve"));
+    if has_approval_card {
         return Status::Waiting;
     }
 
-    if [
-        "permission request",
-        "do you trust the contents",
-        "yes, i trust this folder",
-        "enter to select",
-        "enter confirm",
-    ]
-    .iter()
-    .any(|p| last_lines_lower.contains(p))
-    {
+    // Interactive picker / ask_question footers sit in the bottom few lines.
+    if bottom_5.iter().any(|line| {
+        line.contains("enter to select")
+            || line.contains("enter confirm")
+            || (!has_composer && line.contains("permission request"))
+    }) {
         return Status::Waiting;
     }
 
@@ -2781,31 +2851,22 @@ pub fn detect_antigravity_status(raw_content: &str) -> Status {
     // screen until it ends; while thinking, that line is a free-text summary
     // rather than an activity word. Checked before the generic approval words,
     // which also match transcript text such as "allows" above the prompt.
-    let footer_cancel = non_empty_lines
+    let spinner_status_line = recent_lines
         .iter()
-        .rev()
-        .take(3)
-        .any(|line| line.contains("esc to cancel"));
-    let spinner_status_line = non_empty_lines
-        .iter()
-        .rev()
-        .take(30)
         .any(|line| line.trim_start().starts_with(ANTIGRAVITY_SPINNER_FRAMES));
     if footer_cancel || spinner_status_line {
         return Status::Running;
     }
     // Once the turn ends the footer switches to `? for shortcuts`, so transcript
     // words like "allow" must not turn an idle session into Waiting.
-    if non_empty_lines
-        .iter()
-        .rev()
-        .take(3)
-        .any(|line| line.contains("? for shortcuts"))
-    {
+    if footer_idle {
         return Status::Idle;
     }
 
-    if contains_approval_prompt(&last_lines_lower, &["execute?", "run command?"]) {
+    if contains_approval_prompt(
+        &last_lines_lower,
+        &["permission request", "execute?", "run command?"],
+    ) {
         return Status::Waiting;
     }
 
@@ -2830,6 +2891,58 @@ pub fn detect_antigravity_status(raw_content: &str) -> Status {
     }
 
     Status::Idle
+}
+
+/// Reconcile a `Running` hook write against the live pane for Antigravity.
+///
+/// Antigravity's `PreInvocation` hook writes `running` before each model call
+/// and `Stop` writes `idle` when the loop terminates, but Antigravity emits no
+/// waiting hook when a tool permission card, subagent approval (`ctrl+k
+/// approve`), workspace trust dialog, or `ask_question` prompt blocks the turn.
+/// Mirrors `reconcile_claude_hook_status`:
+/// - Any blocking prompt on the pane downgrades `Running` to `Waiting`.
+/// - A parked idle footer (`? for shortcuts` without a live spinner or cancel
+///   footer) downgrades stale `Running` to `Idle` once the status file has
+///   aged past `IDLE_RECONCILE_MIN_RUNNING_AGE`.
+/// - Otherwise trust the hook (`Running`) so an active turn before its spinner
+///   renders never flickers `Idle`.
+pub(crate) fn reconcile_antigravity_hook_status(
+    hook_status: Status,
+    raw_content: &str,
+    running_age: Option<std::time::Duration>,
+) -> Status {
+    if hook_status != Status::Running {
+        return hook_status;
+    }
+    let clean = strip_ansi(raw_content);
+    let detected = detect_antigravity_status(&clean);
+    if detected == Status::Waiting {
+        tracing::debug!(
+            target: "tmux.status",
+            "antigravity reconciler: hook Running downgraded to Waiting"
+        );
+        return Status::Waiting;
+    }
+    if detected == Status::Idle
+        && running_age.is_some_and(|age| age >= IDLE_RECONCILE_MIN_RUNNING_AGE)
+    {
+        let lower = clean.to_lowercase();
+        let has_idle_footer = lower
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .rev()
+            .take(3)
+            .any(|line| line.contains("? for shortcuts"));
+        if has_idle_footer {
+            tracing::debug!(
+                target: "tmux.status",
+                "antigravity reconciler: hook Running downgraded to Idle (stale_running_idle_footer, age {:?})",
+                running_age
+            );
+            return Status::Idle;
+        }
+    }
+    hook_status
 }
 
 #[cfg(test)]
@@ -6556,6 +6669,17 @@ esc to cancel                                        auto · Gemini 4 Neon · hi
 >
 ──────────────────────────────
   Press up to edit queued messages                   auto · Gemini 4 Neon · high",
+            // Transcript/diff text containing approval or auth keywords above a
+            // live composer must not flip a working turn to Waiting (orange).
+            "\
+● Edited 1 file (status_detection.rs)
+  + if line.contains(\"approval required\") || line.contains(\"deny access\") || line.contains(\"signing in\") {
+  +     // permission request / enter to select / do you trust the contents
+⢿  Running cargo test... 4s
+──────────────────────────────
+>
+──────────────────────────────
+esc to cancel                                        auto · Gemini 4 Neon · high",
         ];
         for content in cases {
             assert_eq!(
@@ -6628,9 +6752,95 @@ esc to cancel";
     #[test]
     fn test_detect_antigravity_status_waiting_user_approval_status_line() {
         // "awaiting user approval" is the status line shown while the agent
-        // is blocked on the user's tool-permission decision.
-        let content = "I'll read that file now.\n awaiting user approval.";
-        assert_eq!(detect_antigravity_status(content), Status::Waiting);
+        // is blocked on the user's tool-permission decision; "ctrl+k approve"
+        // is shown on subagent approval prompts (upstream #5717).
+        for content in [
+            "I'll read that file now.\n awaiting user approval.",
+            "Subagent request\nctrl+k approve · esc to cancel",
+        ] {
+            assert_eq!(detect_antigravity_status(content), Status::Waiting);
+        }
+    }
+
+    #[test]
+    fn test_reconcile_antigravity_hook_status() {
+        let approval_pane = "\
+⚠ Approval Required
+
+> Yes, just this once
+  Yes, allow always
+  No, deny access
+
+esc to cancel";
+        assert_eq!(
+            reconcile_antigravity_hook_status(Status::Running, approval_pane, None),
+            Status::Waiting
+        );
+
+        let idle_pane = "\
+● Edited 1 file (main.rs)
+──────────────────────────────
+>
+──────────────────────────────
+? for shortcuts                                      auto · Gemini 4 Neon · high";
+        // Fresh Running write trusts the hook before the spinner appears.
+        assert_eq!(
+            reconcile_antigravity_hook_status(
+                Status::Running,
+                idle_pane,
+                Some(std::time::Duration::from_secs(1))
+            ),
+            Status::Running
+        );
+        // Stale Running write with an idle footer downgrades to Idle.
+        assert_eq!(
+            reconcile_antigravity_hook_status(
+                Status::Running,
+                idle_pane,
+                Some(IDLE_RECONCILE_MIN_RUNNING_AGE)
+            ),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_verified_antigravity_permission_signature() {
+        let three_choice = "\
+read_file
+path: /workspace/secrets.env
+
+⚠ Approval Required
+
+> Yes, just this once
+  Yes, allow always
+  No, deny access
+
+esc to cancel";
+        assert_eq!(
+            verified_permission_prompt_signature(three_choice, "antigravity")
+                .expect("3-choice Antigravity approval should verify")
+                .approval,
+            PermissionPromptApproval::MappedAllowAlways
+        );
+
+        let two_choice = "\
+run_command
+⚠ Approval Required
+> Yes, just this once
+  No, deny access";
+        assert_eq!(
+            verified_permission_prompt_signature(two_choice, "antigravity")
+                .expect("2-choice Antigravity approval should verify")
+                .approval,
+            PermissionPromptApproval::AllowOnce
+        );
+
+        let trust_dialog = "\
+Do you trust the contents of this directory?
+Antigravity CLI requires permission to read, edit, and execute files here.
+> Yes, I trust this folder
+  No, exit";
+        assert!(verified_permission_prompt_signature(trust_dialog, "antigravity").is_none());
     }
 
     #[test]

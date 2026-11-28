@@ -290,6 +290,18 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         clean_files: &[],
     },
     AgentConfigMount {
+        tool_name: "antigravity",
+        host_rel: ".gemini/config",
+        container_suffix: ".gemini/config",
+        skip_entries: &["sandbox"],
+        seed_files: &[],
+        copy_dirs: &["skills"],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
+        clean_files: &[],
+    },
+    AgentConfigMount {
         tool_name: "kimi",
         host_rel: ".kimi-code",
         container_suffix: ".kimi-code",
@@ -2816,8 +2828,13 @@ mod tests {
         let tool_names: Vec<&str> = AGENT_CONFIG_MOUNTS.iter().map(|m| m.tool_name).collect();
         for name in &tool_names {
             let count = tool_names.iter().filter(|n| *n == name).count();
-            // OpenCode has two mounts: data dir (.local/share/opencode) + config dir (.config/opencode)
-            let expected = if *name == "opencode" { 2 } else { 1 };
+            // OpenCode has two mounts (.local/share/opencode + .config/opencode)
+            // and Antigravity has two (.gemini/antigravity-cli + .gemini/config).
+            let expected = if matches!(*name, "opencode" | "antigravity") {
+                2
+            } else {
+                1
+            };
             assert_eq!(
                 count, expected,
                 "tool_name '{}' appears {} times, expected {}",
@@ -2863,12 +2880,14 @@ mod tests {
             .iter()
             .filter(|m| m.tool_name == "antigravity")
             .collect();
-        assert_eq!(antigravity_mounts.len(), 1);
+        assert_eq!(antigravity_mounts.len(), 2);
         assert_eq!(antigravity_mounts[0].host_rel, ".gemini/antigravity-cli");
         assert_eq!(
             antigravity_mounts[0].container_suffix,
             ".gemini/antigravity-cli"
         );
+        assert_eq!(antigravity_mounts[1].host_rel, ".gemini/config");
+        assert_eq!(antigravity_mounts[1].container_suffix, ".gemini/config");
 
         // Unknown tool should match nothing
         let unknown_mounts: Vec<_> = AGENT_CONFIG_MOUNTS

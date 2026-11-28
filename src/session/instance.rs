@@ -20,15 +20,15 @@ use crate::tmux;
 use crate::tmux::status_detection::{OMP_BANNER_DISMISSAL_ANCHOR, OMP_TERMINAL_RETRY_MARKERS};
 
 use crate::session::capture::{
-    capture_claude_session_id, capture_claude_session_id_in_container, capture_codex_session_id,
-    capture_copilot_session_id, capture_gemini_session_id, capture_hermes_session_id,
-    capture_kimi_session_id, capture_omp_session_id, capture_pi_session_id,
-    capture_vibe_session_id, claude_poll_fn, claude_poll_fn_sandboxed, codex_poll_fn,
-    codex_poll_fn_sandboxed, copilot_poll_fn, gemini_poll_fn, gemini_poll_fn_sandboxed,
-    generate_claude_session_id, hermes_poll_fn, hermes_poll_fn_sandboxed, is_valid_session_id,
-    kimi_poll_fn, omp_host_routing_environment, omp_poll_fn, omp_poll_fn_sandboxed,
-    omp_sandbox_launch_marker, opencode_poll_fn, opencode_poll_fn_sandboxed, pi_poll_fn,
-    pi_poll_fn_sandboxed, reject_omp_secret_args, resolve_omp_store_layout,
+    antigravity_poll_fn, capture_claude_session_id, capture_claude_session_id_in_container,
+    capture_codex_session_id, capture_copilot_session_id, capture_gemini_session_id,
+    capture_hermes_session_id, capture_kimi_session_id, capture_omp_session_id,
+    capture_pi_session_id, capture_vibe_session_id, claude_poll_fn, claude_poll_fn_sandboxed,
+    codex_poll_fn, codex_poll_fn_sandboxed, copilot_poll_fn, gemini_poll_fn,
+    gemini_poll_fn_sandboxed, generate_claude_session_id, hermes_poll_fn, hermes_poll_fn_sandboxed,
+    is_valid_session_id, kimi_poll_fn, omp_host_routing_environment, omp_poll_fn,
+    omp_poll_fn_sandboxed, omp_sandbox_launch_marker, opencode_poll_fn, opencode_poll_fn_sandboxed,
+    pi_poll_fn, pi_poll_fn_sandboxed, reject_omp_secret_args, resolve_omp_store_layout,
     resolve_omp_store_layout_in_container_with_environment,
     resolve_omp_store_layout_with_environment, try_capture_codex_session_id_in_container,
     try_capture_gemini_session_id_in_container, try_capture_hermes_session_id_in_container,
@@ -3563,6 +3563,14 @@ impl Instance {
     /// reads can briefly surface different UUIDs, benign under the existing
     /// eventual-consistency capture model.
     pub(crate) fn capture_freshest_session_id(&self) -> Option<String> {
+        if self.tool == "antigravity" {
+            let authoritative = crate::hooks::read_hook_session_id(&self.id)?;
+            if self.retroactive_capture_excludes.contains(&authoritative) {
+                return None;
+            }
+            return override_if_distinct(self.agent_session_id.as_deref(), authoritative);
+        }
+
         if self.tool == "claude" {
             if let Some(authoritative) = crate::hooks::read_hook_session_id(&self.id) {
                 if self.retroactive_capture_excludes.contains(&authoritative) {
@@ -4290,7 +4298,7 @@ impl Instance {
             "agent launch command prepared"
         );
 
-        if self.tool == "claude" {
+        if matches!(self.tool.as_str(), "claude" | "antigravity") {
             let _ = crate::hooks::unlink_session_id_via_guard(&self.id);
         }
 
@@ -5668,9 +5676,8 @@ impl Instance {
         !self.is_structured()
             && self.supports_session_poller()
             && match self.tool.as_str() {
-                "claude" | "opencode" | "vibe" | "pi" | "codex" | "gemini" | "hermes" | "omp" => {
-                    true
-                }
+                "claude" | "antigravity" | "opencode" | "vibe" | "pi" | "codex" | "gemini"
+                | "hermes" | "omp" => true,
                 "copilot" | "kimi" => !self.is_sandboxed(),
                 _ => false,
             }
@@ -5922,6 +5929,7 @@ impl Instance {
                     extra_excludes,
                 ))
             }
+            "antigravity" => Box::new(antigravity_poll_fn(self.id.clone(), extra_excludes)),
             _ => return,
         };
 
@@ -7155,7 +7163,7 @@ impl Instance {
                 //    its prior Running/Waiting edge gate; Codex also inspects
                 //    a new generation from Idle so a whole short turn between
                 //    polls cannot hide its final confirmation.
-                let reconciles_running = (hook_tool == "codex" || hook_tool == "claude")
+                let reconciles_running = matches!(hook_tool, "codex" | "claude" | "antigravity")
                     && hook_status == Status::Running;
                 let reconciles_waiting = hook_status == Status::Waiting;
                 let cached_idle = if idle_hook_tool && hook_status == Status::Idle {
@@ -7187,6 +7195,13 @@ impl Instance {
                                 }
                             } else if hook_tool == "codex" {
                                 tmux::reconcile_codex_hook_status(hook_status, &pane_content)
+                            } else if hook_tool == "antigravity" {
+                                let running_age = crate::hooks::read_hook_status_age(&self.id);
+                                tmux::reconcile_antigravity_hook_status(
+                                    hook_status,
+                                    &pane_content,
+                                    running_age,
+                                )
                             } else {
                                 let running_age = crate::hooks::read_hook_status_age(&self.id);
                                 tmux::reconcile_claude_hook_status(

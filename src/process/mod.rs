@@ -235,7 +235,7 @@ pub fn get_pane_pid(session_name: &str) -> Option<u32> {
     // pane even when the user has created additional tmux windows or split
     // panes.  See #435, #488.
     let target = format!("{session_name}:^.0");
-    let output = crate::tmux::tmux_command()
+    let output = crate::tmux::tmux_query_command()
         .args(["display-message", "-t", &target, "-p", "#{pane_pid}"])
         .output()
         .ok()?;

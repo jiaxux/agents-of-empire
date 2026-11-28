@@ -178,6 +178,9 @@ pub(crate) fn has_aoe_marker(target: &HookTarget) -> bool {
             // `{ event, command }` entries as settl, so the settl marker
             // walker identifies AoE-managed hooks in it unchanged.
             crate::agents::SidecarFormat::KimiToml => settl_config_has_aoe_marker(&target.path),
+            crate::agents::SidecarFormat::AntigravityJson => {
+                antigravity_config_has_aoe_marker(&target.path)
+            }
         },
     }
 }
@@ -345,6 +348,50 @@ fn kiro_config_has_aoe_marker(path: &Path) -> bool {
             if let Some(cmd) = entry.get("command").and_then(|c| c.as_str()) {
                 if is_aoe_hook_command(cmd) {
                     return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Antigravity's `hooks.json` nests named hook groups at top level:
+/// `{ "<group>": { "SessionStart"|"PreInvocation"|"Stop": [{command}],
+/// "PreToolUse"|"PostToolUse": [{ matcher, hooks: [{command}] }] } }`.
+fn antigravity_config_has_aoe_marker(path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&content) else {
+        return false;
+    };
+    let Some(root) = value.as_object() else {
+        return false;
+    };
+    for group in root.values() {
+        let Some(group_obj) = group.as_object() else {
+            continue;
+        };
+        for entries in group_obj.values() {
+            let Some(arr) = entries.as_array() else {
+                continue;
+            };
+            for entry in arr {
+                if entry
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(is_aoe_hook_command)
+                {
+                    return true;
+                }
+                if let Some(nested) = entry.get("hooks").and_then(|h| h.as_array()) {
+                    if nested.iter().any(|h| {
+                        h.get("command")
+                            .and_then(|c| c.as_str())
+                            .is_some_and(is_aoe_hook_command)
+                    }) {
+                        return true;
+                    }
                 }
             }
         }

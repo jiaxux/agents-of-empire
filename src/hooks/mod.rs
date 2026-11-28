@@ -489,7 +489,7 @@ fn hook_command_session_id_sandbox(base: &str) -> String {
          set -- $LS; M=\"$1\"; \
          case \"$M\" in drwx------|drwx------.|drwx------+|drwx------@) ;; *) exit 0 ;; esac; \
          command -v jq >/dev/null 2>&1 || exit 0; \
-         SID=$(jq -r '\\''if (.session_id|type)==\"string\" then .session_id else empty end'\\'' 2>/dev/null); \
+         SID=$(jq -r '\\''if (.session_id|type)==\"string\" then .session_id elif (.conversationId|type)==\"string\" then .conversationId else empty end'\\'' 2>/dev/null); \
          H=[0-9a-fA-F]; \
          case \"$SID\" in $H$H$H$H$H$H$H$H-$H$H$H$H-$H$H$H$H-$H$H$H$H-$H$H$H$H$H$H$H$H$H$H$H$H) ;; *) exit 0 ;; esac; \
          printf \"%s\" \"$SID\" > \"$D/.session_id.$$.tmp\" 2>/dev/null && mv \"$D/.session_id.$$.tmp\" \"$D/session_id\" 2>/dev/null; \
@@ -1704,6 +1704,286 @@ pub fn uninstall_kimi_hooks(config_path: &Path) -> Result<bool> {
 
         crate::session::atomic_write(config_path, config.to_string().as_bytes())?;
         tracing::info!(target: "hooks.uninstall", "Removed AoE hooks from {}", config_path.display());
+        Ok(true)
+    })
+}
+
+/// Top-level hook group name AoE owns inside Antigravity's `hooks.json`.
+const ANTIGRAVITY_AOE_HOOK_GROUP: &str = "aoe-status";
+
+/// Antigravity hook command for status-only events (`PostToolUse`, `Stop`).
+/// Always prints `{}` to stdout before exiting 0 to satisfy Antigravity's
+/// protojson hook contract, even when `AOE_INSTANCE_ID` is unset or a guard
+/// exits early.
+fn antigravity_status_hook_command(status: &str, target: HookInstallTarget) -> String {
+    let base = hook_base_for_target(target);
+    let inner = hook_command_with_base(status, &base, target);
+    // Inject `printf {}; ` immediately inside `sh -c '...'` so every exit path
+    // emits valid JSON `{}` to stdout.
+    inner.replacen("sh -c '", "sh -c 'printf {}; ", 1)
+}
+
+/// Antigravity hook command for `SessionStart`: extracts `conversationId` into
+/// the per-instance `session_id` sidecar without changing status, always
+/// printing `{}` to stdout.
+fn antigravity_session_id_hook_command(target: HookInstallTarget) -> String {
+    match target {
+        HookInstallTarget::Host => format!(
+            "sh -c 'printf {{}}; [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
+             command -v aoe >/dev/null 2>&1 || exit 0; \
+             aoe __extract-session-id >/dev/null 2>&1; exit 0 # {AOE_HOOK_MARKER}'"
+        ),
+        HookInstallTarget::Sandbox => {
+            let sandbox = hook_command_session_id_sandbox(HOOK_STATUS_BASE_IN_CONTAINER);
+            sandbox.replacen("sh -c '", "sh -c 'printf {}; ", 1)
+        }
+    }
+}
+
+/// Antigravity hook command for `PreInvocation`: writes the status file AND
+/// captures `conversationId` in one shell invocation (avoiding a second fork on
+/// every model invocation) while always emitting `{}` to stdout.
+fn antigravity_status_and_session_id_hook_command(
+    status: &str,
+    target: HookInstallTarget,
+) -> String {
+    let base = hook_base_for_target(target);
+    let write = match target {
+        HookInstallTarget::Host => format!(
+            "printf {status} > \"$D/status\" 2>/dev/null; \
+             if command -v aoe >/dev/null 2>&1; then aoe __extract-session-id >/dev/null 2>&1; fi; "
+        ),
+        HookInstallTarget::Sandbox => format!(
+            "printf {status} > \"$D/status\" 2>/dev/null; \
+             if command -v jq >/dev/null 2>&1; then \
+               SID=$(jq -r '\\''if (.session_id|type)==\"string\" then .session_id elif (.conversationId|type)==\"string\" then .conversationId else empty end'\\'' 2>/dev/null); \
+               H=[0-9a-fA-F]; \
+               case \"$SID\" in $H$H$H$H$H$H$H$H-$H$H$H$H-$H$H$H$H-$H$H$H$H-$H$H$H$H$H$H$H$H$H$H$H$H) \
+                 printf \"%s\" \"$SID\" > \"$D/.session_id.$$.tmp\" 2>/dev/null && mv \"$D/.session_id.$$.tmp\" \"$D/session_id\" 2>/dev/null ;; \
+               esac; \
+             fi; "
+        ),
+    };
+    let inner = hook_command_with_write(&write, &base, target);
+    inner.replacen("sh -c '", "sh -c 'printf {}; ", 1)
+}
+
+fn antigravity_event_is_grouped(event_name: &str) -> bool {
+    matches!(event_name, "PreToolUse" | "PostToolUse")
+}
+
+/// Install AoE lifecycle hooks into Antigravity's global `hooks.json`
+/// (typically `~/.gemini/config/hooks.json`).
+///
+/// Antigravity `hooks.json` maps top-level named hook groups to event arrays:
+/// flat handler arrays for `SessionStart`, `PreInvocation`, `PostInvocation`,
+/// and `Stop`, and `{ matcher, hooks }` groups for `PreToolUse` / `PostToolUse`.
+/// AoE manages only its dedicated `"aoe-status"` group, leaving all user hook
+/// groups untouched. `PreToolUse` is deliberately omitted so AoE never injects
+/// or overrides tool permission decisions.
+///
+/// Idempotent on disk: when the file already encodes the same JSON, it is not
+/// rewritten.
+pub fn install_antigravity_hooks(config_path: &Path, target: HookInstallTarget) -> Result<()> {
+    let events = default_sidecar_events("antigravity");
+    install_antigravity_hooks_with_events(config_path, target, &events)
+}
+
+pub fn install_antigravity_hooks_with_events(
+    config_path: &Path,
+    target: HookInstallTarget,
+    events: &[crate::agents::ResolvedHookEvent],
+) -> Result<()> {
+    with_config_lock(config_path, "json.lock", || {
+        let mut config: Value = if config_path.exists() {
+            let content = std::fs::read_to_string(config_path)?;
+            if content.trim().is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_str(&content)
+                    .with_context(|| format!("Failed to parse {}", config_path.display()))?
+            }
+        } else {
+            serde_json::json!({})
+        };
+
+        let before = config.clone();
+
+        let root = config
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("Antigravity hooks.json root is not a JSON object"))?;
+
+        let mut aoe_group = serde_json::Map::new();
+
+        // Always register SessionStart to capture `conversationId` for per-session
+        // auto-resume without changing the idle status of a newly launched session.
+        aoe_group.insert(
+            "SessionStart".to_string(),
+            serde_json::json!([
+                {
+                    "type": "command",
+                    "command": antigravity_session_id_hook_command(target),
+                    "timeout": 10
+                }
+            ]),
+        );
+
+        for event in events {
+            let Some(status) = event.status else {
+                continue;
+            };
+            // Never install a PreToolUse hook on Antigravity: its contract
+            // requires a permission decision (`allow`/`deny`/`ask`/`force_ask`).
+            if event.name == "PreToolUse" {
+                continue;
+            }
+            let cmd = if event.name == "PreInvocation" {
+                antigravity_status_and_session_id_hook_command(status.as_str(), target)
+            } else {
+                antigravity_status_hook_command(status.as_str(), target)
+            };
+            let handler = serde_json::json!({
+                "type": "command",
+                "command": cmd,
+                "timeout": 10
+            });
+            let entry = if antigravity_event_is_grouped(&event.name) {
+                serde_json::json!([
+                    {
+                        "matcher": "*",
+                        "hooks": [handler]
+                    }
+                ])
+            } else {
+                serde_json::json!([handler])
+            };
+            aoe_group.insert(event.name.clone(), entry);
+        }
+
+        root.insert(
+            ANTIGRAVITY_AOE_HOOK_GROUP.to_string(),
+            Value::Object(aoe_group),
+        );
+
+        if config == before {
+            tracing::debug!(
+                target: "hooks.install",
+                "AoE hooks in {} already up to date; skipping write",
+                config_path.display()
+            );
+            return Ok(());
+        }
+
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let formatted = serde_json::to_string_pretty(&config)?;
+        crate::session::atomic_write(config_path, formatted.as_bytes())?;
+
+        tracing::info!(
+            target: "hooks.install",
+            "Installed AoE hooks in {}",
+            config_path.display()
+        );
+        Ok(())
+    })
+}
+
+/// Remove AoE hooks from Antigravity's `hooks.json`, preserving all user hook
+/// groups untouched. Returns whether anything changed.
+pub fn uninstall_antigravity_hooks(config_path: &Path) -> Result<bool> {
+    if !config_path.exists() {
+        return Ok(false);
+    }
+
+    with_config_lock(config_path, "json.lock", || {
+        let content = std::fs::read_to_string(config_path)?;
+        if content.trim().is_empty() {
+            return Ok(false);
+        }
+        let Ok(mut config) = serde_json::from_str::<Value>(&content) else {
+            return Ok(false);
+        };
+        let Some(root) = config.as_object_mut() else {
+            return Ok(false);
+        };
+
+        let mut changed = root.remove(ANTIGRAVITY_AOE_HOOK_GROUP).is_some();
+
+        // Also scrub any AoE-marked handlers that might live under another key.
+        let mut empty_groups = Vec::new();
+        for (group_name, group_val) in root.iter_mut() {
+            let Some(group_obj) = group_val.as_object_mut() else {
+                continue;
+            };
+            let mut empty_events = Vec::new();
+            for (event_name, entries_val) in group_obj.iter_mut() {
+                let Some(arr) = entries_val.as_array_mut() else {
+                    continue;
+                };
+                if antigravity_event_is_grouped(event_name) {
+                    let before_len = arr.len();
+                    for matcher_group in arr.iter_mut() {
+                        if let Some(hooks_arr) = matcher_group
+                            .get_mut("hooks")
+                            .and_then(|h| h.as_array_mut())
+                        {
+                            let h_before = hooks_arr.len();
+                            hooks_arr.retain(|h| {
+                                !h.get("command")
+                                    .and_then(|c| c.as_str())
+                                    .is_some_and(is_aoe_hook_command)
+                            });
+                            if hooks_arr.len() != h_before {
+                                changed = true;
+                            }
+                        }
+                    }
+                    arr.retain(|mg| {
+                        mg.get("hooks")
+                            .and_then(|h| h.as_array())
+                            .is_none_or(|h| !h.is_empty())
+                    });
+                    if arr.len() != before_len {
+                        changed = true;
+                    }
+                } else {
+                    let before_len = arr.len();
+                    arr.retain(|h| {
+                        !h.get("command")
+                            .and_then(|c| c.as_str())
+                            .is_some_and(is_aoe_hook_command)
+                    });
+                    if arr.len() != before_len {
+                        changed = true;
+                    }
+                }
+                if arr.is_empty() {
+                    empty_events.push(event_name.clone());
+                }
+            }
+            for event_name in empty_events {
+                group_obj.remove(&event_name);
+            }
+            if group_obj.is_empty() {
+                empty_groups.push(group_name.clone());
+            }
+        }
+        for group_name in empty_groups {
+            root.remove(&group_name);
+        }
+
+        if !changed {
+            return Ok(false);
+        }
+
+        let formatted = serde_json::to_string_pretty(&config)?;
+        crate::session::atomic_write(config_path, formatted.as_bytes())?;
+        tracing::info!(
+            target: "hooks.uninstall",
+            "Removed AoE hooks from {}",
+            config_path.display()
+        );
         Ok(true)
     })
 }
@@ -5491,6 +5771,25 @@ hooks_auto_accept: false
                 "sandbox session-id",
                 canonical_session_id_command(HookInstallTarget::Sandbox),
             ),
+            (
+                "antigravity host status",
+                antigravity_status_hook_command("idle", HookInstallTarget::Host),
+            ),
+            (
+                "antigravity host session-id",
+                antigravity_session_id_hook_command(HookInstallTarget::Host),
+            ),
+            (
+                "antigravity host pre-invocation",
+                antigravity_status_and_session_id_hook_command("running", HookInstallTarget::Host),
+            ),
+            (
+                "antigravity sandbox pre-invocation",
+                antigravity_status_and_session_id_hook_command(
+                    "running",
+                    HookInstallTarget::Sandbox,
+                ),
+            ),
         ];
         for (label, cmd) in &emitters {
             assert!(
@@ -5498,6 +5797,79 @@ hooks_auto_accept: false
                 "{label} must be recognised by is_aoe_hook_command: {cmd}"
             );
         }
+    }
+
+    #[test]
+    fn test_install_antigravity_hooks_preserves_user_groups_and_emits_valid_json() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("hooks.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+  "user-linter": {
+    "PostToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [{ "type": "command", "command": "./lint.sh" }]
+      }
+    ]
+  }
+}"#,
+        )
+        .unwrap();
+
+        install_antigravity_hooks(&config_path, HookInstallTarget::Host).unwrap();
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: Value = serde_json::from_str(&raw).unwrap();
+
+        // User group is preserved untouched.
+        assert!(parsed.get("user-linter").is_some());
+
+        let aoe_group = parsed
+            .get(ANTIGRAVITY_AOE_HOOK_GROUP)
+            .and_then(|v| v.as_object())
+            .expect("aoe-status group installed");
+        assert!(aoe_group.get("SessionStart").is_some());
+        assert!(aoe_group.get("PreInvocation").is_some());
+        assert!(aoe_group.get("Stop").is_some());
+        // PreToolUse must never be installed (would override permission decisions).
+        assert!(aoe_group.get("PreToolUse").is_none());
+        // PostToolUse uses the grouped { matcher, hooks } schema.
+        let post = aoe_group
+            .get("PostToolUse")
+            .and_then(|v| v.as_array())
+            .expect("PostToolUse array");
+        assert_eq!(post[0]["matcher"].as_str(), Some("*"));
+        assert!(post[0]["hooks"][0]["command"]
+            .as_str()
+            .is_some_and(is_aoe_hook_command));
+
+        // Executing any generated command without AOE_INSTANCE_ID must emit `{}`
+        // and exit 0 to satisfy Antigravity's protojson hook contract.
+        let stop_cmd = aoe_group["Stop"][0]["command"].as_str().unwrap();
+        let output = std::process::Command::new("sh")
+            .args(["-c", stop_cmd])
+            .env_remove("AOE_INSTANCE_ID")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "{}");
+
+        // Idempotent second install does not rewrite.
+        let before_mtime = std::fs::metadata(&config_path).unwrap().modified().unwrap();
+        install_antigravity_hooks(&config_path, HookInstallTarget::Host).unwrap();
+        assert_eq!(
+            std::fs::metadata(&config_path).unwrap().modified().unwrap(),
+            before_mtime
+        );
+
+        // Uninstall removes only AoE hooks and preserves user-linter.
+        assert!(uninstall_antigravity_hooks(&config_path).unwrap());
+        let after: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(after.get(ANTIGRAVITY_AOE_HOOK_GROUP).is_none());
+        assert!(after.get("user-linter").is_some());
+        assert!(!uninstall_antigravity_hooks(&config_path).unwrap());
     }
 
     #[test]

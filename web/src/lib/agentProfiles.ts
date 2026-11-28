@@ -259,6 +259,23 @@ const KIMI: AgentProfile = {
   specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
 };
 
+const ANTIGRAVITY: AgentProfile = {
+  key: "antigravity",
+  subagentToolNames: [],
+  capabilities: {
+    todos: false,
+    skills: false,
+    wakeup: false,
+    subagents: false,
+    legacyModeFallback: false,
+    heartbeatKeepalives: false,
+  },
+  parentMetaNamespaces: [],
+  mcpPrefixes: ["mcp__"],
+  aliases: {},
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
+};
+
 const AOE_AGENT: AgentProfile = {
   ...CLAUDE,
   key: "aoe-agent",
@@ -294,6 +311,7 @@ const PROFILES: Record<string, AgentProfile> = {
   pi: PI,
   omp: OMP,
   kimi: KIMI,
+  antigravity: ANTIGRAVITY,
   "aoe-agent": AOE_AGENT,
 };
 

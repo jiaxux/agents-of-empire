@@ -320,7 +320,7 @@ pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
     // Use `^.0` to target the first window's first pane regardless of
     // base-index or which pane is active.  See #435, #488.
     let target = format!("{session_name}:^.0");
-    crate::tmux::tmux_command()
+    crate::tmux::tmux_query_command()
         .args([
             "display-message",
             "-t",
@@ -337,7 +337,7 @@ pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
 
 fn pane_start_command_is_protected(session_name: &str) -> bool {
     let target = format!("{session_name}:^.0");
-    crate::tmux::tmux_command()
+    crate::tmux::tmux_query_command()
         .args([
             "display-message",
             "-t",
