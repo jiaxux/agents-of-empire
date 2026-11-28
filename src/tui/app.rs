@@ -199,6 +199,7 @@ pub struct App {
     /// tracking off entirely.
     mouse_capture_allowed: bool,
     host_title: super::host_title::HostTitleTracker,
+    icon_renderer: super::agent_icons::KittyIconRenderer,
     /// True when running under Mosh (`MOSH_CONNECTION` set). Mosh mangles
     /// xterm mouse-tracking escapes, so `tui::run` skips the startup
     /// `EnableMouseCapture` and `sync_mouse_capture` must not re-enable
@@ -505,6 +506,8 @@ impl App {
             Some(profile.to_string())
         };
         let mut home = HomeView::new(active_profile, available_tools, file_watch)?;
+        let icon_renderer = super::agent_icons::KittyIconRenderer::detect();
+        home.set_kitty_icons_enabled(icon_renderer.is_enabled());
 
         // Check if we need to show welcome or changelog dialogs
         let config = Config::load_or_warn();
@@ -587,6 +590,7 @@ impl App {
             mouse_captured: crate::tui::mouse_capture_requested(&config.session) && !mosh_active,
             mouse_capture_allowed: crate::tui::mouse_capture_requested(&config.session),
             host_title: super::host_title::HostTitleTracker::default(),
+            icon_renderer,
             mosh_active,
             #[cfg(feature = "serve")]
             pending_structured_view_open: None,
@@ -703,6 +707,8 @@ impl App {
                 crossterm::queue!(terminal.backend_mut(), crossterm::cursor::Hide)?;
             }
             terminal.draw(|f| self.render(f))?;
+            self.icon_renderer
+                .sync(terminal.backend_mut(), self.home.agent_icon_slots())?;
             Ok(())
         })();
         let end_result = crossterm::execute!(
@@ -734,6 +740,7 @@ impl App {
         // of its own extended-keys configuration (#2362).
         #[cfg(unix)]
         let _ = crossterm::execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+        let _ = self.icon_renderer.clear_all(terminal.backend_mut());
         crossterm::execute!(
             terminal.backend_mut(),
             crossterm::terminal::LeaveAlternateScreen,
@@ -794,6 +801,7 @@ impl App {
         // born into raw mode rather than attached to a briefly-cooked tty.
         self.event_stream = Some(EventStream::new());
         crate::tui::clear_terminal(terminal)?;
+        self.icon_renderer.invalidate();
 
         Ok(result)
     }
@@ -1015,6 +1023,7 @@ impl App {
             // there are no stale events to drain.
             if self.needs_redraw {
                 crate::tui::clear_terminal(terminal)?;
+                self.icon_renderer.invalidate();
                 self.needs_redraw = false;
             }
 
@@ -1768,6 +1777,7 @@ impl App {
                             // (responsive::dialog_width, STACKED_BREAKPOINT,
                             // etc.) re-evaluates; ratatui's draw() autoresizes
                             // internally before rendering.
+                            self.icon_renderer.invalidate();
                             self.draw(terminal)?;
                             continue;
                         }

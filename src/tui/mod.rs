@@ -1,6 +1,7 @@
 //! Terminal User Interface module
 
 mod agent_dialogue;
+pub(crate) mod agent_icons;
 mod app;
 mod attach_project_poller;
 mod attached_status_hooks;
@@ -187,6 +188,7 @@ impl Drop for TerminalGuard {
         if self.disable_mouse {
             let _ = execute!(stdout, DisableMouseCapture);
         }
+        agent_icons::cleanup_on_exit(&mut stdout);
         let _ = execute!(
             stdout,
             LeaveAlternateScreen,

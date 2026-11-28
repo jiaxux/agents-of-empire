@@ -948,6 +948,7 @@ impl HomeView {
         self.footer_buttons.clear();
         self.collapse_button_area = Rect::default();
         self.expand_strip_area = Rect::default();
+        self.agent_icon_slots.clear();
 
         // Settings view takes over the whole screen
         if let Some(ref mut settings) = self.settings_view {
@@ -1136,10 +1137,12 @@ impl HomeView {
         // clickable Yes/No buttons) can mutate self. Dialogs with
         // `&self` render methods still work; Rust auto-derefs the
         // mutable borrow.
+        let mut modal_open = self.show_help;
         macro_rules! render_dialogs {
             ($($field:ident),* $(,)?) => {
                 $(
                     if let Some(dialog) = &mut self.$field {
+                        modal_open = true;
                         dialog.render(frame, area, theme);
                     }
                 )*
@@ -1189,13 +1192,18 @@ impl HomeView {
         // The fleet view renders the last published snapshot; it never
         // rebuilds an index or touches git from here.
         if let Some(dialog) = &mut self.fleet_dialog {
+            modal_open = true;
             let snapshot = std::sync::Arc::clone(&self.fleet_snapshot);
             dialog.render(frame, area, theme, &snapshot);
         }
         if let (Some(dialog), Some(dialogue)) =
             (&mut self.agent_dialogue_dialog, &self.agent_dialogue)
         {
+            modal_open = true;
             dialog.render(frame, area, theme, dialogue);
+        }
+        if modal_open {
+            self.agent_icon_slots.clear();
         }
     }
 
@@ -1466,6 +1474,7 @@ impl HomeView {
         );
 
         let mut lines: Vec<Line> = Vec::new();
+        let mut icon_slots: Vec<crate::tui::agent_icons::AgentIconSlot> = Vec::new();
         if scroll.has_more_above {
             lines.push(Line::from(Span::styled(
                 format!("  [{} more above]", scroll.scroll_offset),
@@ -1498,6 +1507,16 @@ impl HomeView {
                     theme.selection
                 };
                 line = line.style(Style::default().bg(bg));
+            }
+            if let Some(slot) = self.build_agent_icon_slot(
+                item,
+                &line,
+                list_region,
+                lines.len(),
+                is_selected,
+                is_hovered,
+            ) {
+                icon_slots.push(slot);
             }
             lines.push(line);
         }
@@ -1572,6 +1591,16 @@ impl HomeView {
                     };
                     line = line.style(Style::default().bg(bg));
                 }
+                if let Some(slot) = self.build_agent_icon_slot(
+                    item,
+                    &line,
+                    shelf_region,
+                    slines.len(),
+                    is_selected,
+                    is_hovered,
+                ) {
+                    icon_slots.push(slot);
+                }
                 slines.push(line);
             }
             if sscroll.has_more_below {
@@ -1583,6 +1612,8 @@ impl HomeView {
             }
             frame.render_widget(Paragraph::new(slines), shelf_region);
         }
+
+        self.agent_icon_slots = icon_slots;
 
         // Render the search bar while typing AND while a committed search is
         // live, so the query you searched for stays pinned at the bottom of the
@@ -1639,6 +1670,49 @@ impl HomeView {
             if self.search_active && !self.has_overlay_above_search() {
                 set_prefixed_input_cursor_position(frame, search_area, "/", &self.search_query);
             }
+        }
+    }
+
+    fn build_agent_icon_slot(
+        &self,
+        item: &Item,
+        line: &Line<'_>,
+        region: Rect,
+        row_offset: usize,
+        is_selected: bool,
+        is_hovered: bool,
+    ) -> Option<crate::tui::agent_icons::AgentIconSlot> {
+        if !self.kitty_icons_enabled || self.view_mode != ViewMode::Structured {
+            return None;
+        }
+        let Item::Session { id, .. } = item else {
+            return None;
+        };
+        let inst = self.get_instance(id)?;
+        let icon_id = crate::tui::agent_icons::icon_id_for_tool(&inst.tool)?;
+        if line.spans.len() < 2 {
+            return None;
+        }
+        let prefix_cols = (line.spans[0].width() + line.spans[1].width()) as u16;
+        let x = region.x.saturating_add(prefix_cols);
+        let y = region.y.saturating_add(row_offset as u16);
+        let icon_cols = crate::tui::agent_icons::KITTY_ICON_COLS as u16;
+        if x.saturating_add(icon_cols) <= region.right() && y < region.bottom() {
+            let highlight = if is_selected {
+                2
+            } else if is_hovered {
+                1
+            } else {
+                0
+            };
+            Some(crate::tui::agent_icons::AgentIconSlot {
+                x,
+                y,
+                icon_id,
+                highlight,
+            })
+        } else {
+            None
         }
     }
 
@@ -2041,20 +2115,26 @@ impl HomeView {
         if let Item::Session { id, .. } = item {
             if self.view_mode == ViewMode::Structured {
                 if let Some(inst) = self.get_instance(id) {
-                    let agent_icon = agent_sidebar_badge(&inst.tool);
-                    if !agent_icon.is_empty() {
-                        let muted = inst.is_archived()
-                            || inst.is_trashed()
-                            || (in_attention && inst.is_snoozed());
-                        let tag_style = agent_badge_style(&inst.tool, muted, theme);
-                        line_spans.push(Span::styled(
-                            format!("{agent_icon} "),
-                            if is_selected {
-                                selected_row_style(tag_style, theme)
-                            } else {
-                                tag_style
-                            },
-                        ));
+                    if self.kitty_icons_enabled
+                        && crate::tui::agent_icons::icon_id_for_tool(&inst.tool).is_some()
+                    {
+                        line_spans.push(Span::raw("   "));
+                    } else {
+                        let agent_icon = agent_sidebar_badge(&inst.tool);
+                        if !agent_icon.is_empty() {
+                            let muted = inst.is_archived()
+                                || inst.is_trashed()
+                                || (in_attention && inst.is_snoozed());
+                            let tag_style = agent_badge_style(&inst.tool, muted, theme);
+                            line_spans.push(Span::styled(
+                                format!("{agent_icon} "),
+                                if is_selected {
+                                    selected_row_style(tag_style, theme)
+                                } else {
+                                    tag_style
+                                },
+                            ));
+                        }
                     }
                 }
             }

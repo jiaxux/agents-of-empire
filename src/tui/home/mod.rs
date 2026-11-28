@@ -801,6 +801,13 @@ pub struct HomeView {
     /// (`leader b`). Persisted to `app_state.home_sidebar_collapsed` so the
     /// choice survives restarts.
     pub(super) sidebar_collapsed: bool,
+    /// Whether the outer terminal supports Kitty Graphics Protocol brand logos
+    /// for sidebar rows. Disabled in tests and unsupported terminals so rows
+    /// fall back to 1-cell Unicode icons.
+    pub(super) kitty_icons_enabled: bool,
+    /// Per-frame Kitty icon slots populated during `render_list` and consumed
+    /// by `App::draw_frame` right after ratatui flushes.
+    pub(super) agent_icon_slots: Vec<crate::tui::agent_icons::AgentIconSlot>,
     /// `(session_id, cols, rows)` of the last NON-live preview resize we sent
     /// to the selected agent's pane, so the 250ms preview poll doesn't
     /// SIGWINCH-storm it every tick. Invalidated (set to None) on attach and on
@@ -2507,6 +2514,8 @@ impl HomeView {
                 .as_ref()
                 .and_then(|c| c.app_state.home_sidebar_collapsed)
                 .unwrap_or(false),
+            kitty_icons_enabled: false,
+            agent_icon_slots: Vec::new(),
             collapse_button_area: Rect::default(),
             expand_strip_area: Rect::default(),
             footer_buttons: Vec::new(),
@@ -5220,6 +5229,17 @@ impl HomeView {
     /// `has_dialog()` ORs `live_send.is_some()` on top, so it would also
     /// gate off the fast path it's supposed to enable — that's why the
     /// fast path needs this method instead.
+    pub(in crate::tui) fn set_kitty_icons_enabled(&mut self, enabled: bool) {
+        self.kitty_icons_enabled = enabled;
+        if !enabled {
+            self.agent_icon_slots.clear();
+        }
+    }
+
+    pub(in crate::tui) fn agent_icon_slots(&self) -> &[crate::tui::agent_icons::AgentIconSlot] {
+        &self.agent_icon_slots
+    }
+
     pub(in crate::tui) fn has_non_live_send_overlay(&self) -> bool {
         #[cfg(feature = "serve")]
         let serve_open = self.serve_view.is_some();
