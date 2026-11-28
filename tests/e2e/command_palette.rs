@@ -18,7 +18,7 @@ fn test_command_palette_opens_with_ctrl_k() {
     // visible regardless of how the dialog clamps in a 30-row test terminal.
     // Settings/Quit live further down the list and may scroll off-screen.
     h.assert_screen_contains("Actions");
-    h.assert_screen_contains("Rename");
+    h.assert_screen_contains("New session");
 }
 
 #[test]

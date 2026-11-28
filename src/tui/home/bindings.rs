@@ -551,24 +551,6 @@ pub static BINDINGS: &[Binding] = &[
             serve_only: false,
         }),
     },
-    // Buffer the selected session into the "Inactive" folder right below
-    // ongoing chats (`b` non-strict, `Shift+B` in strict).
-    Binding {
-        id: ActionId::ToggleBuffer,
-        non_strict: &[k('b')],
-        strict: &[k('B')],
-        context: Context::Always,
-        help: Some(HelpMeta {
-            section: HelpSection::Actions,
-            desc: "Buffer / move to Inactive (toggle)",
-        }),
-        palette: Some(PaletteMeta {
-            title: "Toggle buffer (Inactive folder)",
-            keywords: &["buffer", "inactive", "park", "hide", "pause"],
-            group: PaletteGroup::Actions,
-            serve_only: false,
-        }),
-    },
     // New session from a saved project. Relocated to the secondary `B` slot
     // (`Shift+B` non-strict, `Ctrl+B` in strict) to free bare `b` for buffer.
     Binding {
@@ -951,6 +933,25 @@ pub static BINDINGS: &[Binding] = &[
         palette: Some(PaletteMeta {
             title: "Toggle archive",
             keywords: &["park", "stash", "done", "zzz"],
+            group: PaletteGroup::Actions,
+            serve_only: false,
+        }),
+    },
+    // Buffer the selected session into the "Inactive" folder right below
+    // ongoing chats (`b` non-strict, `Shift+B` in strict). Placed after Rename
+    // so the top Actions slice in the command palette stays unchanged.
+    Binding {
+        id: ActionId::ToggleBuffer,
+        non_strict: &[k('b')],
+        strict: &[k('B')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Actions,
+            desc: "Buffer / move to Inactive (toggle)",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Toggle buffer (Inactive folder)",
+            keywords: &["buffer", "inactive", "park", "hide", "pause"],
             group: PaletteGroup::Actions,
             serve_only: false,
         }),

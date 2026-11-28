@@ -6132,8 +6132,11 @@ fn test_row_tag_none_hides_worktree_branch_suffix() {
     });
 
     let text = rendered_single_session_text(inst, crate::session::config::RowTagMode::None);
+    let without_agent_badge = text.replace("[claude]", "");
     assert!(
-        !text.contains("feature/foo") && !text.contains("[foo") && !text.contains('['),
+        !text.contains("feature/foo")
+            && !text.contains("[foo")
+            && !without_agent_badge.contains('['),
         "None mode should hide all worktree suffix metadata: {text:?}"
     );
 }
@@ -6174,8 +6177,11 @@ fn test_row_tag_none_hides_workspace_suffix() {
     });
 
     let text = rendered_single_session_text(inst, crate::session::config::RowTagMode::None);
+    let without_agent_badge = text.replace("[claude]", "");
     assert!(
-        !text.contains("feature/foo") && !text.contains("repos") && !text.contains('['),
+        !text.contains("feature/foo")
+            && !text.contains("repos")
+            && !without_agent_badge.contains('['),
         "None mode should hide all workspace suffix metadata: {text:?}"
     );
 }

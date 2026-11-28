@@ -1928,11 +1928,12 @@ fn take_injected_fresh_handshake_failure() -> bool {
             .unwrap_or(0);
         AtomicI64::new(n)
     });
-    remaining
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-            (n > 0).then_some(n - 1)
-        })
-        .is_ok()
+    // `try_update` needs Rust 1.99; keep `fetch_update` for the 1.85 MSRV and Nix toolchain.
+    #[allow(deprecated)]
+    let claimed = remaining.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+        (n > 0).then_some(n - 1)
+    });
+    claimed.is_ok()
 }
 
 /// Read the silent-orphan watchdog grace for the given source profile.

@@ -205,17 +205,20 @@ fn keyboard_confirmed_view_switch_fires_immediately() {
     // 1-indexed terminal position is derived from the captured screen so
     // grouping/header layout changes don't silently break the click.
     // The preview panel title also carries the session name, so anchor
-    // on sidebar rows only (they start with the box-drawing `│`).
+    // on sidebar rows only (they start with the box-drawing `│` or `┃`).
     let screen = h.capture_screen();
     let row_idx = screen
         .lines()
-        .position(|l| l.starts_with('│') && l.contains("switchme"))
+        .position(|l| (l.starts_with('│') || l.starts_with('┃')) && l.contains("switchme"))
         .expect("session row on screen") as u16
         + 1;
     h.send_mouse_click(2, 5, row_idx);
     h.wait_for("Switch to structured");
 
-    // Highlight the last menu item ("Switch to structured") and submit.
+    // Highlight "Switch to structured" (followed by "Agent dialogue" and
+    // "Open context" at the bottom of the session menu) and submit.
+    h.send_keys("Up");
+    h.send_keys("Up");
     h.send_keys("Up");
     h.send_keys("Enter");
     h.wait_for("Switch to structured view");

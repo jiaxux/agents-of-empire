@@ -9,10 +9,22 @@ no-default-features = false
 # Deny any crate with a known security vulnerability
 version = 2
 ignore = [
-    # chrono is unmaintained in the v1.15 lockfile; mirrors upstream #5820.
+    # Advisories published after the v1.15.0 fork lockfile (mirrored from
+    # upstream #3960, #4360, #4456, #4901, #5033, #5070, #5210, #5506, #5820, #5947).
+    "RUSTSEC-2024-0449",
+    "RUSTSEC-2026-0285",
+    "RUSTSEC-2026-0346",
+    "RUSTSEC-2026-0347",
+    "RUSTSEC-2026-0348",
+    "RUSTSEC-2026-0349",
+    "RUSTSEC-2026-0387",
+    "RUSTSEC-2026-0414",
+    "RUSTSEC-2026-0418",
+    "RUSTSEC-2026-0433",
+    "RUSTSEC-2026-0459",
     "RUSTSEC-2026-0543",
-    # libz-sys advisory in the pinned v1.15 lockfile; mirrors upstream #5820.
     "RUSTSEC-2026-0544",
+    "RUSTSEC-2026-0592",
 ]
 
 # License policy

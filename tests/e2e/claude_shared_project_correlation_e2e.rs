@@ -412,10 +412,24 @@ fn launch_session(h: &TuiTestHarness, instance_id: &str, title: &str) {
 /// Shared driver: launch two Claude sessions on the SAME project path, apply
 /// their roles, attach the native TUI as the poller host, and wait for each to
 /// correlate to its own shim UUID.
-fn run_shared_project_correlation(test_name: &str, spec_a: SessionSpec, spec_b: SessionSpec) {
+fn run_shared_project_correlation(
+    test_name: &str,
+    hooks_enabled: bool,
+    spec_a: SessionSpec,
+    spec_b: SessionSpec,
+) {
     require_tmux!();
 
     let mut h = TuiTestHarness::new_in_tmp(test_name);
+    if !hooks_enabled {
+        let cfg_path = app_dir_in(h.home_path()).join("config.toml");
+        let existing = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+        std::fs::write(
+            &cfg_path,
+            format!("{existing}\n[session]\nagent_status_hooks = false\n"),
+        )
+        .expect("append hookless session config to config.toml");
+    }
     let claude_home = h.home_path().join(".claude");
     h.set_env("CLAUDE_CONFIG_DIR", &claude_home.display().to_string());
     install_claude_shim(&mut h);
@@ -488,6 +502,7 @@ fn run_shared_project_correlation(test_name: &str, spec_a: SessionSpec, spec_b: 
 fn claude_shared_project_correlation_variant1_sidecar_authoritative() {
     run_shared_project_correlation(
         "claude_shared_v1",
+        true,
         SessionSpec {
             title: "shared-A",
             sidecar: true,
@@ -527,6 +542,7 @@ fn claude_shared_project_correlation_variant1_sidecar_authoritative() {
 fn claude_shared_project_correlation_variant2_filesystem_scan_exclusion() {
     run_shared_project_correlation(
         "claude_shared_v2",
+        false,
         SessionSpec {
             title: "shared-A",
             sidecar: false,
