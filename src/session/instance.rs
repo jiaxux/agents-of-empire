@@ -752,6 +752,14 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
 
+    /// Buffer marker: places the session in the collapsible "Inactive" folder
+    /// right below ongoing chats in the left sidebar without stopping its
+    /// tmux pane. Set only by explicit user command (`b`), and cleared
+    /// automatically when the chat resumes (user interaction or status
+    /// transitioning to Running/Waiting) or when toggled again with `b`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffered_at: Option<DateTime<Utc>>,
+
     /// Favorite marker; sibling of archive. When set AND the session is in
     /// a "needs help" status (Waiting, Error, Idle, Unknown), the session
     /// pre-empts all non-favorited peers in the same status tier, pinning it
@@ -1707,6 +1715,7 @@ impl Instance {
             last_accessed_at: None,
             idle_entered_at: None,
             archived_at: None,
+            buffered_at: None,
             favorited_at: None,
             snoozed_until: None,
             unread: false,
@@ -1850,6 +1859,7 @@ impl Instance {
     pub fn touch_last_accessed(&mut self) {
         self.last_accessed_at = Some(Utc::now());
         self.archived_at = None;
+        self.buffered_at = None;
         self.snoozed_until = None;
         self.idle_dormant_since = None;
     }
@@ -2264,6 +2274,9 @@ impl Instance {
         if pre.archived_at != post.archived_at {
             self.archived_at = post.archived_at;
         }
+        if pre.buffered_at != post.buffered_at {
+            self.buffered_at = post.buffered_at;
+        }
         if pre.favorited_at != post.favorited_at {
             self.favorited_at = post.favorited_at;
         }
@@ -2319,45 +2332,45 @@ impl Instance {
         // (TUI-side or peer-side) dethrones a concurrent archive.
         let touched = self.last_accessed_at > pre.last_accessed_at;
 
-        // archive(): archived=Some => favorited=None, snoozed=None, pinned=None
+        // archive(): archived=Some => favorited=None, snoozed=None, pinned=None, buffered=None
         if archived_changed && post.archived_at.is_some() {
             self.favorited_at = None;
             self.snoozed_until = None;
             self.pinned_at = None;
+            self.buffered_at = None;
         }
-        // favorite(): favorited=Some => archived=None, snoozed=None
+        // favorite(): favorited=Some => archived=None, snoozed=None, buffered=None
         if favorited_changed && post.favorited_at.is_some() {
             self.archived_at = None;
             self.snoozed_until = None;
+            self.buffered_at = None;
         }
         // snooze(): snoozed=Some => pinned=None (sink clears surface).
         if snoozed_changed && post.snoozed_until.is_some() {
             self.pinned_at = None;
         }
-        // pin(): pinned=Some => archived=None, snoozed=None (surface clears sinks).
+        // pin(): pinned=Some => archived=None, snoozed=None, buffered=None (surface clears sinks).
         if pinned_changed && post.pinned_at.is_some() {
             self.archived_at = None;
             self.snoozed_until = None;
+            self.buffered_at = None;
         }
-        // touch_last_accessed(): clears archived + snoozed + idle-dormant.
+        // touch_last_accessed(): clears archived + buffered + snoozed + idle-dormant.
         // Does NOT clear favorite or pin (both are explicit user-surfacing
         // signals, not sink states). Mirrors touch_last_accessed() so the
         // wake-from-dormancy invariant holds on the concurrent-writer merge
         // path too, not just direct touches (#1689).
         if touched {
             self.archived_at = None;
+            self.buffered_at = None;
             self.snoozed_until = None;
             self.idle_dormant_since = None;
         }
         // Final-state invariant: archive is the strongest dismiss and
-        // wins over snooze. The per-mutation rules above clear other
-        // flags on the change side, but the diff can also leave disk
-        // archived (pre-existing) AND snoozed (added by post); without
-        // this check the row would persist both and the web sidebar's
-        // tier comparator (which assumes exactly one active triage
-        // state) would render contradictory chips. See #1581.
+        // wins over snooze and buffer.
         if self.archived_at.is_some() {
             self.snoozed_until = None;
+            self.buffered_at = None;
         }
     }
 
@@ -2380,6 +2393,7 @@ impl Instance {
     /// single active triage state (see `sidebarSort.ts` in #1581).
     pub fn archive(&mut self) {
         self.archived_at = Some(Utc::now());
+        self.buffered_at = None;
         self.favorited_at = None;
         self.snoozed_until = None;
         self.pinned_at = None;
@@ -2392,6 +2406,21 @@ impl Instance {
 
     pub fn is_archived(&self) -> bool {
         self.archived_at.is_some()
+    }
+
+    /// Move the session into the sidebar's "Inactive" buffer folder without
+    /// killing its live tmux pane. Automatically cleared when the chat resumes
+    /// (user interaction or agent activity) or toggled back with `b`.
+    pub fn buffer(&mut self) {
+        self.buffered_at = Some(Utc::now());
+    }
+
+    pub fn unbuffer(&mut self) {
+        self.buffered_at = None;
+    }
+
+    pub fn is_buffered(&self) -> bool {
+        self.buffered_at.is_some()
     }
 
     /// Soft-delete the session into the trash bucket. Stops the live
@@ -2541,6 +2570,7 @@ impl Instance {
     pub fn favorite(&mut self) {
         self.favorited_at = Some(Utc::now());
         self.archived_at = None;
+        self.buffered_at = None;
         self.snoozed_until = None;
     }
 
@@ -2675,6 +2705,7 @@ impl Instance {
     pub fn pin(&mut self) {
         self.pinned_at = Some(Utc::now());
         self.archived_at = None;
+        self.buffered_at = None;
         self.snoozed_until = None;
     }
 

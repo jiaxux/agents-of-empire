@@ -3181,6 +3181,11 @@ impl HomeView {
                     tracing::error!("toggle_archive_at_cursor failed: {}", e);
                 }
             }
+            ActionId::ToggleBuffer => {
+                if let Err(e) = self.toggle_buffer_at_cursor() {
+                    tracing::error!("toggle_buffer_at_cursor failed: {}", e);
+                }
+            }
             ActionId::ToggleFavorite => {
                 if let Err(e) = self.toggle_favorite_at_cursor() {
                     tracing::error!("toggle_favorite_at_cursor failed: {}", e);
@@ -4169,6 +4174,7 @@ impl HomeView {
                     // intentionally disarms.
                     if crate::session::is_within_archived_section(path)
                         || crate::session::is_within_trash_section(path)
+                        || crate::session::is_within_inactive_section(path)
                     {
                         continue;
                     }
@@ -4595,6 +4601,7 @@ impl HomeView {
                     self.selected_session = None;
                     if crate::session::is_within_archived_section(&path)
                         || crate::session::is_within_trash_section(&path)
+                        || crate::session::is_within_inactive_section(&path)
                     {
                         // The synthetic Archived section (and any
                         // project sub-folder rendered under it in
@@ -4715,6 +4722,10 @@ impl HomeView {
         // nonexistent group.
         if crate::session::is_archived_section_path(path) {
             self.toggle_archived_section();
+            return;
+        }
+        if crate::session::is_inactive_section_path(path) {
+            self.toggle_inactive_section();
             return;
         }
         if crate::session::is_trash_section_path(path) {
@@ -5227,6 +5238,10 @@ impl HomeView {
                 if crate::session::is_archived_section_path(path) {
                     self.context_menu =
                         Some(ContextMenuDialog::for_archived_section(anchor, *collapsed));
+                    return true;
+                }
+                if crate::session::is_inactive_section_path(path) {
+                    self.toggle_inactive_section();
                     return true;
                 }
             }

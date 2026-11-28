@@ -23,7 +23,8 @@ use ratatui::prelude::Rect;
 use tui_input::Input;
 
 use crate::session::{
-    append_archived_section, append_archived_section_by_project, append_trash_section,
+    append_archived_section, append_archived_section_by_project, append_inactive_section,
+    append_trash_section,
     config::{load_config, update_app_state, update_config, GroupByMode, SortOrder},
     flatten_sessions_by_attention, flatten_tree, flatten_tree_all_profiles, resolve_config_or_warn,
     DefaultTerminalMode, EnsureReadyOutcome, Group, GroupTree, Instance, Item, Status, Storage,
@@ -533,6 +534,7 @@ pub(super) const ICON_PINNED: &str = "◆";
 /// hit-testing on terminals that render them double-width or as tofu).
 pub(super) const ICON_TRASH_SECTION: &str = "⊘";
 pub(super) const ICON_ARCHIVED_SECTION: &str = "▤";
+pub(super) const ICON_INACTIVE_SECTION: &str = "◫";
 
 /// Hook progress for a session being created in the background
 pub(super) struct CreatingHookProgress {
@@ -767,6 +769,10 @@ pub struct HomeView {
     /// at, so the reconcile can tell when the displayed pane changed and
     /// retarget. `None` before the first preview or when nothing is selected.
     pub(super) preview_capture_target: Option<String>,
+    /// Last observed `LiveCaptureWorker::cycles` value and when it was seen,
+    /// so the render thread can tell a running worker with nothing new (an
+    /// idle pane or a held synchronized update) from a wedged worker (#3559).
+    pub(super) preview_worker_pulse: Option<(u64, std::time::Instant)>,
     /// Notified by the capture worker thread when it has fresh, changed
     /// content. The event loop selects on this to repaint without
     /// busy-polling; an idle pane (no new content) never wakes it.
@@ -1269,6 +1275,11 @@ pub struct HomeView {
     /// bottom until the user opts to see them. Persisted to
     /// `app_state.archived_section_collapsed`.
     pub(super) archived_section_collapsed: bool,
+
+    /// Collapsed state of the synthetic "Inactive" buffer folder right below
+    /// ongoing chats. Defaults to `false` (expanded) and persists to
+    /// `app_state.inactive_section_collapsed`.
+    pub(super) inactive_section_collapsed: bool,
 
     /// Collapsed state of the synthetic "Trash" sidebar section. Defaults to
     /// `true` (collapsed): trash is a recovery shelf, kept out of the way
@@ -2487,6 +2498,7 @@ impl HomeView {
             live_send_worker: None,
             preview_capture_worker: None,
             preview_capture_target: None,
+            preview_worker_pulse: None,
             preview_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
             live_send_last_resize: None,
             live_send_pending_leader: false,
@@ -2656,6 +2668,10 @@ impl HomeView {
                 .as_ref()
                 .and_then(|c| c.app_state.archived_section_collapsed)
                 .unwrap_or(true),
+            inactive_section_collapsed: user_config
+                .as_ref()
+                .and_then(|c| c.app_state.inactive_section_collapsed)
+                .unwrap_or(false),
             trashed_section_collapsed: true,
             recovery_rx: None,
             recovery_lock: None,
@@ -3567,14 +3583,27 @@ impl HomeView {
                         && new_status == Status::Idle
                         && !is_live_target
                         && !already_unread;
+                    // Auto-unbuffer when a buffered chat resumes (transitions
+                    // into Running or Waiting) so it returns to the main list.
+                    let should_unbuffer = matches!(new_status, Status::Running | Status::Waiting)
+                        && self
+                            .get_instance(&update.id)
+                            .is_some_and(|i| i.is_buffered());
 
-                    // One flock for both the status/timestamp patch and the
-                    // unread mark, matching the daemon's per-tick batching
-                    // shape (server/mod.rs's status_poll_loop) instead of
-                    // two separate Storage::update calls on the same row.
-                    self.persist_passive_status_transition(&update.id, should_mark_unread);
+                    // One flock for the status/timestamp patch, unread mark,
+                    // and buffer wake, matching the daemon's per-tick batching.
+                    self.persist_passive_status_transition(
+                        &update.id,
+                        should_mark_unread,
+                        should_unbuffer,
+                    );
                     if should_mark_unread {
                         self.mutate_instance(&update.id, |inst| inst.mark_unread());
+                    }
+                    if should_unbuffer {
+                        self.mutate_instance(&update.id, |inst| inst.unbuffer());
+                        self.rebuild_flat_items();
+                        self.reseat_cursor_after_rebuild();
                     }
 
                     if let Some(inst) = self.get_instance(&update.id).cloned() {
@@ -5509,6 +5538,19 @@ impl HomeView {
         self.update_selected();
     }
 
+    pub fn toggle_inactive_section(&mut self) {
+        self.inactive_section_collapsed = !self.inactive_section_collapsed;
+        let collapsed = self.inactive_section_collapsed;
+        Self::persist_app_state("inactive section", |s| {
+            s.inactive_section_collapsed = Some(collapsed)
+        });
+        self.rebuild_flat_items();
+        if !self.flat_items.is_empty() && self.cursor >= self.flat_items.len() {
+            self.cursor = self.flat_items.len() - 1;
+        }
+        self.update_selected();
+    }
+
     pub fn toggle_archived_section(&mut self) {
         self.archived_section_collapsed = !self.archived_section_collapsed;
         let collapsed = self.archived_section_collapsed;
@@ -5697,6 +5739,7 @@ impl HomeView {
         if self.sort_order == SortOrder::Attention {
             let filtered: Vec<Instance> = self.cloned_instances_in_active_view();
             let mut items = flatten_sessions_by_attention(&filtered);
+            append_inactive_section(&mut items, &filtered, self.inactive_section_collapsed);
             append_archived_section(&mut items, &filtered, self.archived_section_collapsed);
             append_trash_section(&mut items, &filtered, self.trashed_section_collapsed);
             return items;
@@ -5717,6 +5760,9 @@ impl HomeView {
             flatten_tree_all_profiles(&archive_pool, &self.group_trees, self.sort_order)
         };
 
+        // Inactive buffer folder sits right below ongoing chats, above the
+        // bottom-pinned Archived / Trash shelf.
+        append_inactive_section(&mut items, &archive_pool, self.inactive_section_collapsed);
         // Pin the synthetic Archived section to the bottom regardless of
         // sort order. Archived rows were filtered out of the natural flow
         // inside `flatten_tree` / `flatten_tree_all_profiles`.
@@ -5749,7 +5795,7 @@ impl HomeView {
         // automatic"), leaving the user no way to clear it.
         let tree_seed: Vec<Instance> = grouped
             .iter()
-            .filter(|i| !i.is_archived() && !i.is_trashed())
+            .filter(|i| !i.is_archived() && !i.is_trashed() && !i.is_buffered())
             .cloned()
             .collect();
 
@@ -5790,6 +5836,7 @@ impl HomeView {
             }
         }
         let mut items = flatten_tree(&tree, &grouped, self.sort_order);
+        append_inactive_section(&mut items, &grouped, self.inactive_section_collapsed);
         append_archived_section_by_project(
             &mut items,
             &grouped,
@@ -5874,7 +5921,7 @@ impl HomeView {
         // header in the main flow.
         let tree_seed: Vec<Instance> = grouped
             .iter()
-            .filter(|i| !i.is_archived() && !i.is_trashed())
+            .filter(|i| !i.is_archived() && !i.is_trashed() && !i.is_buffered())
             .cloned()
             .collect();
 
@@ -5898,6 +5945,7 @@ impl HomeView {
             }
         }
         let mut items = flatten_tree(&tree, &grouped, self.sort_order);
+        append_inactive_section(&mut items, &grouped, self.inactive_section_collapsed);
         append_archived_section_by_project(
             &mut items,
             &grouped,
@@ -8572,7 +8620,7 @@ impl HomeView {
         let was_sunk = self
             .instances
             .get(id)
-            .map(|i| i.is_archived() || i.snoozed_until.is_some())
+            .map(|i| i.is_archived() || i.snoozed_until.is_some() || i.is_buffered())
             .unwrap_or(false);
         if was_sunk {
             if let Err(e) = self.apply_user_action(id, |inst| inst.touch_last_accessed()) {
@@ -8584,6 +8632,7 @@ impl HomeView {
                 );
             }
             self.rebuild_flat_items();
+            self.reseat_cursor_after_rebuild();
         } else {
             self.mutate_instance(id, |inst| inst.touch_last_accessed());
         }
@@ -9637,31 +9686,20 @@ impl HomeView {
     /// `Storage::update` call instead of a second flock round-trip on the
     /// same row in the same tick, matching the daemon's per-tick batching
     /// shape in `status_poll_loop`.
-    pub(super) fn persist_passive_status_transition(&self, id: &str, mark_unread: bool) {
+    pub(super) fn persist_passive_status_transition(
+        &self,
+        id: &str,
+        mark_unread: bool,
+        clear_buffer: bool,
+    ) {
         let Some(inst) = self.instances.get(id) else {
             return;
         };
         let Some(storage) = self.storages.get(&inst.source_profile) else {
             return;
         };
-        // Structured rows are not durable: their status is a daemon-side
-        // overlay rebuilt from live worker state (`apply_acp_overlay_inplace`)
-        // and re-derived at daemon boot by `seed_acp_statuses`. The daemon's
-        // own passive writer gates the status patch on exactly this predicate
-        // (`decide_passive_transition` returns `patch: None` for
-        // `is_structured()`, `server/mod.rs`). Persisting it here would strand
-        // a row at `Running` or `Error` with no producer left to heal it once
-        // the daemon is gone, since the tmux poller now bails on structured
-        // rows (`status_poller.rs`); this is the #3201 regression from #3170.
-        // The unread mark is deliberately NOT gated: the daemon marks a
-        // structured row unread on a Running -> Idle turn (its `mark_unread` is
-        // not gated on `is_structured`), so mirroring it here keeps the two
-        // producers symmetric.
         let structured = inst.is_structured();
-        // Pure optimization, not a correctness gate: a structured row with
-        // nothing to mark unread has no patch and no unread write, so skip the
-        // empty-write flock round-trip entirely.
-        if structured && !mark_unread {
+        if structured && !mark_unread && !clear_buffer {
             return;
         }
         let patch = (!structured).then(|| crate::session::PassiveStatusPatch::from_instance(inst));
@@ -9672,6 +9710,9 @@ impl HomeView {
                 }
                 if mark_unread {
                     disk.mark_unread();
+                }
+                if clear_buffer {
+                    disk.unbuffer();
                 }
             }
             Ok(())

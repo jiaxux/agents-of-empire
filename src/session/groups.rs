@@ -8,6 +8,12 @@ use std::collections::HashMap;
 use super::config::SortOrder;
 use super::Instance;
 
+/// Sentinel path used by the synthetic "Inactive" buffer folder. Lives right
+/// below ongoing chats in the main list (above the bottom Archived/Trash shelf)
+/// and holds sessions explicitly buffered by the user (`b`) until they resume.
+pub const INACTIVE_SECTION_PATH: &str = "__aoe_inactive_section__";
+pub const INACTIVE_SECTION_NAME: &str = "Inactive";
+
 /// Sentinel path used by the synthetic "Archived" sidebar section. Not a
 /// real GroupTree entry; lives only in the flattened `Item` list to give
 /// archived sessions a stable bottom-of-sidebar home across every sort
@@ -39,6 +45,11 @@ pub const SCRATCH_GROUP_PATH: &str = "__aoe_scratch_group__";
 pub const SCRATCH_GROUP_NAME: &str = "Scratch";
 
 #[inline]
+pub fn is_inactive_section_path(path: &str) -> bool {
+    path == INACTIVE_SECTION_PATH
+}
+
+#[inline]
 pub fn is_archived_section_path(path: &str) -> bool {
     path == ARCHIVED_SECTION_PATH
 }
@@ -52,6 +63,12 @@ pub fn is_trash_section_path(path: &str) -> bool {
 #[inline]
 fn is_scratch_group_path(path: &str) -> bool {
     path == SCRATCH_GROUP_PATH
+}
+
+/// True for the Inactive buffer section sentinel or anything nested under it.
+#[inline]
+pub fn is_within_inactive_section(path: &str) -> bool {
+    path == INACTIVE_SECTION_PATH || path.starts_with(&format!("{}/", INACTIVE_SECTION_PATH))
 }
 
 /// True for the Trash section sentinel or anything nested under it. Mirrors
@@ -82,12 +99,15 @@ pub fn archived_project_sub_path(project_name: &str) -> String {
 }
 
 /// True for any project-mode header that is synthetic rather than a real,
-/// pinnable repo: the Archived/Trash shelves (and anything nested under them)
-/// and the scratch bucket. Keyed on the path (identity), never the display
-/// label, so a real repo named `scratch` is not caught.
+/// pinnable repo: the Inactive/Archived/Trash sections (and anything nested
+/// under them) and the scratch bucket. Keyed on the path (identity), never
+/// the display label, so a real repo named `scratch` is not caught.
 #[inline]
 pub fn is_synthetic_project_header(path: &str) -> bool {
-    is_within_archived_section(path) || is_within_trash_section(path) || is_scratch_group_path(path)
+    is_within_inactive_section(path)
+        || is_within_archived_section(path)
+        || is_within_trash_section(path)
+        || is_scratch_group_path(path)
 }
 
 /// Map a project-mode group identity key to its human display label, for the
@@ -527,7 +547,8 @@ fn sort_groups_inner<T, N, P, A>(
     }
 }
 
-/// Sessions (direct and nested) that belong to `path` and are not archived.
+/// Sessions (direct and nested) that belong to `path` and are active in the
+/// main list (not archived, trashed, or buffered in Inactive).
 fn group_members<'a>(
     path: &'a str,
     instances: &'a [Instance],
@@ -537,11 +558,12 @@ fn group_members<'a>(
         (i.group_path == path || i.group_path.starts_with(&prefix))
             && !i.is_archived()
             && !i.is_trashed()
+            && !i.is_buffered()
     })
 }
 
 /// True for a favorited session that is actively pinnable: not archived, not
-/// trashed, and not snoozed.
+/// trashed, not buffered, and not snoozed.
 ///
 /// `favorite()` and `archive()` are mutually exclusive today, so a favorited
 /// row is normally never archived. The archive/trash guards defend the direct
@@ -552,7 +574,11 @@ fn group_members<'a>(
 /// and snooze outranks the pin, the Attention sort encodes the same precedence
 /// by sinking snoozed rows to tier 99 before favorite is ever consulted.
 pub(crate) fn is_live_favorite(inst: &Instance) -> bool {
-    !inst.is_archived() && !inst.is_trashed() && !inst.is_snoozed() && inst.is_favorited()
+    !inst.is_archived()
+        && !inst.is_trashed()
+        && !inst.is_buffered()
+        && !inst.is_snoozed()
+        && inst.is_favorited()
 }
 
 /// True when the group at `path` (including nested sub-groups) has at least
@@ -862,7 +888,9 @@ pub fn flatten_tree_all_profiles(
     // `append_archived_section`.
     let mut ungrouped: Vec<&Instance> = instances
         .iter()
-        .filter(|i| i.group_path.is_empty() && !i.is_archived() && !i.is_trashed())
+        .filter(|i| {
+            i.group_path.is_empty() && !i.is_archived() && !i.is_trashed() && !i.is_buffered()
+        })
         .collect();
 
     sort_sessions(&mut ungrouped, sort_order);
@@ -945,7 +973,7 @@ pub fn flatten_sessions_by_attention(instances: &[Instance]) -> Vec<Item> {
     // lifecycle terminals.
     let mut refs: Vec<&Instance> = instances
         .iter()
-        .filter(|i| !i.is_archived() && !i.is_trashed())
+        .filter(|i| !i.is_archived() && !i.is_trashed() && !i.is_buffered())
         .collect();
     refs.sort_by_key(|i| attention_session_key(i));
     refs.into_iter()
@@ -968,7 +996,9 @@ pub fn flatten_tree(
     // `append_archived_section`.
     let mut ungrouped: Vec<&Instance> = instances
         .iter()
-        .filter(|i| i.group_path.is_empty() && !i.is_archived() && !i.is_trashed())
+        .filter(|i| {
+            i.group_path.is_empty() && !i.is_archived() && !i.is_trashed() && !i.is_buffered()
+        })
         .collect();
 
     sort_sessions(&mut ungrouped, sort_order);
@@ -1028,7 +1058,9 @@ fn flatten_group(
     // section appended by the caller.
     let mut group_sessions: Vec<&Instance> = instances
         .iter()
-        .filter(|i| i.group_path == group.path && !i.is_archived() && !i.is_trashed())
+        .filter(|i| {
+            i.group_path == group.path && !i.is_archived() && !i.is_trashed() && !i.is_buffered()
+        })
         .collect();
 
     sort_sessions(&mut group_sessions, sort_order);
@@ -1061,6 +1093,42 @@ fn flatten_group(
 /// predicate (excluding archived and trashed sessions).
 fn count_sessions_in_group(path: &str, instances: &[Instance]) -> usize {
     group_members(path, instances).count()
+}
+
+/// Append the synthetic "Inactive" buffer folder to `items`, right below
+/// ongoing chats in the main list (above the bottom Archived/Trash shelf).
+/// Contains sessions explicitly buffered by the user (`is_buffered()`),
+/// ordered most-recently-buffered first. No-op when empty.
+pub fn append_inactive_section(items: &mut Vec<Item>, instances: &[Instance], collapsed: bool) {
+    let mut buffered: Vec<&Instance> = instances
+        .iter()
+        .filter(|i| i.is_buffered() && !i.is_archived() && !i.is_trashed())
+        .collect();
+    if buffered.is_empty() {
+        return;
+    }
+    buffered.sort_by_key(|i| Reverse(i.buffered_at));
+
+    items.push(Item::Group {
+        path: INACTIVE_SECTION_PATH.to_string(),
+        name: INACTIVE_SECTION_NAME.to_string(),
+        depth: 0,
+        collapsed,
+        session_count: buffered.len(),
+        profile: None,
+        archived_at: None,
+    });
+
+    if collapsed {
+        return;
+    }
+
+    for inst in buffered {
+        items.push(Item::Session {
+            id: inst.id.clone(),
+            depth: 1,
+        });
+    }
 }
 
 /// Append the synthetic "Archived" section to `items`, pinned to the

@@ -717,6 +717,14 @@ const LIVE_CAPTURE_INTERVAL_IDLE_MS: u64 = 250;
 /// one cheap failed attempt per interval rather than one per 25ms tick.
 const VT_REARM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How long the VT grid stands as the sole source of truth, and how long the
+/// pane must have been quiet, before the worker re-seeds it from
+/// `capture-pane` (#3612). Bounds any grid divergence at one quiet-time seed
+/// per interval off the render thread without interrupting active streaming or
+/// typing.
+#[cfg(unix)]
+const VT_RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Cloneable handle that nudges a [`LiveCaptureWorker`] out of its
 /// inter-capture wait. Handed to [`LiveSendWorker`] so a dispatched
 /// keystroke batch triggers an immediate capture of the typed echo rather
@@ -802,10 +810,16 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// down an armed channel (disabling its `pipe-pane`) and falls back to
     /// the capture path in place, no restart needed.
     vt_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the last cycle sampled a live VT grid rather than forking
+    /// `capture-pane`; see [`Self::vt_active`].
+    vt_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Whether the raw OSC 52 observer may run when terminal rendering uses
     /// capture-pane. Mirrors the Clipboard Pass-through setting, so disabled
     /// mode does not keep a second pipe-pane connection open.
     clipboard_capture_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Cycle counter, bumped at the top of every worker iteration so the
+    /// render thread can tell a healthy idle worker from a wedged one (#3559).
+    cycles: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Drop for LiveCaptureWorker {
@@ -1007,10 +1021,14 @@ impl LiveCaptureWorker {
         // `[tmux] vt_live` value right after spawn (and on every config
         // refresh), so the worker itself never touches the config file.
         let vt_enabled = Arc::new(AtomicBool::new(true));
+        let vt_active = Arc::new(AtomicBool::new(false));
+        let vt_active_cell = vt_active.clone();
         // Start disabled until the render reconcile publishes the Clipboard
         // Pass-through setting, avoiding an observer before configuration is
         // available for a newly created worker.
         let clipboard_capture_enabled = Arc::new(AtomicBool::new(false));
+        let cycles = Arc::new(AtomicU64::new(0));
+        let cycles_cell = cycles.clone();
         let lines_cell = capture_lines.clone();
         let target_cell = target.clone();
         let slot = latest.clone();
@@ -1063,6 +1081,8 @@ impl LiveCaptureWorker {
             #[cfg(unix)]
             let mut last_vt_arm: Option<std::time::Instant> = None;
             #[cfg(unix)]
+            let mut next_vt_resync: Option<std::time::Instant> = None;
+            #[cfg(unix)]
             let mut last_osc52_arm: Option<std::time::Instant> = None;
             // Panes in the target window, refreshed on the lazy
             // `PANE_COUNT_PROBE_MS` cadence. The seed only covers the window
@@ -1081,6 +1101,7 @@ impl LiveCaptureWorker {
                 crate::tmux::composite::WindowLayout,
             )> = None;
             while !stop_flag.load(Ordering::Relaxed) {
+                cycles_cell.fetch_add(1, Ordering::Relaxed);
                 let lines = lines_cell.load(Ordering::Relaxed);
                 // Read the target without holding the lock across the fork:
                 // `set_target` must never wait on a `capture-pane`.
@@ -1112,6 +1133,7 @@ impl LiveCaptureWorker {
                     {
                         vt_source = None;
                         last_vt_arm = None;
+                        next_vt_resync = None;
                         osc52_source = None;
                         osc52_seen = 0;
                         last_osc52_arm = None;
@@ -1224,6 +1246,7 @@ impl LiveCaptureWorker {
                             // the remainder of a poll interval.
                             if let Some(v) = vt_source.as_ref() {
                                 v.set_change_wakeup(nudge_thread.clone());
+                                next_vt_resync = last_vt_arm.map(|t| t + VT_RESYNC_INTERVAL);
                             }
                         }
                         // A channel whose forwarder has disconnected stops
@@ -1238,6 +1261,18 @@ impl LiveCaptureWorker {
                         match vt_source.as_ref() {
                             Some(v) => {
                                 let synchronized = v.synchronized_update_active();
+                                if !synchronized {
+                                    let now = std::time::Instant::now();
+                                    let quiet = last_published_at
+                                        .is_none_or(|t| t.elapsed() >= VT_RESYNC_INTERVAL);
+                                    if quiet && next_vt_resync.is_none_or(|at| at <= now) {
+                                        next_vt_resync = Some(if v.resync_from_pane() {
+                                            now + VT_RESYNC_INTERVAL
+                                        } else {
+                                            now + VT_REARM_INTERVAL
+                                        });
+                                    }
+                                }
                                 // Keep clipboard data in its single-slot queue
                                 // while a synchronized frame is incomplete;
                                 // the closing marker wakes this worker and the
@@ -1414,6 +1449,7 @@ impl LiveCaptureWorker {
                 let vt_active = vt_source.as_ref().is_some_and(|v| v.is_alive());
                 #[cfg(not(unix))]
                 let vt_active = false;
+                vt_active_cell.store(vt_active, Ordering::Relaxed);
                 let ms = if vt_active {
                     LIVE_CAPTURE_INTERVAL_FAST_MS
                 } else {
@@ -1443,7 +1479,9 @@ impl LiveCaptureWorker {
             cursor,
             clipboard,
             vt_enabled,
+            vt_active,
             clipboard_capture_enabled,
+            cycles,
         }
     }
 
@@ -1573,6 +1611,18 @@ impl LiveCaptureWorker {
     /// render loop then keeps the current preview).
     pub(in crate::tui) fn take_latest(&self) -> Option<String> {
         self.latest.lock().ok().and_then(|mut guard| guard.take())
+    }
+
+    /// Snapshot of the worker's cycle counter so the render thread can tell a
+    /// healthy idle worker from a wedged one (#3559).
+    pub(in crate::tui) fn cycles(&self) -> u64 {
+        self.cycles.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the worker is currently sampling a live VT channel rather than
+    /// falling back to `capture-pane` (#3612).
+    pub(in crate::tui) fn vt_active(&self) -> bool {
+        self.vt_active.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The newest cursor for the worker's CURRENT target pane, or `None`

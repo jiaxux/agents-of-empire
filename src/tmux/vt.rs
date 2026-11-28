@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
@@ -568,18 +569,81 @@ fn seed_parser(
     target: &str,
     parser: &Mutex<vt100::Parser>,
     app_cursor: &AtomicBool,
+    grid_gen: &AtomicU64,
+    seed_epoch: &AtomicU64,
     cols: u16,
     rows: u16,
-) {
-    let Some((body, state)) = capture_seed_snapshot(target) else {
-        return;
+) -> bool {
+    let Some(stream) = capture_seed_stream(target, rows) else {
+        return false;
     };
-    let stream = assemble_seed_stream(&body, &state, rows);
-    if let Ok(mut p) = parser.lock() {
-        *p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
-        p.process(&stream);
-        app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
+    swap_seeded_parser(
+        parser, app_cursor, grid_gen, seed_epoch, None, None, &stream, cols, rows,
+    )
+}
+
+/// Capture the pane and weave its modes and cursor into one replayable byte
+/// stream, or `None` when the pane could not be captured. Split from the swap
+/// so a caller can bracket the (forking, multi-millisecond) capture with the
+/// generation check `swap_seeded_parser` needs.
+fn capture_seed_stream(target: &str, rows: u16) -> Option<Vec<u8>> {
+    let (body, state) = capture_seed_snapshot(target)?;
+    Some(assemble_seed_stream(&body, &state, rows))
+}
+
+/// Check whether the unix socket backing `pipe-pane` currently has unread pane
+/// output buffered in the kernel receive queue (`FIONREAD > 0`). Uses a
+/// non-blocking ioctl on a cloned descriptor so `write_input` is never blocked
+/// across a capture. Returns `false` if the query is unavailable.
+fn stream_has_unread_bytes(stream: &UnixStream) -> bool {
+    let mut avail: libc::c_int = 0;
+    // SAFETY: `FIONREAD` takes a pointer to a `c_int` and does not retain it.
+    let rc = unsafe { libc::ioctl(stream.as_raw_fd(), libc::FIONREAD, &mut avail) };
+    rc == 0 && avail > 0
+}
+
+/// Replace `parser` with a fresh grid built from `stream`, unless the reader
+/// applied a chunk since generation `since` or unread bytes are already sitting
+/// in the pipe socket waiting to be replayed.
+///
+/// The guard is the ordering boundary between the snapshot and `pipe-pane`
+/// consumption (#3617, #3759). `capture_seed_stream` forks tmux, so `run_reader`
+/// can take the parser lock first and apply a chunk that the snapshot (taken
+/// before it) does not contain, or unread bytes in the socket may replay onto
+/// the freshly seeded cursor and shift subsequent relative moves. Because
+/// `run_reader` bumps `grid_gen` while still holding this lock, a generation
+/// that still reads `since` with an empty socket receive queue proves no live
+/// output is racing the swap.
+///
+/// `since` of `None` swaps unconditionally, for callers whose current grid is
+/// stale by definition (the initial seed, and the post-resize reflow).
+#[allow(clippy::too_many_arguments)]
+fn swap_seeded_parser(
+    parser: &Mutex<vt100::Parser>,
+    app_cursor: &AtomicBool,
+    grid_gen: &AtomicU64,
+    seed_epoch: &AtomicU64,
+    since: Option<u64>,
+    pipe_probe: Option<&UnixStream>,
+    stream: &[u8],
+    cols: u16,
+    rows: u16,
+) -> bool {
+    let Ok(mut p) = parser.lock() else {
+        return false;
+    };
+    if since.is_some_and(|g| g != grid_gen.load(Ordering::Relaxed)) {
+        return false;
     }
+    if since.is_some() && pipe_probe.is_some_and(stream_has_unread_bytes) {
+        return false;
+    }
+    *p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+    p.process(stream);
+    app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
+    seed_epoch.fetch_add(1, Ordering::Relaxed);
+    grid_gen.fetch_add(1, Ordering::Relaxed);
+    true
 }
 
 /// How many times [`capture_seed_snapshot`] re-runs the probe/capture/probe
@@ -728,6 +792,23 @@ fn split_seed_capture(raw: &[u8]) -> (&[u8], &str) {
 /// the parser's cursor lands after the last replayed glyph, bottom-right for a
 /// full-screen app, until the first live chunk carries the app's own escapes
 /// (issue #2902).
+/// Map tmux's 0-based visible `cursor_y` onto a grid of `grid_rows` rows when
+/// the capture was taken at `pane_height` (#3831).
+///
+/// When heights agree (or `pane_height` is unknown), this is simply `cursor_y`
+/// clamped to the grid. When a reseed races a resize and the capture carries a
+/// different height than `grid_rows`, surplus rows scrolled off the top of the
+/// shorter grid, so anchoring from the bottom keeps the cursor on the same
+/// logical row the capture actually filled.
+fn seeded_cursor_row(cursor_y: u16, pane_height: u16, grid_rows: u16) -> u16 {
+    let max_row = grid_rows.saturating_sub(1);
+    if pane_height == 0 || pane_height == grid_rows {
+        return cursor_y.min(max_row);
+    }
+    let from_bottom = pane_height.saturating_sub(1).saturating_sub(cursor_y);
+    max_row.saturating_sub(from_bottom)
+}
+
 fn assemble_seed_stream(body: &[u8], state: &PaneSeedState, rows: u16) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(body.len() + 32);
     if state.alt {
@@ -752,10 +833,10 @@ fn assemble_seed_stream(body: &[u8], state: &PaneSeedState, rows: u16) -> Vec<u8
         out.extend_from_slice(b"\x1b[?1h");
     }
     out.extend_from_slice(&lf_to_crlf(strip_trailing_row_terminator(body)));
-    // 1-based CUP in visible-screen coordinates, clamped to the grid so a stale
-    // query (the pane moved between the state read and this seed) can't push the
-    // cursor off-screen; the first live chunk re-syncs it either way.
-    let cy = state.cursor_y.min(rows.saturating_sub(1)) + 1;
+    // 1-based CUP in visible-screen coordinates, mapped onto the grid height
+    // so a capture that raced a resize still places the cursor on the row the
+    // capture actually filled.
+    let cy = seeded_cursor_row(state.cursor_y, state.pane_height, rows) + 1;
     let cx = state.cursor_x + 1;
     out.extend_from_slice(format!("\x1b[{cy};{cx}H").as_bytes());
     out.extend_from_slice(if state.cursor_visible {
@@ -1108,6 +1189,355 @@ struct ReaderCtx {
     /// from `chunk_seq`: re-seeds bump this too, and the debounce's
     /// first-chunk special case must not see seed bumps.
     grid_gen: Arc<AtomicU64>,
+    /// Bumped under `parser.lock()` whenever a seed replaces the parser, so
+    /// `run_reader` resets its streaming sequence normalizer on the next chunk.
+    seed_epoch: Arc<AtomicU64>,
+}
+
+/// Compute tmux's target 0-based column for `CSI Ps Z` (CBT: Cursor Backward
+/// Tabulation) from 0-based `col` on a `cols`-wide grid.
+///
+/// Matches tmux's `screen_write_backtab` (verified empirically against tmux
+/// 3.x): a pending-wrap column (`col == cols`) clamps to `cols - 1` before
+/// stepping back to the preceding 8-column tab stop, and each additional count
+/// steps back another 8 columns, saturating at column 0.
+fn cbt_target_col(col: u16, cols: u16, count: u16) -> u16 {
+    let clamped = col.min(cols.saturating_sub(1));
+    if clamped == 0 {
+        return 0;
+    }
+    let steps = count.max(1);
+    let first_stop = ((clamped - 1) / 8) * 8;
+    first_stop.saturating_sub(steps.saturating_sub(1).saturating_mul(8))
+}
+
+/// Parse up to two decimal `;`-separated CSI parameters (defaulting empty or
+/// `0` entries to `1`). Returns `(p1, p2, is_empty)`.
+fn parse_csi_params(params: &[u8]) -> (u16, u16, bool) {
+    if params.is_empty() {
+        return (1, 1, true);
+    }
+    let mut parts = params.split(|&b| b == b';');
+    let parse_one = |slice: Option<&[u8]>| -> u16 {
+        let Some(s) = slice else { return 1 };
+        if s.is_empty() {
+            return 1;
+        }
+        let mut val: u16 = 0;
+        for &b in s {
+            val = val.saturating_mul(10).saturating_add(u16::from(b - b'0'));
+        }
+        if val == 0 {
+            1
+        } else {
+            val
+        }
+    };
+    let p1 = parse_one(parts.next());
+    let p2 = parse_one(parts.next());
+    (p1, p2, false)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum NormState {
+    #[default]
+    Normal,
+    Esc,
+    Csi,
+    CsiPassthrough,
+    StringPayload,
+    StringEsc,
+}
+
+/// Maximum buffered length of a partial escape sequence split across reads
+/// before falling back to verbatim pass-through.
+const NORM_MAX_PENDING: usize = 64;
+
+/// Streaming adapter sitting in front of `vt100::Parser::process`.
+///
+/// `vt100` omits several cursor and edit sequences that tmux executes and
+/// terminfo-driven TUIs emit, most notably `CSI Ps Z` (CBT, cursor backward
+/// tabulation, which Antigravity CLI emits mid-typing whenever moving left
+/// across 8-column tab stops is shorter than `CSI Ps D`), `CSI Ps b` (REP),
+/// `CSI Ps \`` (HPA), `CSI Ps ; Ps f` (HVP), `CSI s` / `CSI u` (SCOSC/SCORC),
+/// `ESC D` (IND), and `ESC E` (NEL). Dropping a single `CSI Ps Z` in an app
+/// that uses relative cursor positioning permanently shifts every subsequent
+/// typed character to the wrong column.
+///
+/// Fast path: chunks containing none of these sequences pass straight through
+/// to `vt100::Parser::process` as a single slice with zero allocations.
+#[derive(Debug, Default)]
+struct VtSequenceNormalizer {
+    state: NormState,
+    pending: Vec<u8>,
+    last_graphic: Option<char>,
+    utf8_buf: [u8; 4],
+    utf8_len: u8,
+}
+
+impl VtSequenceNormalizer {
+    fn reset(&mut self) {
+        self.state = NormState::Normal;
+        self.pending.clear();
+        self.last_graphic = None;
+        self.utf8_len = 0;
+    }
+
+    fn record_normal_byte(&mut self, b: u8) {
+        if (0x20..=0x7e).contains(&b) {
+            self.utf8_len = 0;
+            self.last_graphic = Some(b as char);
+        } else if b >= 0x80 {
+            let len = usize::from(self.utf8_len);
+            if len < self.utf8_buf.len() {
+                self.utf8_buf[len] = b;
+                self.utf8_len += 1;
+                if let Ok(s) = std::str::from_utf8(&self.utf8_buf[..usize::from(self.utf8_len)]) {
+                    if let Some(ch) = s.chars().next() {
+                        self.last_graphic = Some(ch);
+                    }
+                    self.utf8_len = 0;
+                } else if self.utf8_len == 4 {
+                    self.utf8_len = 0;
+                }
+            } else {
+                self.utf8_len = 0;
+            }
+        } else {
+            self.utf8_len = 0;
+        }
+    }
+
+    fn emit_csi_translation(&self, parser: &mut vt100::Parser, final_byte: u8, params: &[u8]) {
+        let (p1, p2, empty) = parse_csi_params(params);
+        match final_byte {
+            b'Z' => {
+                let (_, col) = parser.screen().cursor_position();
+                let (_, cols) = parser.screen().size();
+                let target_col = cbt_target_col(col, cols, p1);
+                let seq = format!("\x1b[{}G", target_col + 1);
+                parser.process(seq.as_bytes());
+            }
+            b'b' => {
+                if let Some(ch) = self.last_graphic {
+                    let (_, cols) = parser.screen().size();
+                    let count = usize::from(p1.min(cols));
+                    if count > 0 {
+                        let mut encoded = [0u8; 4];
+                        let s = ch.encode_utf8(&mut encoded);
+                        let mut repeated = Vec::with_capacity(s.len() * count);
+                        for _ in 0..count {
+                            repeated.extend_from_slice(s.as_bytes());
+                        }
+                        parser.process(&repeated);
+                    }
+                }
+            }
+            b'`' => {
+                let seq = format!("\x1b[{p1}G");
+                parser.process(seq.as_bytes());
+            }
+            b'f' => {
+                let seq = format!("\x1b[{p1};{p2}H");
+                parser.process(seq.as_bytes());
+            }
+            b's' if empty => parser.process(b"\x1b7"),
+            b'u' if empty => parser.process(b"\x1b8"),
+            _ => {}
+        }
+    }
+
+    fn process(&mut self, parser: &mut vt100::Parser, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut flush_from: usize = 0;
+        let mut esc_start: Option<usize> = None;
+
+        for (i, &b) in bytes.iter().enumerate() {
+            match self.state {
+                NormState::Normal => {
+                    if b == 0x1b {
+                        self.utf8_len = 0;
+                        esc_start = Some(i);
+                        self.state = NormState::Esc;
+                    } else {
+                        self.record_normal_byte(b);
+                    }
+                }
+                NormState::CsiPassthrough => {
+                    if b == 0x1b {
+                        esc_start = Some(i);
+                        self.state = NormState::Esc;
+                    } else if (0x40..=0x7e).contains(&b) || b < 0x20 {
+                        self.state = NormState::Normal;
+                    }
+                }
+                NormState::StringPayload => {
+                    if b == 0x07 || b == 0x18 || b == 0x1a {
+                        self.state = NormState::Normal;
+                    } else if b == 0x1b {
+                        self.state = NormState::StringEsc;
+                    }
+                }
+                NormState::StringEsc => {
+                    if b == b'\\' {
+                        self.state = NormState::Normal;
+                    } else if b == 0x1b {
+                        self.state = NormState::StringEsc;
+                    } else if matches!(b, b'D' | b'E') {
+                        // A bare ESC inside a string aborts it and runs this ESC.
+                        let seq_start = i.saturating_sub(1);
+                        if seq_start > flush_from {
+                            parser.process(&bytes[flush_from..seq_start]);
+                        }
+                        if b == b'D' {
+                            parser.process(b"\n");
+                        } else {
+                            parser.process(b"\r\n");
+                        }
+                        flush_from = i + 1;
+                        self.state = NormState::Normal;
+                    } else if b == b'[' {
+                        esc_start = i.checked_sub(1);
+                        if esc_start.is_none() {
+                            // ESC was the final byte of the previous chunk;
+                            // `parser` already saw that ESC in StringPayload,
+                            // so fall back to passthrough.
+                            self.state = NormState::CsiPassthrough;
+                        } else {
+                            self.state = NormState::Csi;
+                        }
+                    } else {
+                        self.state = NormState::Normal;
+                    }
+                }
+                NormState::Esc => match b {
+                    b'[' => {
+                        if esc_start.is_none() {
+                            self.pending.push(b);
+                        }
+                        self.state = NormState::Csi;
+                    }
+                    b'D' | b'E' => {
+                        if let Some(s) = esc_start.take() {
+                            if s > flush_from {
+                                parser.process(&bytes[flush_from..s]);
+                            }
+                        } else {
+                            self.pending.clear();
+                        }
+                        if b == b'D' {
+                            parser.process(b"\n");
+                        } else {
+                            parser.process(b"\r\n");
+                        }
+                        flush_from = i + 1;
+                        self.state = NormState::Normal;
+                    }
+                    0x1b => {
+                        if esc_start.is_none() {
+                            parser.process(&self.pending);
+                            self.pending.clear();
+                            flush_from = i;
+                        }
+                        esc_start = Some(i);
+                    }
+                    b']' | b'P' | b'_' | b'^' | b'X' => {
+                        if esc_start.is_none() {
+                            self.pending.push(b);
+                            parser.process(&self.pending);
+                            self.pending.clear();
+                            flush_from = i + 1;
+                        } else {
+                            esc_start = None;
+                        }
+                        self.state = NormState::StringPayload;
+                    }
+                    _ => {
+                        if esc_start.is_none() {
+                            self.pending.push(b);
+                            parser.process(&self.pending);
+                            self.pending.clear();
+                            flush_from = i + 1;
+                        } else {
+                            esc_start = None;
+                        }
+                        self.state = NormState::Normal;
+                    }
+                },
+                NormState::Csi => {
+                    if b.is_ascii_digit() || b == b';' {
+                        if esc_start.is_none() {
+                            self.pending.push(b);
+                            if self.pending.len() >= NORM_MAX_PENDING {
+                                parser.process(&self.pending);
+                                self.pending.clear();
+                                flush_from = i + 1;
+                                self.state = NormState::CsiPassthrough;
+                            }
+                        } else if let Some(s) = esc_start {
+                            if i - s >= NORM_MAX_PENDING {
+                                esc_start = None;
+                                self.state = NormState::CsiPassthrough;
+                            }
+                        }
+                    } else if b == 0x1b {
+                        if esc_start.is_none() {
+                            parser.process(&self.pending);
+                            self.pending.clear();
+                            flush_from = i;
+                        }
+                        esc_start = Some(i);
+                        self.state = NormState::Esc;
+                    } else {
+                        let params_empty = match esc_start {
+                            Some(s) => i == s + 2,
+                            None => self.pending.len() <= 2,
+                        };
+                        let should_translate = matches!(b, b'Z' | b'b' | b'`' | b'f')
+                            || (matches!(b, b's' | b'u') && params_empty);
+                        if should_translate {
+                            if let Some(s) = esc_start.take() {
+                                if s > flush_from {
+                                    parser.process(&bytes[flush_from..s]);
+                                }
+                                self.emit_csi_translation(parser, b, &bytes[s + 2..i]);
+                            } else {
+                                let params = std::mem::take(&mut self.pending);
+                                self.emit_csi_translation(parser, b, &params[2..]);
+                            }
+                            flush_from = i + 1;
+                            self.state = NormState::Normal;
+                        } else {
+                            if esc_start.is_none() {
+                                self.pending.push(b);
+                                parser.process(&self.pending);
+                                self.pending.clear();
+                                flush_from = i + 1;
+                            } else {
+                                esc_start = None;
+                            }
+                            self.state = if (0x40..=0x7e).contains(&b) || b < 0x20 {
+                                NormState::Normal
+                            } else {
+                                NormState::CsiPassthrough
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(s) = esc_start {
+            if s > flush_from {
+                parser.process(&bytes[flush_from..s]);
+            }
+            self.pending.extend_from_slice(&bytes[s..]);
+        } else if self.pending.is_empty() && flush_from < bytes.len() {
+            parser.process(&bytes[flush_from..]);
+        }
+    }
 }
 
 /// Prefix shared by DEC synchronized-update begin/end markers. The final byte
@@ -1204,6 +1634,8 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
     let mut buf = [0u8; 8192];
     let mut osc52 = Osc52Scanner::new();
     let mut sync_updates = SyncUpdateScanner::default();
+    let mut normalizer = VtSequenceNormalizer::default();
+    let mut seen_seed_epoch = ctx.seed_epoch.load(Ordering::Relaxed);
     while !ctx.stop.load(Ordering::Relaxed) {
         match conn.read(&mut buf) {
             Ok(0) => break,
@@ -1221,6 +1653,11 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                         *guard = Some(text.clone());
                     }
                 }
+                // Keep synchronized-update tracking aligned across the pre-seed
+                // boundary too (#3771): dropping a pre-seed opener or closer
+                // before the scanner sees it would invert the gate on the first
+                // live frame.
+                let sync = sync_updates.feed(&buf[..n]);
                 // Bytes that arrive before the seed are ALREADY IN IT, so they
                 // must be dropped rather than applied. `arm` orders the pipe
                 // first and the seed second (pipe-pane, wait for the forwarder
@@ -1266,25 +1703,33 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                     continue;
                 }
 
-                let sync = sync_updates.feed(&buf[..n]);
                 // A frame that remains open after this read must become
                 // unpublished BEFORE the parser can expose its first partial
                 // cells. Conversely, a closing read stays unpublished until
-                // all of its bytes have been parsed below.
-                if !sync.was_active && sync.is_active {
+                // all of its bytes have been parsed and `grid_gen` has been
+                // bumped under the same parser lock (#3636, #3770).
+                if sync.is_active {
                     ctx.sync_update_active.store(true, Ordering::Release);
                 }
                 if let Ok(mut p) = ctx.parser.lock() {
-                    p.process(&buf[..n]);
+                    let epoch = ctx.seed_epoch.load(Ordering::Relaxed);
+                    if epoch != seen_seed_epoch {
+                        normalizer.reset();
+                        seen_seed_epoch = epoch;
+                    }
+                    normalizer.process(&mut p, &buf[..n]);
                     ctx.app_cursor
                         .store(p.screen().application_cursor(), Ordering::Relaxed);
-                }
-                if sync.was_active && !sync.is_active {
+                    // Bump `grid_gen` while still holding the parser lock so a
+                    // concurrent guarded reseed cannot observe a stale
+                    // generation and discard this chunk (#3636).
+                    ctx.grid_gen.fetch_add(1, Ordering::Relaxed);
+                    if !sync.is_active {
+                        ctx.sync_update_active.store(false, Ordering::Release);
+                    }
+                } else if !sync.is_active {
                     ctx.sync_update_active.store(false, Ordering::Release);
                 }
-                // Invalidate cached sample assemblies BEFORE the wakeup, so a
-                // woken sampler always sees the new generation.
-                ctx.grid_gen.fetch_add(1, Ordering::Relaxed);
                 // Stamp this chunk's arrival so the capture worker can tell a
                 // lone chunk (keystroke echo) from a back-to-back stream (a
                 // multi-chunk repaint) and hold the sample until the stream
@@ -1391,6 +1836,8 @@ pub(crate) struct VtChannel {
     /// Grid generation (see the `ReaderCtx` field of the same name): the
     /// cache key half of `sample_cache`.
     grid_gen: Arc<AtomicU64>,
+    /// Bumped under `parser.lock()` whenever a seed replaces the parser.
+    seed_epoch: Arc<AtomicU64>,
     /// The last assembled sample, keyed by (generation, window, size). Every
     /// viewer samples on a cadence, but an idle pane's grid doesn't change
     /// between chunks, so re-walking (scrollback + screen) into ANSI each
@@ -1545,6 +1992,7 @@ impl VtChannel {
         let prev_gap_ms = Arc::new(AtomicU64::new(u64::MAX));
         let sync_update_active = Arc::new(AtomicBool::new(false));
         let grid_gen = Arc::new(AtomicU64::new(0));
+        let seed_epoch = Arc::new(AtomicU64::new(0));
         let reader = {
             let ctx = ReaderCtx {
                 parser: parser.clone(),
@@ -1560,6 +2008,7 @@ impl VtChannel {
                 prev_gap_ms: prev_gap_ms.clone(),
                 sync_update_active: sync_update_active.clone(),
                 grid_gen: grid_gen.clone(),
+                seed_epoch: seed_epoch.clone(),
             };
             std::thread::spawn(move || run_reader(listener, ctx))
         };
@@ -1611,8 +2060,15 @@ impl VtChannel {
 
         // Seed the current screen so an already-running agent shows up
         // immediately instead of starting blank (pipe-pane has no backlog).
-        seed_parser(&target, &parser, &app_cursor, cols, rows);
-        grid_gen.fetch_add(1, Ordering::Relaxed);
+        seed_parser(
+            &target,
+            &parser,
+            &app_cursor,
+            &grid_gen,
+            &seed_epoch,
+            cols,
+            rows,
+        );
         seeded.store(true, Ordering::Relaxed);
         tracing::info!(
             %target,
@@ -1636,6 +2092,7 @@ impl VtChannel {
             prev_gap_ms,
             sync_update_active,
             grid_gen,
+            seed_epoch,
             sample_cache: Mutex::new(None),
             sock_dir,
             sock_path,
@@ -1699,21 +2156,13 @@ impl VtChannel {
             self.cols.load(Ordering::Relaxed),
             self.rows.load(Ordering::Relaxed),
         );
-        let (gcy, gcx) = match self.parser.lock() {
-            Ok(p) => p.screen().cursor_position(),
+        let ((gcy, gcx), grid_gen) = match self.parser.lock() {
+            Ok(p) => (
+                p.screen().cursor_position(),
+                self.grid_gen.load(Ordering::Relaxed),
+            ),
             Err(_) => return,
         };
-        // Read the generation AFTER the cursor. `run_reader` bumps `grid_gen`
-        // only once it has released the parser lock, so a cursor read can
-        // already reflect a chunk whose bump has not landed yet. This order
-        // NARROWS that window (a chunk that slipped in usually shows up as a
-        // bumped generation, which `reconcile_step` reads as "output arrived"
-        // and re-arms) but it does not close it: a reader preempted between the
-        // unlock and the bump still presents a cursor newer than the generation
-        // either way. The residual cost is a rare extra reseed, which is
-        // idempotent, so this is a bias not a guarantee. Closing it properly
-        // would mean bumping `grid_gen` while still holding the parser lock.
-        let grid_gen = self.grid_gen.load(Ordering::Relaxed);
         let pending = self.pending_drift.lock().ok().and_then(|g| *g);
         match reconcile_step((c, r, cx, cy), (gc, gr, gcx, gcy), pending, grid_gen) {
             GridReconcile::InSync => self.clear_drift(),
@@ -1725,7 +2174,7 @@ impl VtChannel {
             GridReconcile::Resize => {
                 self.cols.store(c, Ordering::Relaxed);
                 self.rows.store(r, Ordering::Relaxed);
-                self.reseed(c, r);
+                self.reseed(c, r, false);
             }
             GridReconcile::Reseed => {
                 tracing::debug!(
@@ -1735,7 +2184,7 @@ impl VtChannel {
                     grid_cursor = ?(gcx, gcy),
                     "vt: grid diverged from pane; reseeding",
                 );
-                self.reseed(c, r);
+                self.reseed(c, r, true);
             }
         }
     }
@@ -1751,11 +2200,51 @@ impl VtChannel {
 
     /// Rebuild the grid from `capture-pane` and clear any armed drift, so the
     /// freshly seeded cursor is not immediately re-judged against a stale
-    /// generation.
-    fn reseed(&self, cols: u16, rows: u16) {
-        seed_parser(&self.target, &self.parser, &self.app_cursor, cols, rows);
-        self.grid_gen.fetch_add(1, Ordering::Relaxed);
-        self.clear_drift();
+    /// generation. When `guarded` is true, abandons the swap if live chunks
+    /// arrived or are still buffered in the pipe socket while the capture ran.
+    fn reseed(&self, cols: u16, rows: u16, guarded: bool) -> bool {
+        let since = guarded.then(|| self.grid_gen.load(Ordering::Relaxed));
+        let pipe_probe = if guarded {
+            self.stream
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().and_then(|s| s.try_clone().ok()))
+        } else {
+            None
+        };
+        let Some(stream) = capture_seed_stream(&self.target, rows) else {
+            return false;
+        };
+        let seeded = swap_seeded_parser(
+            &self.parser,
+            &self.app_cursor,
+            &self.grid_gen,
+            &self.seed_epoch,
+            since,
+            pipe_probe.as_ref(),
+            &stream,
+            cols,
+            rows,
+        );
+        if seeded {
+            self.clear_drift();
+        }
+        seeded
+    }
+
+    /// Rebuild the grid from a fresh `capture-pane` at its current size, so a
+    /// grid that has stably diverged from tmux cannot stand indefinitely (#3612).
+    /// Returns `false` if the pane could not be captured or live output raced
+    /// the snapshot, letting the caller retry on its own cadence.
+    pub(crate) fn resync_from_pane(&self) -> bool {
+        if self.synchronized_update_active() {
+            return false;
+        }
+        self.reseed(
+            self.cols.load(Ordering::Relaxed),
+            self.rows.load(Ordering::Relaxed),
+            true,
+        )
     }
 
     /// Serialise up to `max_lines` of (scrollback + screen) to per-row ANSI,
@@ -2645,6 +3134,7 @@ mod tests {
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             sync_update_active: Arc::new(AtomicBool::new(false)),
             grid_gen: Arc::new(AtomicU64::new(0)),
+            seed_epoch: Arc::new(AtomicU64::new(0)),
             sample_cache: Mutex::new(None),
             sock_dir: dir.to_path_buf(),
             sock_path: dir.join("s.sock"),
@@ -2904,6 +3394,7 @@ mod tests {
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             sync_update_active: Arc::new(AtomicBool::new(false)),
             grid_gen: grid_gen.clone(),
+            seed_epoch: Arc::new(AtomicU64::new(0)),
         };
         let reader = std::thread::spawn(move || run_reader(listener, ctx));
         let mut conn = UnixStream::connect(&sock).expect("connect");
@@ -2986,6 +3477,7 @@ mod tests {
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             sync_update_active: Arc::new(AtomicBool::new(false)),
             grid_gen: Arc::new(AtomicU64::new(0)),
+            seed_epoch: Arc::new(AtomicU64::new(0)),
         };
         let reader = std::thread::spawn(move || run_reader(listener, ctx));
         let mut conn = UnixStream::connect(&sock).expect("connect");
@@ -3053,6 +3545,7 @@ mod tests {
             prev_gap_ms: prev_gap_ms.clone(),
             sync_update_active: sync_update_active.clone(),
             grid_gen: grid_gen.clone(),
+            seed_epoch: Arc::new(AtomicU64::new(0)),
         };
         let reader = std::thread::spawn(move || run_reader(listener, ctx));
         let mut conn = UnixStream::connect(&sock).expect("connect");
@@ -3264,6 +3757,7 @@ mod tests {
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             sync_update_active: Arc::new(AtomicBool::new(false)),
             grid_gen: Arc::new(AtomicU64::new(0)),
+            seed_epoch: Arc::new(AtomicU64::new(0)),
         };
         let reader = std::thread::spawn(move || run_reader(listener, ctx));
         let mut conn = UnixStream::connect(&sock).expect("connect");
@@ -3398,6 +3892,7 @@ mod tests {
             prev_gap_ms: prev_gap_ms.clone(),
             sync_update_active: Arc::new(AtomicBool::new(false)),
             grid_gen: Arc::new(AtomicU64::new(0)),
+            seed_epoch: Arc::new(AtomicU64::new(0)),
         };
         let reader = std::thread::spawn(move || run_reader(listener, ctx));
         let mut conn = UnixStream::connect(&sock).expect("connect");
@@ -3523,6 +4018,7 @@ mod tests {
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             sync_update_active: Arc::new(AtomicBool::new(false)),
             grid_gen: grid_gen.clone(),
+            seed_epoch: Arc::new(AtomicU64::new(0)),
         };
         let reader = std::thread::spawn(move || run_reader(listener, ctx));
         let mut conn = UnixStream::connect(&sock).expect("connect");
@@ -3718,5 +4214,200 @@ mod tests {
         for (raw, want) in cases {
             assert_eq!(parse_size_cursor(raw), want, "{raw:?}");
         }
+    }
+
+    #[test]
+    fn cbt_target_col_matches_tmux_tab_stops() {
+        let cases = [
+            // (col, cols, count, expected)
+            (0, 40, 1, 0),
+            (8, 40, 1, 0),
+            (9, 40, 1, 8),
+            (24, 40, 1, 16),
+            (24, 40, 2, 8),
+            (30, 40, 1, 24),
+            (30, 40, 2, 16),
+            (39, 40, 2, 24),
+            // Pending wrap on 40-col and 41-col panes clamps to cols - 1 first.
+            (40, 40, 1, 32),
+            (40, 40, 2, 24),
+            (41, 41, 1, 32),
+            // Exact Antigravity mid-typing CBT: col 58 -> 56 -> 48.
+            (58, 120, 2, 48),
+            // Count 0 defaults to 1.
+            (30, 40, 0, 24),
+            // Overshoot saturates at column 0.
+            (30, 40, 99, 0),
+        ];
+        for (col, cols, count, expected) in cases {
+            assert_eq!(
+                cbt_target_col(col, cols, count),
+                expected,
+                "col={col} cols={cols} count={count}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalizer_handles_antigravity_cbt_mid_typing_and_split_reads() {
+        // Exact sequence captured from Antigravity CLI 1.5.19 when inserting
+        // characters in the middle of a prompt: after writing "Eravity cli"
+        // (ending at col 58), agy optimizes CUB 10 into CBT 2 (`\x1b[2Z`)
+        // because 48 is a multiple of 8. Without CBT support, vt100 drops
+        // `\x1b[2Z` and paints "Rravity cli" 10 columns too far right.
+        let prefix = "> hello world this is a typing test in antigINSravity cli";
+        let stream = concat!(
+            "\x1b[?2026hEravity cli\x1b[2Z\x1b[?2026l",
+            "\x1b[?2026hRravity cli\x1b[10D\x1b[?2026l",
+        )
+        .as_bytes();
+
+        for chunk_size in [stream.len(), 7, 1] {
+            let mut p = vt100::Parser::new(4, 120, 0);
+            let mut norm = VtSequenceNormalizer::default();
+            norm.process(&mut p, prefix.as_bytes());
+            // Move cursor to col 47 (the 'r' of "ravity cli").
+            norm.process(&mut p, b"\x1b[10D");
+            for chunk in stream.chunks(chunk_size) {
+                norm.process(&mut p, chunk);
+            }
+            let row0 = p.screen().rows(0, 120).next().unwrap_or_default();
+            assert_eq!(
+                row0, "> hello world this is a typing test in antigINSERravity cli",
+                "chunk_size={chunk_size}"
+            );
+            assert_eq!(
+                p.screen().cursor_position(),
+                (0, 49),
+                "chunk_size={chunk_size}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalizer_translates_rep_hpa_hvp_scosc_ind_nel_and_preserves_decslrm() {
+        let mut p = vt100::Parser::new(6, 40, 0);
+        let mut norm = VtSequenceNormalizer::default();
+
+        // REP (`CSI Ps b`) repeats last graphic char, ignoring OSC titles and
+        // private CSI parameters in between.
+        norm.process(&mut p, b"A\x1b]2;title\x07\x1b[?2026h\x1b[3b\x1b[?2026l");
+        assert_eq!(p.screen().rows(0, 40).next().unwrap_or_default(), "AAAA");
+        assert_eq!(p.screen().cursor_position(), (0, 4));
+
+        // HPA (`CSI Ps \``), HVP (`CSI r;c f`), SCOSC/SCORC (`CSI s`/`u`).
+        norm.process(&mut p, b"\x1b[10`X");
+        assert_eq!(p.screen().cursor_position(), (0, 10));
+        norm.process(&mut p, b"\x1b[2;6f\x1b[s\x1b[1;1H\x1b[uY");
+        assert_eq!(p.screen().cursor_position(), (1, 6));
+        assert_eq!(p.screen().cell(1, 5).map(|c| c.contents()), Some("Y"));
+
+        // DECSLRM (`CSI 2;10 s`, non-empty params) must not trigger SCOSC.
+        norm.process(&mut p, b"\x1b[4;3H\x1b[2;10s\x1b[1;1H\x1b[u");
+        assert_eq!(p.screen().cursor_position(), (1, 5));
+
+        // IND (`ESC D`) moves down preserving column; NEL (`ESC E`) moves to col 0.
+        norm.process(&mut p, b"\x1b[1;5H\x1bD");
+        assert_eq!(p.screen().cursor_position(), (1, 4));
+        norm.process(&mut p, b"\x1bE");
+        assert_eq!(p.screen().cursor_position(), (2, 0));
+    }
+
+    #[test]
+    fn seeded_cursor_row_bottom_anchors_when_capture_height_differs() {
+        let cases = [
+            // Matching heights or unknown pane_height: direct clamp.
+            (5, 24, 24, 5),
+            (30, 24, 24, 23),
+            (5, 0, 24, 5),
+            // Capture taller (40 rows) poured into shorter grid (30 rows):
+            // row 38 (1 row above bottom) maps to row 28 (1 row above bottom).
+            (38, 40, 30, 28),
+            // Row scrolled off the top of the shorter grid clamps to row 0.
+            (5, 40, 30, 0),
+        ];
+        for (cy, pane_h, grid_rows, expected) in cases {
+            assert_eq!(
+                seeded_cursor_row(cy, pane_h, grid_rows),
+                expected,
+                "cy={cy} pane_h={pane_h} grid_rows={grid_rows}"
+            );
+        }
+    }
+
+    #[test]
+    fn swap_seeded_parser_stands_down_on_raced_generation_or_unread_pipe() {
+        use std::io::Write;
+
+        let parser = Mutex::new(vt100::Parser::new(6, 40, 0));
+        let app_cursor = AtomicBool::new(false);
+        let grid_gen = AtomicU64::new(5);
+        let seed_epoch = AtomicU64::new(0);
+        parser.lock().unwrap().process(b"live-state");
+
+        let seed = assemble_seed_stream(b"snapshot\n", &PaneSeedState::default(), 6);
+
+        // Generation moved since capture started -> stand down.
+        assert!(!swap_seeded_parser(
+            &parser,
+            &app_cursor,
+            &grid_gen,
+            &seed_epoch,
+            Some(4),
+            None,
+            &seed,
+            40,
+            6,
+        ));
+        assert!(parser
+            .lock()
+            .unwrap()
+            .screen()
+            .contents()
+            .contains("live-state"));
+
+        // Unread bytes waiting in the pipe socket -> stand down (#3759).
+        let (rx, mut tx) = UnixStream::pair().expect("socketpair");
+        tx.write_all(b"pending-keystroke").expect("write");
+        assert!(!swap_seeded_parser(
+            &parser,
+            &app_cursor,
+            &grid_gen,
+            &seed_epoch,
+            Some(5),
+            Some(&rx),
+            &seed,
+            40,
+            6,
+        ));
+        assert!(parser
+            .lock()
+            .unwrap()
+            .screen()
+            .contents()
+            .contains("live-state"));
+
+        // Drain the socket -> guarded swap now succeeds and bumps seed_epoch.
+        let mut drain = [0u8; 32];
+        let _ = (&rx).read(&mut drain).expect("drain");
+        assert!(swap_seeded_parser(
+            &parser,
+            &app_cursor,
+            &grid_gen,
+            &seed_epoch,
+            Some(5),
+            Some(&rx),
+            &seed,
+            40,
+            6,
+        ));
+        assert!(parser
+            .lock()
+            .unwrap()
+            .screen()
+            .contents()
+            .contains("snapshot"));
+        assert_eq!(grid_gen.load(Ordering::Relaxed), 6);
+        assert_eq!(seed_epoch.load(Ordering::Relaxed), 1);
     }
 }

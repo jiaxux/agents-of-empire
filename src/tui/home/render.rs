@@ -11,8 +11,8 @@ use rattles::presets::prelude as spinners;
 
 use super::{
     get_indent, live_send, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION, ICON_COLLAPSED,
-    ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED,
-    ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
+    ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_INACTIVE_SECTION,
+    ICON_PINNED, ICON_STOPPED, ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
 };
 use crate::containers::image_update::ImageUpdate;
 use crate::session::config::{GroupByMode, RowTagMode, SortOrder};
@@ -208,6 +208,58 @@ fn capture_lines_for(height: u16, scroll_offset: u16) -> usize {
 /// and a drag-select tracks exactly the cells under the pointer.
 fn preview_frozen(scroll_offset: u16, has_selection: bool) -> bool {
     scroll_offset > 0 || has_selection
+}
+
+/// Minimum interval between idle synchronous fallback `capture-pane` forks.
+const PREVIEW_REFRESH_MS: u128 = 250;
+
+/// Ceiling on how long a pulsing `capture-pane` worker may be the sole source
+/// of truth before the synchronous fallback self-heals (#3559, #3612). A live
+/// VT worker handles its own quiet-time resync off the render thread and is
+/// trusted for as long as it pulses.
+const WORKER_TRUST_CEILING_MS: u128 = 10_000;
+
+/// How long `LiveCaptureWorker::cycles` may stay unchanged before the render
+/// thread treats the worker as wedged and falls back to synchronous capture.
+const WORKER_PULSE_TIMEOUT: Duration = Duration::from_millis(1_500);
+
+/// Fold an observed capture-worker cycle counter into a liveness verdict and
+/// updated observation (#3559).
+fn worker_pulse_step(
+    cycles: u64,
+    prev: Option<(u64, Instant)>,
+    now: Instant,
+) -> (bool, Option<(u64, Instant)>) {
+    match prev {
+        None => (false, Some((cycles, now))),
+        Some((last, _)) if cycles != last => (true, Some((cycles, now))),
+        Some((last, at)) => (
+            now.saturating_duration_since(at) < WORKER_PULSE_TIMEOUT,
+            Some((last, at)),
+        ),
+    }
+}
+
+/// Whether the synchronous idle fallback poll in `refresh_preview_cache_core`
+/// should fire (#3559, #3612).
+///
+/// A pulsing VT worker suppresses the render-thread `capture-pane` fork
+/// completely: firing it every 250ms both stalled typing frames and bypassed
+/// the VT channel's DEC 2026 synchronized-update gate, causing flicker when
+/// full-screen or inline TUIs (like Antigravity) repainted mid-frame.
+fn idle_poll_due(
+    frozen: bool,
+    idle_elapsed_ms: u128,
+    worker_covers_idle: bool,
+    worker_is_vt: bool,
+) -> bool {
+    if frozen || idle_elapsed_ms <= PREVIEW_REFRESH_MS {
+        return false;
+    }
+    if !worker_covers_idle {
+        return true;
+    }
+    !worker_is_vt && idle_elapsed_ms > WORKER_TRUST_CEILING_MS
 }
 
 /// Decide whether the cached capture window still covers the requested scroll.
@@ -1639,6 +1691,8 @@ impl HomeView {
                     Some(ICON_TRASH_SECTION)
                 } else if crate::session::is_archived_section_path(path) {
                     Some(ICON_ARCHIVED_SECTION)
+                } else if crate::session::is_inactive_section_path(path) {
+                    Some(ICON_INACTIVE_SECTION)
                 } else {
                     None
                 };
@@ -2130,6 +2184,17 @@ impl HomeView {
     /// `force` bypasses the idle throttle; the agent passes `in_live` here so
     /// every render refreshes the preview in live-send mode (see the throttle
     /// note in `refresh_preview_cache_if_needed`), the others pass `false`.
+    fn observe_worker_pulse(&mut self) -> bool {
+        let Some(worker) = self.preview_capture_worker.as_ref() else {
+            self.preview_worker_pulse = None;
+            return false;
+        };
+        let (alive, next) =
+            worker_pulse_step(worker.cycles(), self.preview_worker_pulse, Instant::now());
+        self.preview_worker_pulse = next;
+        alive
+    }
+
     fn refresh_preview_cache_core(
         &mut self,
         width: u16,
@@ -2138,24 +2203,31 @@ impl HomeView {
         select: fn(&mut Self) -> &mut super::PreviewCache,
         capture: impl FnOnce(&Self, &str, usize) -> Option<String>,
     ) {
-        const PREVIEW_REFRESH_MS: u128 = 250;
         let Some(id) = self.selected_session.clone() else {
             return;
         };
         let scroll_offset = self.preview_scroll_offset;
         let frozen = self.preview_is_frozen();
         let visible_rows = self.preview_visible_rows;
+        let worker_covers_idle = self.observe_worker_pulse();
+        let worker_is_vt = self
+            .preview_capture_worker
+            .as_ref()
+            .is_some_and(|worker| worker.vt_active());
 
         let cache = select(self);
+        let idle_elapsed = cache.last_refresh.elapsed().as_millis();
         let needs_refresh = force
             || cache.session_id.as_ref() != Some(&id)
             || cache.dimensions != (width, height)
-            || capture_window_stale(frozen, cache.captured_lines, height, visible_rows, scroll_offset)
-            // While frozen (reading scrollback or holding a selection) the idle
-            // poll must not re-capture: a fresh bottom-anchored snapshot would
-            // shift the held content out from under the reader or the drag.
-            // Session change, resize, and the reading grow still refresh.
-            || (!frozen && cache.last_refresh.elapsed().as_millis() > PREVIEW_REFRESH_MS);
+            || capture_window_stale(
+                frozen,
+                cache.captured_lines,
+                height,
+                visible_rows,
+                scroll_offset,
+            )
+            || idle_poll_due(frozen, idle_elapsed, worker_covers_idle, worker_is_vt);
         if !needs_refresh {
             return;
         }
@@ -2234,6 +2306,7 @@ impl HomeView {
                 worker.set_target(desired.clone().unwrap_or_default());
             }
             self.preview_capture_target = desired;
+            self.preview_worker_pulse = None;
             // New pane under the pointer: drop the hover dedup cell so a
             // stationary pointer still reports its cell to the new agent.
             self.hover_forward_cell = None;
@@ -4621,6 +4694,52 @@ mod tests {
         let style = Style::default().fg(theme.running);
 
         assert_eq!(selected_row_style(style, &theme).fg, Some(theme.running));
+    }
+
+    #[test]
+    fn idle_poll_due_trusts_a_vt_worker_and_bounds_a_capture_worker() {
+        let past_cadence = PREVIEW_REFRESH_MS + 1;
+        let past_ceiling = WORKER_TRUST_CEILING_MS + 1;
+        let cases = [
+            (false, PREVIEW_REFRESH_MS, false, false, false),
+            (false, PREVIEW_REFRESH_MS, true, true, false),
+            (false, past_cadence, false, false, true),
+            (false, past_cadence, false, true, true),
+            (false, past_cadence, true, true, false),
+            (false, past_ceiling, true, true, false),
+            (false, past_cadence, true, false, false),
+            (false, past_ceiling, true, false, true),
+            (true, past_cadence, false, false, false),
+            (true, past_ceiling, true, false, false),
+        ];
+        for (frozen, elapsed, covered, vt, expected) in cases {
+            assert_eq!(
+                idle_poll_due(frozen, elapsed, covered, vt),
+                expected,
+                "frozen={frozen} elapsed={elapsed} covered={covered} vt={vt}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_pulse_step_trusts_running_worker_and_flags_wedged_one() {
+        let t0 = Instant::now();
+        let within = t0 + WORKER_PULSE_TIMEOUT - Duration::from_millis(1);
+        let past = t0 + WORKER_PULSE_TIMEOUT;
+
+        assert_eq!(worker_pulse_step(7, None, t0), (false, Some((7, t0))));
+        assert_eq!(
+            worker_pulse_step(8, Some((7, t0)), within),
+            (true, Some((8, within)))
+        );
+        assert_eq!(
+            worker_pulse_step(7, Some((7, t0)), within),
+            (true, Some((7, t0)))
+        );
+        assert_eq!(
+            worker_pulse_step(7, Some((7, t0)), past),
+            (false, Some((7, t0)))
+        );
     }
 
     #[test]

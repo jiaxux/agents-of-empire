@@ -832,6 +832,12 @@ pub struct AppStateConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_section_collapsed: Option<bool>,
 
+    /// Collapsed state for the synthetic "Inactive" buffer folder right below
+    /// ongoing chats. Defaults to expanded when absent so newly buffered chats
+    /// are immediately visible until the user collapses the folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inactive_section_collapsed: Option<bool>,
+
     /// Paths of project-mode sidebar folders the user has collapsed. Stored as
     /// the set of collapsed paths (absent/expanded folders are not listed), so
     /// the choice survives restarts. Group-mode collapse lives on the per-profile

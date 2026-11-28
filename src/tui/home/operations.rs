@@ -479,6 +479,11 @@ impl HomeView {
         if wake_snooze {
             self.mutate_instance(&id, |inst| inst.unsnooze());
         }
+        if self.get_instance(&id).is_some_and(|i| i.is_buffered()) {
+            let _ = self.apply_user_action(&id, |inst| inst.unbuffer());
+            self.rebuild_flat_items();
+            self.reseat_cursor_after_rebuild();
+        }
 
         // Apply tool swap before restart so the new binary starts on the
         // next launch.
@@ -1663,7 +1668,7 @@ impl HomeView {
                 return None;
             }
             let inst = self.instances.get(id)?;
-            (!inst.is_archived() && !inst.is_trashed()).then(|| id.clone())
+            (!inst.is_archived() && !inst.is_trashed() && !inst.is_buffered()).then(|| id.clone())
         };
         for item in self.flat_items.iter().skip(self.cursor + 1) {
             if let Some(id) = candidate(item) {
@@ -1706,6 +1711,52 @@ impl HomeView {
         // rebuild can move it; reseat the cursor by id so the next action
         // still targets this session.
         self.select_session_by_id(&id);
+        Ok(())
+    }
+
+    /// Toggle the cursor's session in/out of the sidebar's "Inactive" buffer
+    /// folder (`b`). Unlike archive, buffering keeps the live tmux pane alive
+    /// so the chat can resume at any time and automatically return to the main
+    /// list.
+    pub(super) fn toggle_buffer_at_cursor(&mut self) -> anyhow::Result<()> {
+        let Some(id) = self.selected_session.clone() else {
+            return Ok(());
+        };
+        let (is_buffered, is_sunk) = match self.instances.get(&id) {
+            Some(i) => (i.is_buffered(), i.is_archived() || i.is_trashed()),
+            None => return Ok(()),
+        };
+        if is_sunk {
+            return Ok(());
+        }
+        if is_buffered {
+            self.apply_user_action(&id, |inst| inst.unbuffer())?;
+            self.rebuild_flat_items();
+            self.select_session_by_id(&id);
+            return Ok(());
+        }
+
+        let successor = (self.sort_order != crate::session::config::SortOrder::Attention)
+            .then(|| self.archive_successor_session(&id))
+            .flatten();
+
+        self.apply_user_action(&id, |inst| inst.buffer())?;
+        self.rebuild_flat_items();
+        if self.sort_order == crate::session::config::SortOrder::Attention {
+            self.select_top_attention(None);
+            if self.selected_session.as_deref() == Some(id.as_str()) {
+                self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
+                self.update_selected();
+            }
+        } else {
+            match successor {
+                Some(next) => self.select_session_by_id(&next),
+                None => {
+                    self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
+                    self.update_selected();
+                }
+            }
+        }
         Ok(())
     }
 

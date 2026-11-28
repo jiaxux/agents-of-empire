@@ -1398,7 +1398,7 @@ fn test_b_opens_project_session_picker_when_projects_exist() {
     .unwrap();
 
     assert!(env.view.project_session_picker_dialog.is_none());
-    env.view.handle_key(key(KeyCode::Char('b')), None);
+    env.view.handle_key(key(KeyCode::Char('B')), None);
     assert!(env.view.project_session_picker_dialog.is_some());
     assert!(env.view.info_dialog.is_none());
     // The picker captures filter chars, so it must register as a modal: an
@@ -1416,7 +1416,7 @@ fn test_b_opens_project_add_flow_when_no_projects() {
     std::fs::create_dir_all(&project_dir).unwrap();
     let profile = env.view.config_profile();
 
-    env.view.handle_key(key(KeyCode::Char('b')), None);
+    env.view.handle_key(key(KeyCode::Char('B')), None);
     assert!(env.view.project_session_picker_dialog.is_none());
     assert!(env.view.info_dialog.is_none());
     assert!(env.view.projects_dialog.is_some());
@@ -1434,7 +1434,7 @@ fn test_b_opens_project_add_flow_when_no_projects() {
     let projects = crate::session::projects::load_merged(&profile).unwrap();
     assert!(
         projects.iter().any(|p| p.path == canonical),
-        "b empty-state add flow should register the typed path"
+        "B empty-state add flow should register the typed path"
     );
 }
 
@@ -1443,7 +1443,7 @@ fn test_b_opens_project_add_flow_when_no_projects() {
 fn test_b_empty_project_add_flow_escape_closes_dialog() {
     let mut env = create_test_env_empty();
 
-    env.view.handle_key(key(KeyCode::Char('b')), None);
+    env.view.handle_key(key(KeyCode::Char('B')), None);
     assert!(env.view.projects_dialog.is_some());
 
     env.view.handle_key(key(KeyCode::Esc), None);
@@ -1467,7 +1467,7 @@ fn test_b_submit_opens_new_dialog_with_prefilled_path() {
     .unwrap();
     let expected = projects::load_merged("test").unwrap()[0].path.clone();
 
-    env.view.handle_key(key(KeyCode::Char('b')), None);
+    env.view.handle_key(key(KeyCode::Char('B')), None);
     assert!(env.view.project_session_picker_dialog.is_some());
     env.view.handle_key(key(KeyCode::Enter), None);
     assert!(env.view.project_session_picker_dialog.is_none());
@@ -1477,6 +1477,164 @@ fn test_b_submit_opens_new_dialog_with_prefilled_path() {
         .as_ref()
         .expect("new session dialog should open after picking a project");
     assert_eq!(dialog.path_value(), expected);
+}
+
+#[test]
+#[serial]
+fn buffer_key_moves_session_to_inactive_folder_between_ongoing_and_archived() {
+    use crate::session::{
+        is_archived_section_path, is_inactive_section_path, INACTIVE_SECTION_NAME,
+    };
+
+    let mut env = create_test_env_with_sessions(3);
+    let id0 = env.view.instance_at(0).id.clone();
+    let id1 = env.view.instance_at(1).id.clone();
+    let id2 = env.view.instance_at(2).id.clone();
+
+    // Archive id2 so we can assert ordering: ongoing -> Inactive -> Archived.
+    env.view.mutate_instance(&id2, |inst| inst.archive());
+    env.view.rebuild_flat_items();
+    env.view.select_session_by_id(&id0);
+
+    // Press 'b' to buffer id0 into the Inactive folder.
+    env.view.handle_key(key(KeyCode::Char('b')), None);
+    assert!(
+        env.view.get_instance(&id0).unwrap().is_buffered(),
+        "b must buffer the selected session"
+    );
+
+    let ongoing_pos = env
+        .view
+        .flat_items
+        .iter()
+        .position(|it| matches!(it, Item::Session { id, depth: 0 } if *id == id1))
+        .expect("ongoing session should remain at depth 0");
+    let inactive_header_pos = env
+        .view
+        .flat_items
+        .iter()
+        .position(|it| {
+            matches!(it, Item::Group { path, name, session_count: 1, .. }
+                if is_inactive_section_path(path) && name == INACTIVE_SECTION_NAME)
+        })
+        .expect("Inactive header should appear once a session is buffered");
+    let buffered_row_pos = env
+        .view
+        .flat_items
+        .iter()
+        .position(|it| matches!(it, Item::Session { id, depth: 1 } if *id == id0))
+        .expect("buffered session should render under Inactive at depth 1");
+    let archived_header_pos = env
+        .view
+        .flat_items
+        .iter()
+        .position(|it| matches!(it, Item::Group { path, .. } if is_archived_section_path(path)))
+        .expect("Archived header should exist");
+
+    assert!(
+        ongoing_pos < inactive_header_pos
+            && inactive_header_pos < buffered_row_pos
+            && buffered_row_pos < archived_header_pos,
+        "order must be ongoing -> Inactive -> buffered row -> Archived; items={:?}",
+        env.view.flat_items
+    );
+    // Inactive lives above the pinned bottom shelf.
+    assert_eq!(env.view.shelf_start(), Some(archived_header_pos));
+
+    // Collapsing Inactive hides its child row while keeping the header.
+    env.view.toggle_inactive_section();
+    assert!(env.view.inactive_section_collapsed);
+    assert!(
+        !env.view
+            .flat_items
+            .iter()
+            .any(|it| matches!(it, Item::Session { id, .. } if *id == id0)),
+        "collapsing Inactive must hide buffered sessions"
+    );
+    env.view.toggle_inactive_section();
+
+    // Pressing 'b' on the buffered session moves it back to the main list.
+    env.view.select_session_by_id(&id0);
+    env.view.handle_key(key(KeyCode::Char('b')), None);
+    assert!(!env.view.get_instance(&id0).unwrap().is_buffered());
+    assert!(
+        !env.view
+            .flat_items
+            .iter()
+            .any(|it| matches!(it, Item::Group { path, .. } if is_inactive_section_path(path))),
+        "empty Inactive folder must disappear"
+    );
+}
+
+#[test]
+#[serial]
+fn buffered_session_auto_returns_on_user_interaction_or_status_resume() {
+    use crate::tui::status_poller::{IdleIntent, StatusUpdate};
+
+    // Case 1: user interaction (`stamp_last_accessed`) unbuffers persistently.
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.select_session_by_id(&id);
+    env.view.handle_key(key(KeyCode::Char('b')), None);
+    assert!(env.view.get_instance(&id).unwrap().is_buffered());
+
+    env.view.stamp_last_accessed(&id);
+    assert!(
+        !env.view.get_instance(&id).unwrap().is_buffered(),
+        "user interaction must unbuffer the session in memory"
+    );
+    let on_disk = env
+        .view
+        .storages
+        .values()
+        .next()
+        .unwrap()
+        .load()
+        .expect("load");
+    assert!(
+        !on_disk.iter().find(|i| i.id == id).unwrap().is_buffered(),
+        "user interaction must persist unbuffer to disk"
+    );
+
+    // Case 2: status transition Idle -> Running (and Idle -> Waiting) auto-unbuffers.
+    for target_status in [Status::Running, Status::Waiting] {
+        env.view.mutate_instance(&id, |inst| {
+            inst.status = Status::Idle;
+        });
+        env.view
+            .apply_user_action(&id, |inst| inst.buffer())
+            .expect("buffer");
+        env.view.rebuild_flat_items();
+        assert!(env.view.get_instance(&id).unwrap().is_buffered());
+
+        env.view
+            .apply_status_updates_without_hooks(vec![StatusUpdate {
+                id: id.clone(),
+                status: target_status,
+                last_error: None,
+                last_accessed_at: None,
+                idle_entered_at: IdleIntent::Clear,
+                live_status_baseline: None,
+                idle_hook_reconciliation: None,
+                pane_dead: false,
+            }]);
+        assert!(
+            !env.view.get_instance(&id).unwrap().is_buffered(),
+            "transition to {target_status:?} must auto-unbuffer the session"
+        );
+        let on_disk = env
+            .view
+            .storages
+            .values()
+            .next()
+            .unwrap()
+            .load()
+            .expect("load");
+        assert!(
+            !on_disk.iter().find(|i| i.id == id).unwrap().is_buffered(),
+            "transition to {target_status:?} must persist unbuffer to disk"
+        );
+    }
 }
 
 #[test]

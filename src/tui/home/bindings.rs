@@ -61,6 +61,9 @@ pub enum ActionId {
     Restart,
     Update,
     ToggleArchive,
+    /// Move the selected session into/out of the sidebar's "Inactive" buffer
+    /// folder without killing its live pane.
+    ToggleBuffer,
     ToggleFavorite,
     ToggleSnooze,
     /// Toggle the selected session's unread marker (read -> manual-unread;
@@ -548,12 +551,30 @@ pub static BINDINGS: &[Binding] = &[
             serve_only: false,
         }),
     },
-    // New session from a saved project. Follows the bare->Shift relocation
-    // rule: `b` non-strict, `Shift+B` in strict.
+    // Buffer the selected session into the "Inactive" folder right below
+    // ongoing chats (`b` non-strict, `Shift+B` in strict).
     Binding {
-        id: ActionId::NewFromProject,
+        id: ActionId::ToggleBuffer,
         non_strict: &[k('b')],
         strict: &[k('B')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Actions,
+            desc: "Buffer / move to Inactive (toggle)",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Toggle buffer (Inactive folder)",
+            keywords: &["buffer", "inactive", "park", "hide", "pause"],
+            group: PaletteGroup::Actions,
+            serve_only: false,
+        }),
+    },
+    // New session from a saved project. Relocated to the secondary `B` slot
+    // (`Shift+B` non-strict, `Ctrl+B` in strict) to free bare `b` for buffer.
+    Binding {
+        id: ActionId::NewFromProject,
+        non_strict: &[k('B')],
+        strict: &[ctrl('b')],
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Actions,
@@ -1109,6 +1130,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Projects => "projects",
         ActionId::Restart => "restart",
         ActionId::ToggleArchive => "archive",
+        ActionId::ToggleBuffer => "buffer",
         ActionId::ToggleFavorite => "favorite",
         ActionId::ToggleSnooze => "snooze",
         ActionId::ToggleUnread => "toggle-unread",
